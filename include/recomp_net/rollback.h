@@ -147,11 +147,26 @@ typedef struct RNetRbSession RNetRbSession;
 
 typedef struct RNetRbConfig
 {
-    uint32_t local_slot;       /* this host's player slot */
+    /* This host's player slot -- or `slot_count` exactly, which means
+     * OBSERVER: a spectator that runs the simulation and owns no seat.
+     *
+     * local_slot is only ever compared, never used as an index, and every
+     * comparison asks the same question: "is this the slot I own?" A value one
+     * past the last seat answers no for every slot, and the four behaviours
+     * fall out already correct -- every row is sealed from the wire rather
+     * than from get_input_row, only CONFIRMED rows count as authority (an
+     * observer must never credit its own prediction), row validity is read
+     * from the peer mask, and admission waits on every seat instead of
+     * skipping one. So an observer is not a mode with its own code path; it is
+     * the ordinary path with no seat of its own, which is why it cannot drift
+     * from the seated one. */
+    uint32_t local_slot;
     uint32_t delay;            /* committed input delay D */
     uint32_t seal_max_span;    /* <= RNET_RB_SEAL_MAX_SPAN; 0 = default */
     /* Active seats in this match (1..RNET_RB_MAX_SLOTS). Peer-seal completion
-     * only waits on slots in [0, slot_count) excluding local_slot. 0 => 2. */
+     * only waits on slots in [0, slot_count) excluding local_slot -- so an
+     * observer, whose local_slot is outside that range, waits on all of them.
+     * 0 => 2. */
     uint32_t slot_count;
     /* TipHold quiet window after POST match (0 = finalize immediately;
      * RNET_RB_TIP_RUNWAY_DEFAULT recommended for digital hosts). Also the
@@ -188,6 +203,10 @@ uint32_t rnet_rb_get_mismatch_tick(const RNetRbSession *s);
 uint32_t rnet_rb_get_load_tick(const RNetRbSession *s);
 uint32_t rnet_rb_get_target_tick(const RNetRbSession *s);
 int32_t rnet_rb_get_corrected_slot(const RNetRbSession *s);
+
+/* 1 when this session owns no seat: it simulates and displays the match and
+ * contributes no input row to anybody. */
+uint8_t rnet_rb_is_observer(const RNetRbSession *s);
 uint8_t rnet_rb_is_from_peer_notify(const RNetRbSession *s);
 uint8_t rnet_rb_get_corr_flags(const RNetRbSession *s);
 

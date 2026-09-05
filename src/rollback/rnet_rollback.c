@@ -79,7 +79,9 @@ RNetRbSession *rnet_rb_create(const RNetRbConfig *cfg, const RNetRollbackVTable 
     {
         s->cfg.slot_count = RNET_RB_MAX_SLOTS;
     }
-    if (s->cfg.local_slot >= s->cfg.slot_count)
+    /* `slot_count` exactly is the observer sentinel (see rollback.h); above
+     * that is a seat that does not exist and stays an error. */
+    if (s->cfg.local_slot > s->cfg.slot_count)
     {
         free(s);
         return NULL;
@@ -198,6 +200,15 @@ uint32_t rnet_rb_get_epoch_id(const RNetRbSession *s) { return (s != NULL) ? s->
 uint32_t rnet_rb_get_mismatch_tick(const RNetRbSession *s) { return (s != NULL) ? s->corr.mismatch_tick : 0u; }
 uint32_t rnet_rb_get_load_tick(const RNetRbSession *s) { return (s != NULL) ? s->corr.load_tick : 0u; }
 uint32_t rnet_rb_get_target_tick(const RNetRbSession *s) { return (s != NULL) ? s->corr.target_tick : 0u; }
+uint8_t rnet_rb_is_observer(const RNetRbSession *s)
+{
+    if (s == NULL)
+    {
+        return 0u;
+    }
+    return (s->cfg.local_slot >= s->cfg.slot_count) ? 1u : 0u;
+}
+
 int32_t rnet_rb_get_corrected_slot(const RNetRbSession *s) { return (s != NULL) ? s->corr.slot : -1; }
 uint8_t rnet_rb_is_from_peer_notify(const RNetRbSession *s)
 {

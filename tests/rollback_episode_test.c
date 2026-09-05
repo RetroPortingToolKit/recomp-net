@@ -418,6 +418,46 @@ int main(void)
 
     rnet_rb_destroy(s);
 
+    /* --- observer (spectator) sessions -----------------------------------
+     *
+     * A spectator owns no seat. It is expressed as local_slot == slot_count,
+     * which is one past the last seat, so every "is this my slot?" test
+     * answers no and the ordinary path does the right thing without a second
+     * code path to keep in step. */
+    {
+        RNetRbConfig ocfg;
+        RNetRbSession *obs;
+
+        memset(&ocfg, 0, sizeof(ocfg));
+        ocfg.delay = 3u;
+        ocfg.slot_count = 2u;
+        ocfg.local_slot = 2u; /* == slot_count: observer */
+        obs = rnet_rb_create(&ocfg, &vt);
+        expect_true(obs != NULL, "observer session is accepted");
+        expect_true(rnet_rb_is_observer(obs), "and reports itself as one");
+        rnet_rb_destroy(obs);
+
+        /* A seated peer is not an observer. */
+        memset(&ocfg, 0, sizeof(ocfg));
+        ocfg.delay = 3u;
+        ocfg.slot_count = 2u;
+        ocfg.local_slot = 1u;
+        obs = rnet_rb_create(&ocfg, &vt);
+        expect_true(obs != NULL, "seated session still creates");
+        expect_true(!rnet_rb_is_observer(obs), "a seated peer owns a seat");
+        rnet_rb_destroy(obs);
+
+        /* Past the sentinel is a seat that does not exist, and stays an
+         * error -- widening the guard must not turn a typo into a session
+         * that silently waits on nobody. */
+        memset(&ocfg, 0, sizeof(ocfg));
+        ocfg.delay = 3u;
+        ocfg.slot_count = 2u;
+        ocfg.local_slot = 3u;
+        expect_true(rnet_rb_create(&ocfg, &vt) == NULL,
+                    "a slot past the sentinel is still refused");
+    }
+
     if (g_failures == 0)
     {
         printf("rollback_episode_test: ok\n");
