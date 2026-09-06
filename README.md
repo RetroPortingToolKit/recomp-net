@@ -175,3 +175,14 @@ SNES-oriented checklist: snesrecomp `docs/RECOMP_NET.md` (“Per-game patches”
 
 - Automatch or matchmaking HTTP clients
 - Game-specific pad layouts, snapshots, or determinism fixes (host responsibility)
+
+## Chat filter
+
+`include/recomp_net/chat_filter.h`: mask profanity and slurs in a chat line
+(`rnet_chat_filter_apply`). The word list is `data/chat_filter_words.txt`
+(many languages; see its header for the matching rules); after editing it
+run `tools/gen_chat_filter_words.py` to regenerate the baked-in copy, and
+copy the list to recomp-net-server's `data/` so the server's Rust port stays
+identical. Every client calls it as a line lands in its chat ring, so rooms
+with no server (LAN) are filtered the same way. `RNET_CHAT_FILTER=0`
+disables it. Tests: `tests/chat_filter_test.c`.
