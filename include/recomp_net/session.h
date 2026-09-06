@@ -105,6 +105,9 @@ rnet_u8 rnet_session_committed_delay(const RNetSession *s);
  */
 int rnet_session_request_delay_change(RNetSession *s, rnet_u8 new_delay);
 int rnet_session_local_slot(const RNetSession *s);
+/* 1 when this session owns no seat: it simulates every slot from the wire and
+ * contributes no input. See RNetConfig.local_slot. */
+int rnet_session_is_observer(const RNetSession *s);
 rnet_u32 rnet_session_sim_tick(const RNetSession *s);
 int rnet_session_is_running(const RNetSession *s);
 RNetIceState rnet_session_ice_state(const RNetSession *s);

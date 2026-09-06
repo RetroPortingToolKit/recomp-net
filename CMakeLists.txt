@@ -252,6 +252,10 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(rollback_episode_test PRIVATE recomp_net)
   add_test(NAME rollback_episode_test COMMAND rollback_episode_test)
 
+  add_executable(session_observer_test tests/session_observer_test.c)
+  target_link_libraries(session_observer_test PRIVATE recomp_net)
+  add_test(NAME session_observer_test COMMAND session_observer_test)
+
   add_executable(rb_wire_test tests/rb_wire_test.c)
   target_link_libraries(rb_wire_test PRIVATE recomp_net)
   target_include_directories(rb_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

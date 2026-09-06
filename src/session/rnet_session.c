@@ -54,6 +54,14 @@ struct RNetSession
     rnet_u32 last_input_tip;
     int last_input_tip_valid;
     int is_sim_authority; /* local_slot == 0 sends START */
+    /* 1 when this session owns no seat: it simulates every slot from the
+     * wire, contributes no input, and never becomes sim authority. */
+    int is_observer;
+    /* Sender id on the wire. Equal to cfg.local_slot for a seated peer; for
+     * an observer it is a slot in the RELAY's namespace, which is what makes
+     * the relay recognise it as a spectator and refuse to forward it. Never
+     * used to index a per-seat array -- see the guards below. */
+    rnet_u8 wire_slot;
     /* Resolved hashes and peer confirmations are prepared up
      * to D ticks ahead, so strict agreement normally completes before admit. */
     rnet_u32 published_tick[RNET_HISTORY_LENGTH];
@@ -412,7 +420,7 @@ static void send_input_confirm_tick(RNetSession *s, rnet_u32 tick,
     rnet_u64 now;
 
     if (s == NULL) return;
-    len = rnet_proto_encode_input_confirm(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+    len = rnet_proto_encode_input_confirm(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                           s->input_epoch, tick, hash);
     send_raw(s, buf, len);
     now = session_now(s);
@@ -539,7 +547,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_BYE:
-        if (pkt->local_slot != s->cfg.local_slot)
+        if (pkt->local_slot != s->wire_slot)
         {
             s->peer_gone = 1;
         }
@@ -580,7 +588,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         state_on_probe_reply(s, pkt);
         break;
     case RNET_PKT_SIO_MULTI_XFER:
-        if (pkt->local_slot != s->cfg.local_slot)
+        if (pkt->local_slot != s->wire_slot)
         {
             rnet_u16 pad = (rnet_u16)(pkt->sio_confirm |
                                       ((rnet_u16)pkt->sio_vblank << 8));
@@ -610,7 +618,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     case RNET_PKT_RB_FRAME_COMMIT:
         /* Not rb_peer_slot-filtered: PSX-Link seats all emit the same
          * machine-level pair fold, so every peer's commit is comparable. */
-        if (pkt->local_slot != s->cfg.local_slot)
+        if (pkt->local_slot != s->wire_slot)
         {
             if (s->rb_fc_q_count < RNET_RB_FC_QUEUE)
             {
@@ -636,7 +644,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             break;
         }
-        if (pkt->local_slot != s->cfg.local_slot &&
+        if (pkt->local_slot != s->wire_slot &&
             s->rb_sync_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_sync_q[s->rb_sync_head].epoch_id = pkt->rb_epoch_id;
@@ -651,7 +659,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_SEAL_ROWS:
-        if (pkt->local_slot != s->cfg.local_slot &&
+        if (pkt->local_slot != s->wire_slot &&
             s->rb_seal_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_seal_q[s->rb_seal_head].epoch_id = pkt->rb_epoch_id;
@@ -678,7 +686,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             break;
         }
-        if (pkt->local_slot != s->cfg.local_slot &&
+        if (pkt->local_slot != s->wire_slot &&
             s->rb_base_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_base_q[s->rb_base_head].epoch_id = pkt->rb_epoch_id;
@@ -696,7 +704,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             break;
         }
-        if (pkt->local_slot != s->cfg.local_slot &&
+        if (pkt->local_slot != s->wire_slot &&
             s->rb_post_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_post_q[s->rb_post_head].epoch_id = pkt->rb_epoch_id;
@@ -709,7 +717,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_MODSET:
-        if (pkt->local_slot != s->cfg.local_slot)
+        if (pkt->local_slot != s->wire_slot)
         {
             memcpy(s->modset_text, pkt->modset_text, sizeof(s->modset_text));
             s->modset_text[sizeof(s->modset_text) - 1] = '\0';
@@ -717,7 +725,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_MODSET_ACK:
-        if (pkt->local_slot != s->cfg.local_slot)
+        if (pkt->local_slot != s->wire_slot)
         {
             memcpy(s->modset_ack_reason, pkt->modset_reason,
                    sizeof(s->modset_ack_reason));
@@ -727,7 +735,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_RESOLVED:
-        if (pkt->local_slot != s->cfg.local_slot &&
+        if (pkt->local_slot != s->wire_slot &&
             s->rb_resolved_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_resolved_q[s->rb_resolved_head] = pkt->rb_resolved_through;
@@ -977,7 +985,7 @@ static void state_send_ack(RNetSession *s)
 {
     rnet_u8 buf[64];
     int n;
-    n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+    n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                     s->state_xfer_id, s->state_contiguity);
     if (n > 0)
     {
@@ -1049,7 +1057,7 @@ static void state_drive_sender(RNetSession *s)
     if (s->state_peer_ack == 0 &&
         (s->state_last_begin_ms == 0 || now - s->state_last_begin_ms >= kBeginRetransmitMs))
     {
-        n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+        n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                           s->state_op, s->state_slot, s->state_xfer_id, s->state_total, s->state_crc);
         if (n > 0)
         {
@@ -1090,7 +1098,7 @@ static void state_drive_sender(RNetSession *s)
         rnet_u32 off = s->state_send_cursor;
         rnet_u32 left = s->state_total - off;
         rnet_u16 chunk = (left > RNET_STATE_CHUNK_MAX) ? (rnet_u16)RNET_STATE_CHUNK_MAX : (rnet_u16)left;
-        n = rnet_proto_encode_state_chunk(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+        n = rnet_proto_encode_state_chunk(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                           s->state_xfer_id, off, s->state_buf + off, chunk);
         if (n <= 0)
         {
@@ -1127,7 +1135,7 @@ static void state_drive_sender(RNetSession *s)
 
 static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
 {
-    if (pkt->local_slot == s->cfg.local_slot)
+    if (pkt->local_slot == s->wire_slot)
     {
         return; /* ignore echo */
     }
@@ -1145,7 +1153,7 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
          * hard resync. Re-ACK it instead of reopening a completed transfer. */
         rnet_u8 buf[64];
         int n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic,
-                                            s->cfg.session_id, s->cfg.local_slot,
+                                            s->cfg.session_id, s->wire_slot,
                                             pkt->state_xfer_id, pkt->state_total_size);
         if (n > 0) send_raw(s, buf, n);
         return;
@@ -1257,7 +1265,7 @@ static void state_drive_probe(RNetSession *s)
         return;
     }
     n = rnet_proto_encode_state_probe(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                      s->cfg.local_slot, s->state_probe_op, s->state_probe_slot,
+                                      s->wire_slot, s->state_probe_op, s->state_probe_slot,
                                       s->state_probe_size, s->state_probe_crc);
     if (n > 0)
     {
@@ -1268,7 +1276,7 @@ static void state_drive_probe(RNetSession *s)
 
 static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
 {
-    if (pkt->local_slot == s->cfg.local_slot)
+    if (pkt->local_slot == s->wire_slot)
     {
         return;
     }
@@ -1287,7 +1295,7 @@ static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         rnet_u8 buf[64];
         int n = rnet_proto_encode_state_probe_reply(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                                    s->cfg.local_slot, s->state_probe_op, s->state_probe_slot,
+                                                    s->wire_slot, s->state_probe_op, s->state_probe_slot,
                                                     s->state_probe_match ? 1u : 0u, s->state_probe_size,
                                                     s->state_probe_crc);
         if (n > 0)
@@ -1316,7 +1324,7 @@ static void state_on_probe_reply(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
-    if (pkt->local_slot == s->cfg.local_slot)
+    if (pkt->local_slot == s->wire_slot)
     {
         return;
     }
@@ -1344,7 +1352,7 @@ static void maybe_bootstrap(RNetSession *s)
     {
         if (now - s->last_hello_ms >= 100ULL)
         {
-            len = rnet_proto_encode_hello(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+            len = rnet_proto_encode_hello(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                           s->cfg.slot_count, s->delay);
             send_raw(s, buf, len);
             s->last_hello_ms = now;
@@ -1359,11 +1367,17 @@ static void maybe_bootstrap(RNetSession *s)
         }
         if (now - s->last_ready_ms >= 100ULL)
         {
-            len = rnet_proto_encode_ready(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot);
+            len = rnet_proto_encode_ready(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot);
             send_raw(s, buf, len);
             s->last_ready_ms = now;
         }
-        s->peer_ready[s->cfg.local_slot] = 1;
+        /* Mark our own seat ready. An observer has no seat to mark -- and
+         * local_slot is the sentinel, which would index one past the array
+         * when the room is full. It still waits for every seat below. */
+        if (!s->is_observer)
+        {
+            s->peer_ready[s->cfg.local_slot] = 1;
+        }
         for (slot = 0; slot < s->cfg.slot_count; ++slot)
         {
             if (!rnet_config_slot_occupied(&s->cfg, slot))
@@ -1401,6 +1415,17 @@ static void send_input_bundle(RNetSession *s)
     rnet_u32 ack;
     int sent_any = 0;
     rnet_u64 now = session_now(s);
+
+    /* The one choke point for "a spectator sends no input".
+     *
+     * Guarded here rather than at each of the seven call sites -- several are
+     * stall paths that retransmit, and a spectator's local_ring is empty
+     * anyway, so those would send empty bundles forever. One guard cannot be
+     * forgotten when an eighth call site is added. */
+    if (s->is_observer)
+    {
+        return;
+    }
 
     if (s->phase != RNET_PHASE_RUNNING)
     {
@@ -1447,8 +1472,15 @@ static void send_input_bundle(RNetSession *s)
         if (ack_lo < lo)
             lo = ack_lo;
     }
+    /* Which peer's progress to acknowledge. Seated peers point at the next
+     * seat round; an observer has no "next" seat from a seat of its own, and
+     * the sentinel would pick a ring by accident of arithmetic. Seat 0 is the
+     * sim authority and the one peer guaranteed present, so an observer acks
+     * against that. */
     ack = rnet_ring_highest_valid(
-        &s->remote_rings[(s->cfg.local_slot + 1) % s->cfg.slot_count]);
+        &s->remote_rings[s->is_observer
+                             ? 0
+                             : ((s->cfg.local_slot + 1) % s->cfg.slot_count)]);
     t = lo;
     while (t <= tip)
     {
@@ -1475,7 +1507,7 @@ static void send_input_bundle(RNetSession *s)
             continue;
         }
         len = rnet_proto_encode_input(buf, sizeof(buf), s->cfg.protocol_magic,
-                                      s->cfg.session_id, s->cfg.local_slot, s->input_epoch, ack,
+                                      s->cfg.session_id, s->wire_slot, s->input_epoch, ack,
                                       frames, count);
         if (len < 0)
         {
@@ -1670,7 +1702,23 @@ RNetSession *rnet_session_create(const RNetConfig *cfg, const RNetHostVTable *ho
     {
         return NULL;
     }
-    if (cfg->slot_count < 2 || cfg->slot_count > RNET_MAX_SLOTS || cfg->local_slot >= cfg->slot_count)
+    if (cfg->slot_count < 2 || cfg->slot_count > RNET_MAX_SLOTS)
+    {
+        return NULL;
+    }
+    /* `slot_count` exactly is the observer sentinel; above it is a seat that
+     * does not exist and stays an error, so a typo cannot quietly become a
+     * session that waits on nobody. */
+    if (cfg->local_slot > cfg->slot_count)
+    {
+        return NULL;
+    }
+    /* An observer must carry a wire id outside the seat range. Sending as a
+     * player slot would have the relay forward its packets and the peers
+     * store them as that seat's input -- the exact thing a spectator must not
+     * be able to do. Refuse rather than silently send as a player. */
+    if (cfg->local_slot == cfg->slot_count &&
+        rnet_config_wire_slot(cfg) < cfg->slot_count)
     {
         return NULL;
     }
@@ -1683,7 +1731,11 @@ RNetSession *rnet_session_create(const RNetConfig *cfg, const RNetHostVTable *ho
     s->host = *host;
     s->delay = cfg->input_delay;
     s->phase = RNET_PHASE_IDLE;
-    s->is_sim_authority = (cfg->local_slot == 0) ? 1 : 0;
+    s->is_observer = rnet_config_is_observer(cfg) ? 1 : 0;
+    s->wire_slot = rnet_config_wire_slot(cfg);
+    /* An observer is never authority: its local_slot is the sentinel, never
+     * 0, so this already answers no -- stated rather than relied upon. */
+    s->is_sim_authority = (!s->is_observer && cfg->local_slot == 0) ? 1 : 0;
     s->rb_peer_slot = -1;
     s->session_start_ms = rnet_os_monotonic_ms();
     s->last_peer_rx_ms = 0;
@@ -1941,7 +1993,7 @@ void rnet_session_pump(RNetSession *s)
         {
             rnet_u8 buf[RNET_MAX_PACKET];
             int len = rnet_proto_encode_hello(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                              s->cfg.local_slot, s->cfg.slot_count, s->delay);
+                                              s->wire_slot, s->cfg.slot_count, s->delay);
             send_raw(s, buf, len);
             s->last_hello_ms = now;
         }
@@ -2021,23 +2073,37 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
      * neutral prefix is consumed, peer input normally arrived D frames ago. */
     play_wire = sim_tick;
     sample_wire = rnet_wire_tick_from_sim(sim_tick, s->delay);
-    if (!rnet_ring_get(&s->local_ring, sample_wire, &local_future))
+    memset(&local_future, 0, sizeof(local_future));
+    memset(&local_play, 0, sizeof(local_play));
+    if (!s->is_observer)
     {
-        memset(&local_future, 0, sizeof(local_future));
-        s->host.sample_local(sim_tick, &local_future, s->host.ctx);
-        local_future.tick = sample_wire;
-        local_future.valid = 1;
-        if (local_future.size > RNET_INPUT_MAX)
+        if (!rnet_ring_get(&s->local_ring, sample_wire, &local_future))
         {
-            local_future.size = RNET_INPUT_MAX;
+            memset(&local_future, 0, sizeof(local_future));
+            s->host.sample_local(sim_tick, &local_future, s->host.ctx);
+            local_future.tick = sample_wire;
+            local_future.valid = 1;
+            if (local_future.size > RNET_INPUT_MAX)
+            {
+                local_future.size = RNET_INPUT_MAX;
+            }
+            rnet_ring_store(&s->local_ring, &local_future);
         }
-        rnet_ring_store(&s->local_ring, &local_future);
-    }
 
-    send_input_bundle(s);
+        send_input_bundle(s);
+    }
+    /* An observer samples nothing and sends nothing.
+     *
+     * Not sampling is the point: its controllers must not reach the match,
+     * and the surest way is for the pad never to enter the pipeline at all.
+     * Not sending follows -- it has no row anyone needs, the relay would drop
+     * it anyway, and on a direct path a peer would reject it as an
+     * out-of-range seat. Three layers agreeing, none of them relied upon
+     * alone. It still sends HELLO / READY / confirms, which is what binds it
+     * at the relay so the match reaches it. */
     refresh_confirm_window(s, play_wire, sample_wire);
 
-    if (!rnet_ring_get(&s->local_ring, play_wire, &local_play))
+    if (!s->is_observer && !rnet_ring_get(&s->local_ring, play_wire, &local_play))
     {
         if (play_wire == sample_wire)
             local_play = local_future;
@@ -2266,7 +2332,7 @@ int rnet_session_send_bye(RNetSession *s)
     {
         return -1;
     }
-    n = rnet_proto_encode_bye(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot);
+    n = rnet_proto_encode_bye(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot);
     if (n <= 0)
     {
         return -1;
@@ -2385,6 +2451,11 @@ int rnet_session_request_delay_change(RNetSession *s, rnet_u8 new_delay)
 int rnet_session_local_slot(const RNetSession *s)
 {
     return (s != NULL) ? (int)s->cfg.local_slot : -1;
+}
+
+int rnet_session_is_observer(const RNetSession *s)
+{
+    return (s != NULL) ? s->is_observer : 0;
 }
 
 rnet_u32 rnet_session_sim_tick(const RNetSession *s)
@@ -2580,7 +2651,7 @@ int rnet_session_state_probe_reply(RNetSession *s, int match)
         return -1;
     }
     n = rnet_proto_encode_state_probe_reply(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                            s->cfg.local_slot, s->state_probe_op, s->state_probe_slot,
+                                            s->wire_slot, s->state_probe_op, s->state_probe_slot,
                                             match ? 1u : 0u, s->state_probe_size, s->state_probe_crc);
     if (n <= 0)
     {
@@ -2668,7 +2739,7 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
     s->state_xfer_start_ms = session_now(s);
     state_pacing_reset(s);
 
-    n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->cfg.local_slot,
+    n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
                                       s->state_op, s->state_slot, s->state_xfer_id, s->state_total, s->state_crc);
     if (n > 0)
     {
@@ -2827,7 +2898,7 @@ int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
         return -1;
     }
     n = rnet_proto_encode_rb_frame_commit(buf, sizeof(buf), s->cfg.protocol_magic,
-                                          s->cfg.session_id, s->cfg.local_slot,
+                                          s->cfg.session_id, s->wire_slot,
                                           through_tick, state_hash);
     if (n <= 0)
     {
@@ -3017,7 +3088,7 @@ int rnet_session_send_rb_sync(RNetSession *s, rnet_u32 epoch_id, rnet_u32 mismat
     if (s == NULL || s->phase != RNET_PHASE_RUNNING)
         return -1;
     n = rnet_proto_encode_rb_sync(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                  s->cfg.local_slot, epoch_id, mismatch_tick, load_tick,
+                                  s->wire_slot, epoch_id, mismatch_tick, load_tick,
                                   target_tick, corrected_slot, op, flags);
     if (n <= 0)
         return -1;
@@ -3073,7 +3144,7 @@ int rnet_session_send_rb_seal_rows(RNetSession *s, rnet_u32 epoch_id, rnet_u32 m
         wire[i].is_valid = rows[i].is_valid;
     }
     enc = rnet_proto_encode_rb_seal_rows(buf, sizeof(buf), s->cfg.protocol_magic,
-                                         s->cfg.session_id, s->cfg.local_slot, epoch_id,
+                                         s->cfg.session_id, s->wire_slot, epoch_id,
                                          mismatch_tick, target_tick, slot, row_begin, wire, n);
     if (enc <= 0)
         return -1;
@@ -3128,7 +3199,7 @@ int rnet_session_send_rb_baseline(RNetSession *s, rnet_u32 epoch_id, rnet_u32 lo
     if (s == NULL || s->phase != RNET_PHASE_RUNNING)
         return -1;
     n = rnet_proto_encode_rb_baseline(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                      s->cfg.local_slot, epoch_id, load_tick, digest_master,
+                                      s->wire_slot, epoch_id, load_tick, digest_master,
                                       digest_a, digest_b, digest_c);
     if (n <= 0)
         return -1;
@@ -3167,7 +3238,7 @@ int rnet_session_send_rb_post(RNetSession *s, rnet_u32 epoch_id, rnet_u32 target
     if (s == NULL || s->phase != RNET_PHASE_RUNNING)
         return -1;
     n = rnet_proto_encode_rb_post(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                  s->cfg.local_slot, epoch_id, target_tick, digest_master,
+                                  s->wire_slot, epoch_id, target_tick, digest_master,
                                   input_digest, match);
     if (n <= 0)
         return -1;
@@ -3206,7 +3277,7 @@ int rnet_session_send_sio_multi_xfer(RNetSession *s, rnet_u8 unit_id, rnet_u32 s
     if (s->phase != RNET_PHASE_RUNNING && s->phase != RNET_PHASE_READY)
         return -1;
     n = rnet_proto_encode_sio_multi_xfer(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                         s->cfg.local_slot, unit_id, seq, send, confirm_pad);
+                                         s->wire_slot, unit_id, seq, send, confirm_pad);
     if (n <= 0)
         return -1;
     /* Small redundancy: Multi barrier cannot hide behind INPUT FEC. */
@@ -3242,7 +3313,7 @@ int rnet_session_send_modset(RNetSession *s, const char *text)
         return -1;
     }
     n = rnet_proto_encode_modset(buf, sizeof(buf), s->cfg.protocol_magic,
-                                 s->cfg.session_id, (rnet_u8)s->cfg.local_slot,
+                                 s->cfg.session_id, (rnet_u8)s->wire_slot,
                                  text);
     if (n <= 0)
     {
@@ -3278,7 +3349,7 @@ int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
     }
     n = rnet_proto_encode_modset_ack(buf, sizeof(buf), s->cfg.protocol_magic,
                                      s->cfg.session_id,
-                                     (rnet_u8)s->cfg.local_slot, status,
+                                     (rnet_u8)s->wire_slot, status,
                                      reason);
     if (n <= 0)
     {
@@ -3320,7 +3391,7 @@ int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through)
     if (s == NULL || s->phase != RNET_PHASE_RUNNING)
         return -1;
     n = rnet_proto_encode_rb_resolved(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                      s->cfg.local_slot, resolved_through);
+                                      s->wire_slot, resolved_through);
     if (n <= 0)
         return -1;
     send_raw(s, buf, n);

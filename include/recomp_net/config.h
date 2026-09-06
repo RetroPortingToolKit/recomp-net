@@ -16,8 +16,23 @@ typedef struct RNetConfig
 {
     /* Number of player slots in the session (2..RNET_MAX_SLOTS). */
     rnet_u8 slot_count;
-    /* Local player slot index (0..slot_count-1). */
+    /* Local player slot index (0..slot_count-1) -- or `slot_count` exactly,
+     * which means OBSERVER: a spectator that simulates the match, displays it,
+     * and owns no seat.
+     *
+     * Every "is this my seat?" test in the session compares against this, and
+     * a value one past the last seat answers no for all of them: the observer
+     * resolves every slot from the wire, waits on every seat, and contributes
+     * to none. It is the ordinary path with no seat, not a second mode. */
     rnet_u8 local_slot;
+    /* Sender id placed on the wire. 0 = "same as local_slot".
+     *
+     * These have to be able to differ for an observer. It has no sim seat, so
+     * local_slot is a sentinel outside the seat range -- but it still has to
+     * identify itself on the wire with a slot the RELAY recognises as a
+     * spectator, which is a number in the relay's namespace, not the sim's.
+     * Seated peers leave this 0 and the two are the same value, as before. */
+    rnet_u8 wire_slot;
     /* Fixed input delay D in sim ticks (wire_tick = sim_tick + D). */
     rnet_u8 input_delay;
     /* How many prior INPUT frames to retransmit per packet. */
@@ -41,11 +56,26 @@ static inline void rnet_config_init_defaults(RNetConfig *cfg)
     }
     cfg->slot_count = 2;
     cfg->local_slot = 0;
+    cfg->wire_slot = 0;
     cfg->input_delay = 2;
     cfg->bundle_redundancy = RNET_DEFAULT_BUNDLE_REDUNDANCY;
     cfg->session_id = 1;
     cfg->protocol_magic = 0x524E4554u; /* 'RNET' */
     cfg->occupied_mask = 0; /* all occupied */
+}
+
+/* 1 when this config describes a spectator: no seat, watches every slot. */
+static inline int rnet_config_is_observer(const RNetConfig *cfg)
+{
+    return (cfg != NULL) && (cfg->local_slot >= cfg->slot_count);
+}
+
+/* The sender id this config puts on the wire. */
+static inline rnet_u8 rnet_config_wire_slot(const RNetConfig *cfg)
+{
+    if (cfg == NULL)
+        return 0;
+    return (cfg->wire_slot != 0) ? cfg->wire_slot : cfg->local_slot;
 }
 
 /* 1 if seat is a real peer (or mask unset ⇒ every seat in range). */
