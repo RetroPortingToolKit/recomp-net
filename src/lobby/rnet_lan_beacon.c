@@ -13,9 +13,7 @@
 #define RNET_BC_STALE_MS 5000ull
 
 typedef struct RNetLanBeaconEntry {
-    char lobby_id[RNET_LAN_BEACON_ID_MAX];
-    char endpoint[RNET_LAN_BEACON_ENDPOINT_MAX];
-    char game_name[RNET_LAN_BEACON_GAME_MAX];
+    RNetLanBeaconRoom room;   /* room.lobby_id[0] == 0 marks a free slot */
     rnet_u64 last_seen_ms;
 } RNetLanBeaconEntry;
 
@@ -23,9 +21,7 @@ struct RNetLanBeacon {
     rnet_socket sock;
     unsigned short discovery_port;
     int is_publisher;
-    char lobby_id[RNET_LAN_BEACON_ID_MAX];
-    char endpoint[RNET_LAN_BEACON_ENDPOINT_MAX];
-    char game_name[RNET_LAN_BEACON_GAME_MAX];
+    RNetLanBeaconRoom room;   /* publisher: what tick announces */
     rnet_u64 next_send_ms;
     RNetLanBeaconEntry cache[RNET_BC_CACHE_MAX];
     int cache_count;
@@ -95,21 +91,43 @@ static int endpoint_looks_ok(const char *ep)
     return 0;
 }
 
-static int build_announce(char *buf, size_t cap, const char *lobby_id,
-                          const char *endpoint, const char *game_name)
+/* A text field rides one line of the datagram, so a newline inside it would
+ * shift every row after it. Room names come from a text box. */
+static void copy_line_field(char *dst, size_t cap, const char *src)
 {
-    int n;
-    if (!buf || cap < 32 || !lobby_id || !lobby_id[0] || !endpoint || !endpoint[0])
-        return -1;
-    n = snprintf(buf, cap, "%s\nANNOUNCE\n%s\n%s\n%s\n", RNET_BC_MAGIC, lobby_id,
-                 endpoint, game_name ? game_name : "");
-    if (n < 0 || (size_t)n >= cap)
-        return -1;
-    return 0;
+    size_t i;
+    copy_trunc(dst, cap, src);
+    for (i = 0; dst && dst[i]; ++i)
+        if (dst[i] == '\n' || dst[i] == '\r')
+            dst[i] = ' ';
 }
 
-static int parse_announce(char *pkt, char *lobby_id, size_t id_cap, char *endpoint,
-                          size_t ep_cap, char *game_name, size_t game_cap)
+int rnet_lan_beacon_format_announce(const RNetLanBeaconRoom *room, char *buf,
+                                    size_t cap)
+{
+    RNetLanBeaconRoom clean;
+    int n;
+    if (!buf || cap < 32 || !room || !room->lobby_id[0] ||
+        !endpoint_looks_ok(room->endpoint))
+        return -1;
+    memset(&clean, 0, sizeof(clean));
+    copy_line_field(clean.lobby_id, sizeof(clean.lobby_id), room->lobby_id);
+    copy_line_field(clean.game_name, sizeof(clean.game_name), room->game_name);
+    copy_line_field(clean.game_version, sizeof(clean.game_version),
+                    room->game_version);
+    copy_line_field(clean.room_name, sizeof(clean.room_name), room->room_name);
+    n = snprintf(buf, cap,
+                 "%s\nANNOUNCE\n%s\n%s\n%s\n%s\n%s\npw=%d players=%d max=%d "
+                 "started=%d\n",
+                 RNET_BC_MAGIC, clean.lobby_id, room->endpoint, clean.game_name,
+                 clean.game_version, clean.room_name, room->has_password ? 1 : 0,
+                 room->player_count, room->max_slots, room->started ? 1 : 0);
+    if (n < 0 || (size_t)n >= cap)
+        return -1;
+    return n;
+}
+
+static int parse_announce(char *pkt, RNetLanBeaconRoom *out)
 {
     char *cursor = pkt;
     const char *magic = next_line(&cursor);
@@ -117,37 +135,59 @@ static int parse_announce(char *pkt, char *lobby_id, size_t id_cap, char *endpoi
     const char *id = next_line(&cursor);
     const char *ep = next_line(&cursor);
     const char *game = next_line(&cursor);
+    /* V2 rows. A V1 publisher stops at game_name; each of these is NULL then
+     * and the room reads back with empty strings / zeros. */
+    const char *version = next_line(&cursor);
+    const char *name = next_line(&cursor);
+    const char *flags = next_line(&cursor);
     if (!magic || strcmp(magic, RNET_BC_MAGIC) != 0)
         return 0;
     if (!op || strcmp(op, "ANNOUNCE") != 0)
         return 0;
     if (!id || !id[0] || !ep || !endpoint_looks_ok(ep))
         return 0;
-    copy_trunc(lobby_id, id_cap, id);
-    copy_trunc(endpoint, ep_cap, ep);
-    copy_trunc(game_name, game_cap, game ? game : "");
+    memset(out, 0, sizeof(*out));
+    copy_trunc(out->lobby_id, sizeof(out->lobby_id), id);
+    copy_trunc(out->endpoint, sizeof(out->endpoint), ep);
+    copy_trunc(out->game_name, sizeof(out->game_name), game ? game : "");
+    copy_trunc(out->game_version, sizeof(out->game_version),
+               version ? version : "");
+    copy_trunc(out->room_name, sizeof(out->room_name), name ? name : "");
+    if (flags) {
+        int pw = 0, players = 0, max = 0, started = 0;
+        if (sscanf(flags, "pw=%d players=%d max=%d started=%d", &pw, &players,
+                   &max, &started) == 4) {
+            out->has_password = pw != 0;
+            out->player_count = players;
+            out->max_slots = max;
+            out->started = started != 0;
+        }
+    }
     return 1;
 }
 
-static void cache_upsert(RNetLanBeacon *b, const char *lobby_id, const char *endpoint,
-                         const char *game_name, rnet_u64 now)
+static int entry_fresh(const RNetLanBeaconEntry *e, rnet_u64 now)
+{
+    return e->room.lobby_id[0] && now - e->last_seen_ms <= RNET_BC_STALE_MS;
+}
+
+static void cache_upsert(RNetLanBeacon *b, const RNetLanBeaconRoom *room,
+                         rnet_u64 now)
 {
     int i;
     int free_i = -1;
     int oldest_i = 0;
     rnet_u64 oldest = 0;
-    if (!b || !lobby_id || !endpoint)
+    if (!b || !room)
         return;
     for (i = 0; i < RNET_BC_CACHE_MAX; ++i) {
-        if (!b->cache[i].lobby_id[0]) {
+        if (!b->cache[i].room.lobby_id[0]) {
             if (free_i < 0)
                 free_i = i;
             continue;
         }
-        if (strcmp(b->cache[i].lobby_id, lobby_id) == 0) {
-            copy_trunc(b->cache[i].endpoint, sizeof(b->cache[i].endpoint), endpoint);
-            copy_trunc(b->cache[i].game_name, sizeof(b->cache[i].game_name),
-                       game_name);
+        if (strcmp(b->cache[i].room.lobby_id, room->lobby_id) == 0) {
+            b->cache[i].room = *room;
             b->cache[i].last_seen_ms = now;
             return;
         }
@@ -158,9 +198,7 @@ static void cache_upsert(RNetLanBeacon *b, const char *lobby_id, const char *end
         }
     }
     i = free_i >= 0 ? free_i : oldest_i;
-    copy_trunc(b->cache[i].lobby_id, sizeof(b->cache[i].lobby_id), lobby_id);
-    copy_trunc(b->cache[i].endpoint, sizeof(b->cache[i].endpoint), endpoint);
-    copy_trunc(b->cache[i].game_name, sizeof(b->cache[i].game_name), game_name);
+    b->cache[i].room = *room;
     b->cache[i].last_seen_ms = now;
     if (b->cache_count < RNET_BC_CACHE_MAX)
         ++b->cache_count;
@@ -209,22 +247,29 @@ int rnet_lan_beacon_publish_open(RNetLanBeacon **out, unsigned short discovery_p
     return 0;
 }
 
-int rnet_lan_beacon_publish_set(RNetLanBeacon *beacon, const char *lobby_id,
-                                const char *game_endpoint, const char *game_name)
+int rnet_lan_beacon_publish_set_room(RNetLanBeacon *beacon,
+                                     const RNetLanBeaconRoom *room)
 {
     if (!beacon || !beacon->is_publisher)
         return -1;
-    if (!lobby_id || !lobby_id[0] || !endpoint_looks_ok(game_endpoint)) {
-        beacon->lobby_id[0] = '\0';
-        beacon->endpoint[0] = '\0';
+    if (!room || !room->lobby_id[0] || !endpoint_looks_ok(room->endpoint)) {
+        memset(&beacon->room, 0, sizeof(beacon->room));
         return -1;
     }
-    copy_trunc(beacon->lobby_id, sizeof(beacon->lobby_id), lobby_id);
-    copy_trunc(beacon->endpoint, sizeof(beacon->endpoint), game_endpoint);
-    copy_trunc(beacon->game_name, sizeof(beacon->game_name),
-               game_name ? game_name : "");
+    beacon->room = *room;
     beacon->next_send_ms = 0;
     return 0;
+}
+
+int rnet_lan_beacon_publish_set(RNetLanBeacon *beacon, const char *lobby_id,
+                                const char *game_endpoint, const char *game_name)
+{
+    RNetLanBeaconRoom room;
+    memset(&room, 0, sizeof(room));
+    copy_trunc(room.lobby_id, sizeof(room.lobby_id), lobby_id);
+    copy_trunc(room.endpoint, sizeof(room.endpoint), game_endpoint);
+    copy_trunc(room.game_name, sizeof(room.game_name), game_name);
+    return rnet_lan_beacon_publish_set_room(beacon, &room);
 }
 
 int rnet_lan_beacon_publish_tick(RNetLanBeacon *beacon)
@@ -232,22 +277,23 @@ int rnet_lan_beacon_publish_tick(RNetLanBeacon *beacon)
     char buf[RNET_BC_MAX_PKT];
     struct sockaddr_in dst;
     rnet_u64 now;
+    int len;
     if (!beacon || !beacon->is_publisher || !rnet_os_socket_valid(beacon->sock))
         return -1;
-    if (!beacon->lobby_id[0] || !beacon->endpoint[0])
+    if (!beacon->room.lobby_id[0] || !beacon->room.endpoint[0])
         return 0;
     now = rnet_os_monotonic_ms();
     if (beacon->next_send_ms && now < beacon->next_send_ms)
         return 0;
-    if (build_announce(buf, sizeof(buf), beacon->lobby_id, beacon->endpoint,
-                       beacon->game_name) != 0)
+    len = rnet_lan_beacon_format_announce(&beacon->room, buf, sizeof(buf));
+    if (len < 0)
         return -1;
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
     dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
     dst.sin_port = htons(beacon->discovery_port);
     /* rnet_os_sendto returns bytes sent (>=0) or -1. */
-    if (rnet_os_sendto(beacon->sock, buf, strlen(buf), &dst) < 0)
+    if (rnet_os_sendto(beacon->sock, buf, (size_t)len, &dst) < 0)
         return -1;
     beacon->next_send_ms = now + RNET_BC_INTERVAL_MS;
     return 0;
@@ -270,6 +316,8 @@ int rnet_lan_beacon_listen_open(RNetLanBeacon **out, unsigned short discovery_po
         free(b);
         return -1;
     }
+    /* reuseaddr: two launchers on one machine both listen on the discovery
+     * port, and UDP delivers a broadcast to every socket bound to it. */
     (void)rnet_os_setsockopt_reuseaddr(b->sock, 1);
     (void)rnet_os_setsockopt_broadcast(b->sock, 1);
     (void)rnet_os_set_nonblocking(b->sock);
@@ -285,6 +333,23 @@ int rnet_lan_beacon_listen_open(RNetLanBeacon **out, unsigned short discovery_po
     return 0;
 }
 
+int rnet_lan_beacon_listen_inject(RNetLanBeacon *beacon, const char *pkt,
+                                  size_t len)
+{
+    char buf[RNET_BC_MAX_PKT];
+    RNetLanBeaconRoom room;
+    if (!beacon || beacon->is_publisher || !pkt)
+        return 0;
+    if (len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+    memcpy(buf, pkt, len);
+    buf[len] = '\0';
+    if (!parse_announce(buf, &room))
+        return 0;
+    cache_upsert(beacon, &room, rnet_os_monotonic_ms());
+    return 1;
+}
+
 int rnet_lan_beacon_listen_pump(RNetLanBeacon *beacon)
 {
     int updated = 0;
@@ -295,24 +360,11 @@ int rnet_lan_beacon_listen_pump(RNetLanBeacon *beacon)
         struct sockaddr_in src;
         int would_block = 0;
         int n;
-        char lobby_id[RNET_LAN_BEACON_ID_MAX];
-        char endpoint[RNET_LAN_BEACON_ENDPOINT_MAX];
-        char game_name[RNET_LAN_BEACON_GAME_MAX];
         memset(&src, 0, sizeof(src));
         n = rnet_os_recvfrom(beacon->sock, buf, sizeof(buf) - 1, &src, &would_block);
-        if (n < 0) {
-            if (would_block)
-                break;
-            break;
-        }
-        if (n == 0)
-            break;
-        buf[n] = '\0';
-        if (!parse_announce(buf, lobby_id, sizeof(lobby_id), endpoint, sizeof(endpoint),
-                            game_name, sizeof(game_name)))
-            continue;
-        cache_upsert(beacon, lobby_id, endpoint, game_name, rnet_os_monotonic_ms());
-        ++updated;
+        if (n <= 0)
+            break;   /* would-block, error, or an empty datagram: nothing more now */
+        updated += rnet_lan_beacon_listen_inject(beacon, buf, (size_t)n);
     }
     return updated;
 }
@@ -327,14 +379,47 @@ int rnet_lan_beacon_lookup(const RNetLanBeacon *beacon, const char *lobby_id,
     endpoint_out[0] = '\0';
     now = rnet_os_monotonic_ms();
     for (i = 0; i < RNET_BC_CACHE_MAX; ++i) {
-        if (!beacon->cache[i].lobby_id[0])
+        if (!beacon->cache[i].room.lobby_id[0])
             continue;
-        if (strcmp(beacon->cache[i].lobby_id, lobby_id) != 0)
+        if (strcmp(beacon->cache[i].room.lobby_id, lobby_id) != 0)
             continue;
-        if (now - beacon->cache[i].last_seen_ms > RNET_BC_STALE_MS)
+        if (!entry_fresh(&beacon->cache[i], now))
             return 0;
-        copy_trunc(endpoint_out, endpoint_cap, beacon->cache[i].endpoint);
+        copy_trunc(endpoint_out, endpoint_cap, beacon->cache[i].room.endpoint);
         return endpoint_out[0] ? 1 : 0;
+    }
+    return 0;
+}
+
+int rnet_lan_beacon_count(const RNetLanBeacon *beacon)
+{
+    rnet_u64 now;
+    int i;
+    int n = 0;
+    if (!beacon)
+        return 0;
+    now = rnet_os_monotonic_ms();
+    for (i = 0; i < RNET_BC_CACHE_MAX; ++i)
+        if (entry_fresh(&beacon->cache[i], now))
+            ++n;
+    return n;
+}
+
+int rnet_lan_beacon_get(const RNetLanBeacon *beacon, int index,
+                        RNetLanBeaconRoom *out)
+{
+    rnet_u64 now;
+    int i;
+    if (!beacon || !out || index < 0)
+        return 0;
+    now = rnet_os_monotonic_ms();
+    for (i = 0; i < RNET_BC_CACHE_MAX; ++i) {
+        if (!entry_fresh(&beacon->cache[i], now))
+            continue;
+        if (index-- == 0) {
+            *out = beacon->cache[i].room;
+            return 1;
+        }
     }
     return 0;
 }

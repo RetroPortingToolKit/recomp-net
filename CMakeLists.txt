@@ -34,6 +34,7 @@ set(RNET_CORE_SOURCES
   src/transport/rnet_netsim.c
   src/transport/rnet_transport.c
   src/session/rnet_session.c
+  src/chat/rnet_chat_filter.c
   src/ice/rnet_ice_state.c
   src/ice/rnet_ice_agent.c
 )
@@ -207,6 +208,10 @@ endif()
 if(RNET_BUILD_TESTS)
   enable_testing()
 
+  add_executable(chat_filter_test tests/chat_filter_test.c)
+  target_link_libraries(chat_filter_test PRIVATE recomp_net)
+  add_test(NAME chat_filter_test COMMAND chat_filter_test)
+
   add_executable(ring_admit_test tests/ring_admit_test.c)
   target_link_libraries(ring_admit_test PRIVATE recomp_net)
   target_include_directories(ring_admit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -230,6 +235,10 @@ if(RNET_BUILD_TESTS)
   add_executable(lan_lobby_test tests/lan_lobby_test.c)
   target_link_libraries(lan_lobby_test PRIVATE recomp_net)
   add_test(NAME lan_lobby_test COMMAND lan_lobby_test)
+
+  add_executable(lan_beacon_test tests/lan_beacon_test.c)
+  target_link_libraries(lan_beacon_test PRIVATE recomp_net)
+  add_test(NAME lan_beacon_test COMMAND lan_beacon_test)
 
   add_executable(udp_port_test tests/udp_port_test.c)
   target_link_libraries(udp_port_test PRIVATE recomp_net)
