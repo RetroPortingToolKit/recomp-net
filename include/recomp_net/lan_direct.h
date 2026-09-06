@@ -95,6 +95,20 @@ int rnet_lan_direct_host_send_chat(RNetLanDirectHost *host,
 int rnet_lan_direct_host_take_chat(RNetLanDirectHost *host,
                                    RNetLanChatLine *out);
 
+/* Seat swap. The two-seat room has one possible trade -- host and guest --
+ * so a request carries no seat numbers. The seated guest asks (SWAPREQ), the
+ * host's caller reads it through take_swap_request (1 once per ask), decides,
+ * and answers with send_swap_result; the guest's caller reads that through
+ * take_swap_result (1 once per answer, *accept filled). Moving the seats
+ * themselves is the caller's job (the room file), as for every other change. */
+int rnet_lan_direct_host_take_swap_request(RNetLanDirectHost *host);
+
+/* Push the seat table (host_slot, names, started) to the seated guest. Call
+ * on every room change: without it a guest learns a seat swap only at start. */
+int rnet_lan_direct_host_notify_room(RNetLanDirectHost *host,
+                                     const RNetLanLobby *room);
+int rnet_lan_direct_host_send_swap_result(RNetLanDirectHost *host, int accept);
+
 /* ---- guest --------------------------------------------------------------- */
 
 /* Blocking join to host_hostport. timeout_ms <= 0 → 2000.
@@ -127,6 +141,11 @@ int rnet_lan_direct_guest_send_chat(RNetLanDirectGuest *guest,
 /* Drain one received line, oldest first. 1 = filled, 0 = queue empty. */
 int rnet_lan_direct_guest_take_chat(RNetLanDirectGuest *guest,
                                     RNetLanChatLine *out);
+
+/* Guest asks the host to trade seats / reads the host's answer (see the
+ * host side above). */
+int rnet_lan_direct_guest_send_swap_request(RNetLanDirectGuest *guest);
+int rnet_lan_direct_guest_take_swap_result(RNetLanDirectGuest *guest, int *accept);
 
 /* Guest leaves waiting room (best-effort notify). */
 int rnet_lan_direct_guest_leave(RNetLanDirectGuest *guest);
