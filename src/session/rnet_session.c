@@ -1139,7 +1139,18 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return; /* ignore echo */
     }
-    if (s->cfg.local_slot == 0)
+    if (pkt->state_op == RNET_STATE_OP_MEMCARD)
+    {
+        /* Peer→host upload: only the host receives it, and only from a
+         * guest. Other guests see the same broadcast and must not open a
+         * receive for it, or they would sit on a transfer nobody drives for
+         * them (the sender only tracks the host's ACKs). */
+        if (s->cfg.local_slot != 0 || pkt->local_slot == 0)
+        {
+            return;
+        }
+    }
+    else if (s->cfg.local_slot == 0)
     {
         return; /* host never receives BEGIN */
     }
@@ -2695,12 +2706,25 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
     {
         return -1;
     }
-    if (s->cfg.local_slot != 0 || s->phase != RNET_PHASE_RUNNING || s->state_active)
+    if (s->phase != RNET_PHASE_RUNNING || s->state_active)
     {
         return -1;
     }
-    if (op != RNET_STATE_OP_SAVE && op != RNET_STATE_OP_LOAD && op != RNET_STATE_OP_SRAM &&
-        op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT)
+    if (op == RNET_STATE_OP_MEMCARD)
+    {
+        /* Guest-only upload: the host is the receiver of this op, never its
+         * sender (it would be broadcasting to peers that drop it). */
+        if (s->cfg.local_slot == 0)
+        {
+            return -1;
+        }
+    }
+    else if (s->cfg.local_slot != 0)
+    {
+        return -1;
+    }
+    else if (op != RNET_STATE_OP_SAVE && op != RNET_STATE_OP_LOAD && op != RNET_STATE_OP_SRAM &&
+             op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT)
     {
         return -1;
     }
@@ -2726,6 +2750,14 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
         s->state_next_xfer_id = 1;
     }
     s->state_xfer_id = s->state_next_xfer_id;
+    if (op == RNET_STATE_OP_MEMCARD)
+    {
+        /* The receiver compares against the ids of transfers IT finished — its
+         * own, small counter. Keep guest uploads out of that space so a fresh
+         * upload is never mistaken for a completed host transfer and re-ACKed
+         * instead of received. */
+        s->state_xfer_id |= 0x40000000u;
+    }
     s->state_total = (rnet_u32)size;
     s->state_crc = rnet_proto_checksum(s->state_buf, s->state_total);
     s->state_contiguity = 0;

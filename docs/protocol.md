@@ -96,7 +96,13 @@ multi‑MB MotK `.pst` transfers do not crawl on Force TURN.
 Guest marks ready only after full contiguous receive **and** CRC match. Admit
 stalls for the whole transfer.
 
-`op`: `0=SAVE`, `1=LOAD`, `2=SRAM`.
+`op`: `0=SAVE`, `1=LOAD`, `2=SRAM`, `3=RB_KF`, `4=BOOT`, `5=MEMCARD`.
+
+`MEMCARD` is the one **guest→host** op: a seated guest uploads its own memory
+card so the host can fold it into the SRAM blob it then broadcasts. `slot`
+carries the sender's seat. Only the host opens a receive for it; other guests
+see the same broadcast and drop it (the sender tracks only the host's ACKs).
+It is never probed — the host has nothing to hash it against.
 
 ### STATE_PROBE (11) / STATE_PROBE_REPLY (12)
 

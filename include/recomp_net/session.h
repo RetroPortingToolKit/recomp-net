@@ -173,6 +173,11 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
 #define RNET_STATE_OP_SRAM 2 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_RB_KF 3 /* rollback FMV media keyframe (raw boot_state snap) */
 #define RNET_STATE_OP_BOOT 4 /* post-BIOS host snap barrier (boot_state blob) */
+/* Guest-owned memory card upload. The ONLY peer→host op: a seated guest sends
+ * its card to the host before the host's SRAM broadcast, so the host can fold
+ * it into the blob every peer receives. `slot` carries the sender's seat.
+ * Never probed (the host has nothing to hash it against); begin only. */
+#define RNET_STATE_OP_MEMCARD 5
 
 /*
  * Hash probe (host→guest): announce (op, slot, size, crc).
@@ -198,6 +203,8 @@ void rnet_session_state_probe_finish(RNetSession *s);
  * Host-only (local_slot == 0) chunked blob transfer. Stalls try_admit until the
  * peer ACKs the full payload (all ops). Prefer probe-first; call begin only on
  * hash miss. payload_crc in BEGIN is verified by the guest before ready.
+ * Exception: RNET_STATE_OP_MEMCARD is guest-only (local_slot != 0) and is
+ * received by the host alone; other guests drop it.
  */
 int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const void *data, size_t size);
 int rnet_session_state_busy(const RNetSession *s);
