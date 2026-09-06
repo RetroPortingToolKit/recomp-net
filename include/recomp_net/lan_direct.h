@@ -32,6 +32,28 @@ enum {
 typedef struct RNetLanDirectHost RNetLanDirectHost;
 typedef struct RNetLanDirectGuest RNetLanDirectGuest;
 
+/* ---- lobby chat ----------------------------------------------------------
+ *
+ * The HOST is the authority, exactly as the lobby server is online. A guest
+ * sends its line to the host and appends nothing locally; the host stamps the
+ * sender's seat name on it, keeps it, and echoes it to the guest. So both
+ * peers read the same lines in the same order, and neither can show a line
+ * the other never got.
+ *
+ * Received lines queue inside the host/guest handle and are drained with
+ * take_chat. A queue rather than a single slot: two lines can land between
+ * pumps, and dropping the second would silently lose what somebody said. */
+#define RNET_LAN_CHAT_ID_LEN   64
+#define RNET_LAN_CHAT_NAME_LEN 64
+#define RNET_LAN_CHAT_TEXT_LEN 256
+#define RNET_LAN_CHAT_QUEUE    16
+
+typedef struct RNetLanChatLine {
+    char player_id[RNET_LAN_CHAT_ID_LEN];
+    char from[RNET_LAN_CHAT_NAME_LEN];
+    char text[RNET_LAN_CHAT_TEXT_LEN];
+} RNetLanChatLine;
+
 /* ---- host (waiting room) ------------------------------------------------- */
 
 /* Bind UDP on bind_hostport (usually 0.0.0.0:<port>). Copies room fields.
@@ -62,6 +84,17 @@ int rnet_lan_direct_host_notify_caps(RNetLanDirectHost *host,
 int rnet_lan_direct_host_notify_kick(RNetLanDirectHost *host);
 int rnet_lan_direct_host_notify_close(RNetLanDirectHost *host);
 
+/* Host says something. Queued locally AND sent to the seated guest, so the
+ * caller reads its own line back through take_chat like any other -- one
+ * source for what was said, in one order. */
+int rnet_lan_direct_host_send_chat(RNetLanDirectHost *host,
+                                   const char *player_id, const char *from,
+                                   const char *text);
+
+/* Drain one received line, oldest first. 1 = filled, 0 = queue empty. */
+int rnet_lan_direct_host_take_chat(RNetLanDirectHost *host,
+                                   RNetLanChatLine *out);
+
 /* ---- guest --------------------------------------------------------------- */
 
 /* Blocking join to host_hostport. timeout_ms <= 0 → 2000.
@@ -83,6 +116,17 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
 
 /* Send a latency probe to the host. */
 int rnet_lan_direct_guest_ping(RNetLanDirectGuest *guest);
+
+/* Guest says something. Sent to the host and NOT queued locally: the host is
+ * the authority and echoes it back, which is what keeps both peers' logs in
+ * the same order. `from` is the host's to fill in from the seat table -- a
+ * guest naming itself could name anybody. */
+int rnet_lan_direct_guest_send_chat(RNetLanDirectGuest *guest,
+                                    const char *player_id, const char *text);
+
+/* Drain one received line, oldest first. 1 = filled, 0 = queue empty. */
+int rnet_lan_direct_guest_take_chat(RNetLanDirectGuest *guest,
+                                    RNetLanChatLine *out);
 
 /* Guest leaves waiting room (best-effort notify). */
 int rnet_lan_direct_guest_leave(RNetLanDirectGuest *guest);
