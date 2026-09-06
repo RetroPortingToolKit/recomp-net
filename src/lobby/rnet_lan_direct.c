@@ -9,18 +9,85 @@
 #define RNET_DJ_MAGIC "RNETDJ1"
 #define RNET_DJ_MAX_PKT 1024
 
+/* Received chat, oldest at head. Sized so a burst between two pumps is kept
+ * rather than dropped; when it does overflow the OLDEST goes, because losing
+ * what was just said is the worse failure. */
+struct RNetLanChatQueue {
+    RNetLanChatLine line[RNET_LAN_CHAT_QUEUE];
+    int head;
+    int count;
+};
+
 struct RNetLanDirectHost {
     rnet_socket sock;
     struct sockaddr_in guest;
     int guest_known;
     char bind_hostport[64];
+    struct RNetLanChatQueue chat;
+    int swap_req_pending; /* the seated guest asked to trade seats */
 };
 
 struct RNetLanDirectGuest {
     rnet_socket sock;
     struct sockaddr_in host;
     char host_hostport[64];
+    struct RNetLanChatQueue chat;
+    int swap_res_pending; /* the host answered a swap request */
+    int swap_res_accept;
 };
+
+static void chat_queue_push(struct RNetLanChatQueue *q, const char *player_id,
+                            const char *from, const char *text)
+{
+    RNetLanChatLine *m;
+    int idx;
+    if (!q || !text || !text[0])
+        return;
+    if (q->count < RNET_LAN_CHAT_QUEUE) {
+        idx = (q->head + q->count) % RNET_LAN_CHAT_QUEUE;
+        q->count++;
+    } else {
+        idx = q->head;
+        q->head = (q->head + 1) % RNET_LAN_CHAT_QUEUE;
+    }
+    m = &q->line[idx];
+    memset(m, 0, sizeof(*m));
+    snprintf(m->player_id, sizeof(m->player_id), "%s", player_id ? player_id : "");
+    snprintf(m->from, sizeof(m->from), "%s", from ? from : "");
+    snprintf(m->text, sizeof(m->text), "%s", text);
+}
+
+static int chat_queue_take(struct RNetLanChatQueue *q, RNetLanChatLine *out)
+{
+    if (!q || !out || q->count <= 0)
+        return 0;
+    *out = q->line[q->head];
+    q->head = (q->head + 1) % RNET_LAN_CHAT_QUEUE;
+    q->count--;
+    return 1;
+}
+
+/* A chat line is one line on a newline-delimited wire, so it cannot contain
+ * one. Control bytes are dropped and newlines become spaces rather than the
+ * line being refused: a peer that pastes two lines should be heard, not
+ * silently ignored -- and must not be able to forge a second datagram field. */
+static void chat_sanitize(const char *in, char *out, size_t cap)
+{
+    size_t o = 0;
+    if (!out || cap == 0)
+        return;
+    for (; in && *in && o + 1 < cap; ++in) {
+        const unsigned char c = (unsigned char)*in;
+        if (c == '\n' || c == '\r') {
+            out[o++] = ' ';
+            continue;
+        }
+        if (c < 0x20)
+            continue;
+        out[o++] = (char)c;
+    }
+    out[o] = '\0';
+}
 
 static void trim_crlf(char *s)
 {
@@ -90,6 +157,69 @@ static int build_join_req(char *buf, size_t cap, const char *game,
         !append_line(buf, cap, &o, version ? version : "") ||
         !append_line(buf, cap, &o, password ? password : "") ||
         !append_line(buf, cap, &o, player && player[0] ? player : "Player"))
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return RNET_LAN_DIRECT_OK;
+}
+
+static int build_chat(char *buf, size_t cap, const char *player_id,
+                      const char *from, const char *text)
+{
+    size_t o = 0;
+    if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
+        !append_line(buf, cap, &o, "CHAT") ||
+        !append_line(buf, cap, &o, player_id ? player_id : "") ||
+        !append_line(buf, cap, &o, from ? from : "") ||
+        !append_line(buf, cap, &o, text ? text : ""))
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return RNET_LAN_DIRECT_OK;
+}
+
+/* Room state the guest cannot otherwise learn between join and start: who
+ * sits where. Sent by the host whenever the room changes. */
+static int build_room(char *buf, size_t cap, const RNetLanLobby *room)
+{
+    size_t o = 0;
+    char host_slot[8];
+    char started[8];
+    snprintf(host_slot, sizeof(host_slot), "%d", room && room->host_slot == 1 ? 1 : 0);
+    snprintf(started, sizeof(started), "%d", room && room->started ? 1 : 0);
+    if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
+        !append_line(buf, cap, &o, "ROOM") ||
+        !append_line(buf, cap, &o, host_slot) ||
+        !append_line(buf, cap, &o, room ? room->host_name : "") ||
+        !append_line(buf, cap, &o, room ? room->joiner_name : "") ||
+        !append_line(buf, cap, &o, started))
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return RNET_LAN_DIRECT_OK;
+}
+
+static int build_swap_req(char *buf, size_t cap)
+{
+    size_t o = 0;
+    if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
+        !append_line(buf, cap, &o, "SWAPREQ"))
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return RNET_LAN_DIRECT_OK;
+}
+
+static int build_swap_res(char *buf, size_t cap, int accept)
+{
+    size_t o = 0;
+    if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
+        !append_line(buf, cap, &o, "SWAPRES") ||
+        !append_line(buf, cap, &o, accept ? "1" : "0"))
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return RNET_LAN_DIRECT_OK;
+}
+
+static int build_chat_req(char *buf, size_t cap, const char *player_id,
+                          const char *text)
+{
+    size_t o = 0;
+    if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
+        !append_line(buf, cap, &o, "CHATREQ") ||
+        !append_line(buf, cap, &o, player_id ? player_id : "") ||
+        !append_line(buf, cap, &o, text ? text : ""))
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return RNET_LAN_DIRECT_OK;
 }
@@ -456,6 +586,37 @@ int rnet_lan_direct_host_pump(RNetLanDirectHost *host, RNetLanLobby *room,
             changed = 1;
             if (build_join_ok(reply, sizeof(reply), room) == 0)
                 (void)send_text(host->sock, &src, reply);
+        } else if (strcmp(op, "SWAPREQ") == 0) {
+            /* Only the seated guest has a seat to trade. */
+            if (!host->guest_known ||
+                src.sin_addr.s_addr != host->guest.sin_addr.s_addr ||
+                src.sin_port != host->guest.sin_port)
+                continue;
+            host->swap_req_pending = 1;
+        } else if (strcmp(op, "CHATREQ") == 0) {
+            /* The guest says what it said; the HOST says who said it. A
+             * sender-supplied name could be anybody's, and the seat table is
+             * the only thing that actually knows. */
+            const char *player_id = next_line(&cursor);
+            const char *raw = next_line(&cursor);
+            char text[RNET_LAN_CHAT_TEXT_LEN];
+            char reply[RNET_DJ_MAX_PKT];
+            const char *from;
+            chat_sanitize(raw, text, sizeof(text));
+            if (!text[0])
+                continue;
+            /* Only from the seated guest: an unseated sender is not in this
+             * room and has no seat name to speak under. */
+            if (!host->guest_known ||
+                src.sin_addr.s_addr != host->guest.sin_addr.s_addr ||
+                src.sin_port != host->guest.sin_port)
+                continue;
+            from = room->joiner_name[0] ? room->joiner_name : "Player";
+            chat_queue_push(&host->chat, player_id, from, text);
+            /* Echoed back to the sender too -- that echo is the copy the
+             * guest keeps, which is what puts both logs in one order. */
+            if (build_chat(reply, sizeof(reply), player_id, from, text) == 0)
+                (void)send_text(host->sock, &host->guest, reply);
         } else if (strcmp(op, "LEAVE") == 0) {
             if (host->guest_known && room->joiner_name[0]) {
                 room->joiner_name[0] = '\0';
@@ -735,6 +896,48 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
             return 3;
         return 0;
     }
+    if (strcmp(op, "ROOM") == 0) {
+        const char *host_slot = next_line(&cursor);
+        const char *host_name = next_line(&cursor);
+        const char *joiner_name = next_line(&cursor);
+        const char *started = next_line(&cursor);
+        if (src.sin_addr.s_addr != guest->host.sin_addr.s_addr ||
+            src.sin_port != guest->host.sin_port)
+            return 0;
+        if (room) {
+            room->host_slot = (host_slot && host_slot[0] == '1') ? 1 : 0;
+            if (host_name)
+                snprintf(room->host_name, sizeof(room->host_name), "%s", host_name);
+            if (joiner_name)
+                snprintf(room->joiner_name, sizeof(room->joiner_name), "%s",
+                         joiner_name);
+            room->started = (started && started[0] == '1') ? 1 : 0;
+        }
+        return 0;
+    }
+    if (strcmp(op, "SWAPRES") == 0) {
+        const char *accept = next_line(&cursor);
+        if (src.sin_addr.s_addr != guest->host.sin_addr.s_addr ||
+            src.sin_port != guest->host.sin_port)
+            return 0;
+        guest->swap_res_pending = 1;
+        guest->swap_res_accept = (accept && accept[0] == '1') ? 1 : 0;
+        return 0;
+    }
+    if (strcmp(op, "CHAT") == 0) {
+        /* Only from the host: it is the authority for what was said and by
+         * whom, and a line from anywhere else is not part of this room. */
+        const char *player_id = next_line(&cursor);
+        const char *from = next_line(&cursor);
+        const char *raw = next_line(&cursor);
+        char text[RNET_LAN_CHAT_TEXT_LEN];
+        if (src.sin_addr.s_addr != guest->host.sin_addr.s_addr ||
+            src.sin_port != guest->host.sin_port)
+            return 0;
+        chat_sanitize(raw, text, sizeof(text));
+        chat_queue_push(&guest->chat, player_id, from, text);
+        return 0;
+    }
     if (strcmp(op, "START") == 0) {
         const char *delay_line = next_line(&cursor);
         const char *rollback_line = next_line(&cursor);
@@ -763,6 +966,114 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
     if (strcmp(op, "KICK") == 0 || strcmp(op, "CLOSE") == 0)
         return 2;
     return 0;
+}
+
+int rnet_lan_direct_host_send_chat(RNetLanDirectHost *host,
+                                   const char *player_id, const char *from,
+                                   const char *text)
+{
+    char buf[RNET_DJ_MAX_PKT];
+    char line[RNET_LAN_CHAT_TEXT_LEN];
+    if (!host)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    chat_sanitize(text, line, sizeof(line));
+    if (!line[0])
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    /* Kept locally first, so the host's own log is complete whether or not a
+     * guest is seated to send it to. */
+    chat_queue_push(&host->chat, player_id, from, line);
+    if (!host->guest_known)
+        return RNET_LAN_DIRECT_OK;
+    if (build_chat(buf, sizeof(buf), player_id, from, line) != 0)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return send_text(host->sock, &host->guest, buf);
+}
+
+int rnet_lan_direct_host_take_chat(RNetLanDirectHost *host,
+                                   RNetLanChatLine *out)
+{
+    if (!host)
+        return 0;
+    return chat_queue_take(&host->chat, out);
+}
+
+int rnet_lan_direct_host_notify_room(RNetLanDirectHost *host,
+                                     const RNetLanLobby *room)
+{
+    char buf[RNET_DJ_MAX_PKT];
+    if (!host || !room)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (!host->guest_known)
+        return RNET_LAN_DIRECT_OK;
+    if (build_room(buf, sizeof(buf), room) != 0)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return send_text(host->sock, &host->guest, buf);
+}
+
+int rnet_lan_direct_host_take_swap_request(RNetLanDirectHost *host)
+{
+    if (!host || !host->swap_req_pending)
+        return 0;
+    host->swap_req_pending = 0;
+    return 1;
+}
+
+int rnet_lan_direct_host_send_swap_result(RNetLanDirectHost *host, int accept)
+{
+    char buf[RNET_DJ_MAX_PKT];
+    if (!host)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (!host->guest_known)
+        return RNET_LAN_DIRECT_OK;
+    if (build_swap_res(buf, sizeof(buf), accept) != 0)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return send_text(host->sock, &host->guest, buf);
+}
+
+int rnet_lan_direct_guest_send_swap_request(RNetLanDirectGuest *guest)
+{
+    char buf[RNET_DJ_MAX_PKT];
+    if (!guest)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (build_swap_req(buf, sizeof(buf)) != 0)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    return send_text(guest->sock, &guest->host, buf);
+}
+
+int rnet_lan_direct_guest_take_swap_result(RNetLanDirectGuest *guest, int *accept)
+{
+    if (!guest || !guest->swap_res_pending)
+        return 0;
+    guest->swap_res_pending = 0;
+    if (accept)
+        *accept = guest->swap_res_accept;
+    return 1;
+}
+
+int rnet_lan_direct_guest_send_chat(RNetLanDirectGuest *guest,
+                                    const char *player_id, const char *text)
+{
+    char buf[RNET_DJ_MAX_PKT];
+    char line[RNET_LAN_CHAT_TEXT_LEN];
+    if (!guest)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    chat_sanitize(text, line, sizeof(line));
+    if (!line[0])
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (build_chat_req(buf, sizeof(buf), player_id, line) != 0)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    /* Deliberately NOT queued locally: the host echoes it back, and that echo
+     * is the copy this side keeps. Appending here as well would show the line
+     * twice, and show it in an order the host never agreed to. */
+    return send_text(guest->sock, &guest->host, buf);
+}
+
+int rnet_lan_direct_guest_take_chat(RNetLanDirectGuest *guest,
+                                    RNetLanChatLine *out)
+{
+    if (!guest)
+        return 0;
+    return chat_queue_take(&guest->chat, out);
 }
 
 int rnet_lan_direct_guest_leave(RNetLanDirectGuest *guest)
