@@ -41,6 +41,23 @@ enum {
     RNET_ACCOUNT_FAILED = 3
 };
 
+/*
+ * Where the secret file lives. Call BEFORE rnet_account_init, once, with an
+ * absolute path.
+ *
+ * Without this the path is the bare relative name "netplay_secret", which
+ * resolves against the CURRENT WORKING DIRECTORY -- so the same installed
+ * build signs itself out depending on where it was launched from, and a
+ * rebuild that runs from a different directory looks like a lost login. Hosts
+ * that know their own executable directory should say so here; that is the
+ * "travels with the build" behaviour this file's header describes.
+ *
+ * If the configured path does not exist but a legacy CWD-relative
+ * "netplay_secret" does, the legacy one is read and then migrated to the
+ * configured path, so turning this on does not sign anyone out.
+ */
+void rnet_account_set_secret_path(const char *path);
+
 /* `ws_url` is the lobby URL the client is configured with; the HTTP endpoints
  * live on the same host and port. Safe to call again when the URL changes. */
 void rnet_account_init(const char *ws_url);

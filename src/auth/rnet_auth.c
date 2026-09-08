@@ -184,20 +184,47 @@ static void hmac_sha256_hex(const char *key, const char *msg, char out_hex[65]) 
 
 /* ---- the secret file ---------------------------------------------------- */
 
-static void secret_path(char *out, size_t cap) {
-    /* Beside the other runtime config (keybinds.ini, config.ini), so a build
-     * copied to another device carries it the same way. */
-    snprintf(out, cap, "netplay_secret");
+/* Absolute path set by the host via rnet_account_set_secret_path(). Empty
+ * means "not configured", and the legacy CWD-relative name is used. */
+static char g_secret_path[512];
+
+void rnet_account_set_secret_path(const char *path) {
+    if (!path || !path[0]) { g_secret_path[0] = '\0'; return; }
+    snprintf(g_secret_path, sizeof(g_secret_path), "%s", path);
 }
 
+#define SECRET_LEGACY_NAME "netplay_secret"
+
+static void secret_path(char *out, size_t cap) {
+    /* The host's configured location if it gave one. Otherwise the legacy
+     * bare name -- which resolves against the CWD, not the executable
+     * directory, and is why a build could appear to forget its login after a
+     * rebuild that ran from somewhere else. */
+    if (g_secret_path[0]) {
+        snprintf(out, cap, "%s", g_secret_path);
+        return;
+    }
+    snprintf(out, cap, "%s", SECRET_LEGACY_NAME);
+}
+
+static void secret_store(const char *player_id, const char *secret);
+
 static void secret_load(void) {
-    char path[256];
+    char path[512];
     FILE *f;
     size_t n;
+    int from_legacy = 0;
     secret_path(path, sizeof(path));
     g.secret[0] = '\0';
     g.player_id[0] = '\0';
     f = fopen(path, "rb");
+    if (!f && g_secret_path[0]) {
+        /* Configured path is empty but the old CWD-relative file may still be
+         * sitting where a previous run left it. Read it rather than making the
+         * player sign in again just because the path moved. */
+        f = fopen(SECRET_LEGACY_NAME, "rb");
+        from_legacy = (f != NULL);
+    }
     if (!f) return;
     n = fread(g.secret, 1, sizeof(g.secret) - 1, f);
     g.secret[n] = '\0';
@@ -216,10 +243,15 @@ static void secret_load(void) {
         nl = strpbrk(g.secret, "\r\n");
         if (nl) *nl = '\0';
     }
+    /* Migrate forward so the next run finds it in the stable place. The old
+     * file is deliberately left alone: it is a credential, and deleting one
+     * on the strength of a write we have not confirmed is the wrong order. */
+    if (from_legacy && g.secret[0])
+        secret_store(g.player_id, g.secret);
 }
 
 static void secret_store(const char *player_id, const char *secret) {
-    char path[256];
+    char path[512];
     FILE *f;
     secret_path(path, sizeof(path));
     f = fopen(path, "wb");
@@ -235,7 +267,7 @@ static void secret_store(const char *player_id, const char *secret) {
 }
 
 static void secret_forget(void) {
-    char path[256];
+    char path[512];
     secret_path(path, sizeof(path));
     remove(path);
     g.secret[0] = '\0';
