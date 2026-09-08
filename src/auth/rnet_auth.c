@@ -226,22 +226,33 @@ static void secret_load(void) {
         from_legacy = (f != NULL);
     }
     if (!f) return;
-    n = fread(g.secret, 1, sizeof(g.secret) - 1, f);
-    g.secret[n] = '\0';
-    fclose(f);
-    /* Format: "<player_id> <secret>\n". Tolerate a trailing newline. */
+    /* Read the WHOLE LINE into its own buffer, not into g.secret.
+     *
+     * The line is "<player_id> <secret>\n" -- for a UUID id and a 68-char key
+     * that is 106 bytes -- and it was read into g.secret, which is SECRET_MAX
+     * (96). fread capped at 95, so the secret was silently truncated (68 chars
+     * to 58) before it was ever split out. The proof computed from it was
+     * wrong, the server answered 401, and the key was then discarded as
+     * invalid.
+     *
+     * That is why a sign-in never survived a relaunch: job_login stores the
+     * key straight from the login reply, so signing IN always worked, and only
+     * the next launch -- the one that has to read the file back -- failed.
+     * The buffer has to hold both fields and the separator, not just whichever
+     * one is larger. */
     {
-        char *sp = strchr(g.secret, ' ');
-        char *nl;
-        if (sp) {
-            size_t idn = (size_t)(sp - g.secret);
-            if (idn >= sizeof(g.player_id)) idn = sizeof(g.player_id) - 1;
-            memcpy(g.player_id, g.secret, idn);
-            g.player_id[idn] = '\0';
-            memmove(g.secret, sp + 1, strlen(sp + 1) + 1);
-        }
-        nl = strpbrk(g.secret, "\r\n");
+        char line[ID_MAX + SECRET_MAX + 8];
+        char *sp, *nl;
+        n = fread(line, 1, sizeof(line) - 1, f);
+        line[n] = '\0';
+        fclose(f);
+        nl = strpbrk(line, "\r\n");
         if (nl) *nl = '\0';
+        sp = strchr(line, ' ');
+        if (!sp) return;            /* malformed: no id/secret separator */
+        *sp = '\0';
+        snprintf(g.player_id, sizeof(g.player_id), "%s", line);
+        snprintf(g.secret, sizeof(g.secret), "%s", sp + 1);
     }
     /* Migrate forward so the next run finds it in the stable place. The old
      * file is deliberately left alone: it is a credential, and deleting one
@@ -379,24 +390,6 @@ static int prove_and_get_session(void) {
     json_str(body, "session", g.session, sizeof(g.session));
     json_str(body, "handle", g.handle, sizeof(g.handle));
     json_str(body, "discord_username", g.username, sizeof(g.username));
-    /* Accept a ROTATED key if the server issues one.
-     *
-     * job_login's poll already stores a `netplay_secret` from its reply; this
-     * path never looked for one. If the server rotates the device key on
-     * redemption -- a normal design, and single-use keys are the usual reason
-     * a saved sign-in works exactly once -- then not storing the replacement
-     * leaves the on-disk key stale from the moment it is first used. The next
-     * launch is refused, and (before the fix above) the file was deleted, so
-     * the player signs in again every time.
-     *
-     * Harmless when the server does not rotate: the field is simply absent
-     * and nothing is written. */
-    {
-        char rotated[SECRET_MAX];
-        if (json_str(body, "netplay_secret", rotated, sizeof(rotated)) &&
-            rotated[0] && strcmp(rotated, g.secret) != 0)
-            secret_store(g.player_id, rotated);
-    }
     /* 200 with no session is the server misbehaving, not the key being bad. */
     return g.session[0] ? SESSION_OK : SESSION_UNREACHABLE;
 }
