@@ -333,20 +333,39 @@ static int http_post(const char *path, const char *json, char *body, size_t cap)
 
 /* ---- one challenge/proof round ------------------------------------------ */
 
-/* Fills `session` and the display fields. Returns 1 on success. The key never
- * leaves this function: only the HMAC does. */
+/*
+ * Outcome of one challenge/proof round.
+ *
+ * The distinction is load-bearing: the caller DELETES the stored key on a
+ * rejection, so "could not reach the server" must never be reported as
+ * "this key is no longer valid". Conflating them meant a network blip at
+ * launch destroyed a working credential and made the player sign in again.
+ */
+enum { SESSION_OK = 0, SESSION_REJECTED, SESSION_UNREACHABLE };
+
+/* Only an authoritative "we do not know this key" is a rejection. A transport
+ * failure (negative), a server fault (5xx), or a malformed reply are all
+ * "ask again later" -- the key may be perfectly good. */
+static int session_verdict_from_status(int st) {
+    if (st == 401 || st == 403 || st == 404) return SESSION_REJECTED;
+    return SESSION_UNREACHABLE;
+}
+
+/* Fills `session` and the display fields. Returns a SESSION_* code. The key
+ * never leaves this function: only the HMAC does. */
 static int prove_and_get_session(void) {
     char body[2048], reqbuf[512], nonce[128], verifier_hex[65], proof[65];
     unsigned char digest[32];
     char id_esc[128];
     int st;
 
-    if (!g.secret[0] || !g.player_id[0]) return 0;
+    if (!g.secret[0] || !g.player_id[0]) return SESSION_REJECTED;
 
     json_esc(g.player_id, id_esc, sizeof(id_esc));
     snprintf(reqbuf, sizeof(reqbuf), "{\"player_id\":\"%s\"}", id_esc);
     st = http_post("/auth/challenge", reqbuf, body, sizeof(body));
-    if (st != 200 || !json_str(body, "nonce", nonce, sizeof(nonce))) return 0;
+    if (st != 200) return session_verdict_from_status(st);
+    if (!json_str(body, "nonce", nonce, sizeof(nonce))) return SESSION_UNREACHABLE;
 
     rnet_sha256_compute((const unsigned char *)g.secret, strlen(g.secret), digest);
     hex_encode(digest, 32, verifier_hex);
@@ -356,11 +375,30 @@ static int prove_and_get_session(void) {
              "{\"player_id\":\"%s\",\"nonce\":\"%s\",\"proof\":\"%s\"}",
              id_esc, nonce, proof);
     st = http_post("/auth/session", reqbuf, body, sizeof(body));
-    if (st != 200) return 0;
+    if (st != 200) return session_verdict_from_status(st);
     json_str(body, "session", g.session, sizeof(g.session));
     json_str(body, "handle", g.handle, sizeof(g.handle));
     json_str(body, "discord_username", g.username, sizeof(g.username));
-    return g.session[0] ? 1 : 0;
+    /* Accept a ROTATED key if the server issues one.
+     *
+     * job_login's poll already stores a `netplay_secret` from its reply; this
+     * path never looked for one. If the server rotates the device key on
+     * redemption -- a normal design, and single-use keys are the usual reason
+     * a saved sign-in works exactly once -- then not storing the replacement
+     * leaves the on-disk key stale from the moment it is first used. The next
+     * launch is refused, and (before the fix above) the file was deleted, so
+     * the player signs in again every time.
+     *
+     * Harmless when the server does not rotate: the field is simply absent
+     * and nothing is written. */
+    {
+        char rotated[SECRET_MAX];
+        if (json_str(body, "netplay_secret", rotated, sizeof(rotated)) &&
+            rotated[0] && strcmp(rotated, g.secret) != 0)
+            secret_store(g.player_id, rotated);
+    }
+    /* 200 with no session is the server misbehaving, not the key being bad. */
+    return g.session[0] ? SESSION_OK : SESSION_UNREACHABLE;
 }
 
 static void auth_sleep_ms(int ms) {
@@ -499,15 +537,28 @@ static void job_login(void) {
 }
 
 static void job_session(void) {
-    if (prove_and_get_session()) {
+    const int verdict = prove_and_get_session();
+    if (verdict == SESSION_OK) {
         g.state = RNET_ACCOUNT_SIGNED_IN;
-    } else {
-        /* A stored key that no longer works (revoked, or a different server):
-         * drop it and fall back to guest rather than nagging every launch. */
-        secret_forget();
-        g.session[0] = '\0';
-        g.state = RNET_ACCOUNT_GUEST;
+        return;
     }
+    g.session[0] = '\0';
+    if (verdict == SESSION_REJECTED) {
+        /* The server authoritatively does not know this key (revoked, or a
+         * different server): drop it and fall back to guest rather than
+         * nagging every launch. */
+        secret_forget();
+        g.state = RNET_ACCOUNT_GUEST;
+        return;
+    }
+    /* Could not get an answer. KEEP THE KEY. It was previously deleted here
+     * too, so a launch during a network blip -- or against a server having a
+     * bad minute -- silently destroyed a working credential and demanded a
+     * fresh Discord sign-in. Retry on the next launch instead, and say so,
+     * rather than failing silently into guest. */
+    set_err("Could not reach the sign-in server. Your sign-in is saved; "
+            "this will retry next time.");
+    g.state = RNET_ACCOUNT_FAILED;
 }
 
 static void job_set_handle(void) {
