@@ -35,6 +35,8 @@ set(RNET_CORE_SOURCES
   src/transport/rnet_transport.c
   src/session/rnet_session.c
   src/chat/rnet_chat_filter.c
+  src/auth/rnet_auth.c
+  src/auth/rnet_sha256.c
   src/ice/rnet_ice_state.c
   src/ice/rnet_ice_agent.c
 )
