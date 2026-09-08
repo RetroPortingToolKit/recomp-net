@@ -50,7 +50,18 @@ static struct {
      * thread; single-writer plus aligned word stores, which is what the
      * lobby client already relies on for its connect flags. */
     volatile int state;       /* RNET_ACCOUNT_* */
-    volatile int available;   /* -1 unknown, 0 no logins here, 1 yes */
+    /* 0 = not known to be unavailable, i.e. offer sign-in and let the first
+     * /auth/discord/start settle it; 1 = the server answered 503 and does not
+     * do logins at all.
+     *
+     * Phrased negatively ON PURPOSE. This was `available` with -1 meaning
+     * "unknown", which a zero-initialised static made 0 -- "no logins here" --
+     * until rnet_account_init ran. Init runs from the netplay pump, which the
+     * launcher only reaches on the lobby browser page, so the very first visit
+     * to the chooser saw "no sign-in" and skipped past it; backing out and
+     * re-entering worked, because by then the browser page had pumped. Zero
+     * now means the right thing without anyone having to initialise it. */
+    volatile int unavailable;
     volatile int busy;
 
     char secret[SECRET_MAX];
@@ -375,7 +386,7 @@ static void job_login(void) {
 
     st = http_post("/auth/discord/start", "{}", body, sizeof(body));
     if (st == 503) {
-        g.available = 0;
+        g.unavailable = 1;
         set_err("This lobby server does not offer Discord sign-in.");
         g.state = RNET_ACCOUNT_FAILED;
         return;
@@ -386,7 +397,7 @@ static void job_login(void) {
         g.state = RNET_ACCOUNT_FAILED;
         return;
     }
-    g.available = 1;
+    g.unavailable = 0;
     account_open_url(url);
 
     /* Poll until the server has an answer. The pairing code expires server
@@ -566,7 +577,6 @@ void rnet_account_init(const char *ws_url) {
         snprintf(g.host, sizeof(g.host), "%s", hostport);
     }
     if (!g.initialized) {
-        g.available = -1;
         g.state = RNET_ACCOUNT_GUEST;
         secret_load();
         g.initialized = 1;
@@ -585,10 +595,11 @@ void rnet_account_pump(void) {
 }
 
 int rnet_account_available(void) {
-    /* Unknown until something asks the server. Offering the button is right:
-     * the first start() settles it, and a 503 turns it off for good. */
-    return g.available != 0;
+    /* Unknown counts as available: offering the button is right, because the
+     * first /auth/discord/start settles it and a 503 turns it off for good. */
+    return !g.unavailable;
 }
+
 
 int rnet_account_login_begin(void) {
     if (g.busy) return -1;
