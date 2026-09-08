@@ -62,6 +62,8 @@ static struct {
      * re-entering worked, because by then the browser page had pumped. Zero
      * now means the right thing without anyone having to initialise it. */
     volatile int unavailable;
+    /* Set to abandon an in-flight login so a Retry can start a fresh one. */
+    volatile int cancel;
     volatile int busy;
 
     char secret[SECRET_MAX];
@@ -329,6 +331,17 @@ static int prove_and_get_session(void) {
     return g.session[0] ? 1 : 0;
 }
 
+static void auth_sleep_ms(int ms) {
+#if defined(_WIN32)
+    Sleep((DWORD)ms);
+#else
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    nanosleep(&ts, NULL);
+#endif
+}
+
 /* ---- opening the browser ------------------------------------------------ */
 
 /* The one thing the launcher cannot do for us: hand a URL to the desktop.
@@ -403,7 +416,11 @@ static void job_login(void) {
     /* Poll until the server has an answer. The pairing code expires server
      * side after ten minutes; stop a little before that rather than spinning
      * forever if the player closed the tab. */
-    for (tries = 0; tries < 300; ++tries) {
+    /* Poll for as long as a person plausibly needs to find their password
+     * manager and click Authorize. The UI offers Retry long before this, but
+     * it keeps polling underneath -- aborting after a few seconds would make
+     * signing in impossible, not more responsive. */
+    for (tries = 0; tries < 150 && !g.cancel; ++tries) {
         char req[256];
         char code_esc[160];
         json_esc(g.pair_code, code_esc, sizeof(code_esc));
@@ -423,19 +440,29 @@ static void job_login(void) {
             return;
         }
         if (st == 202) {
-#if defined(_WIN32)
-            Sleep(2000);
-#else
-            struct timespec ts; ts.tv_sec = 2; ts.tv_nsec = 0;
-            nanosleep(&ts, NULL);
-#endif
+            /* Sleep in slices so a Retry is noticed in well under a second
+             * rather than after the poll interval. */
+            int slice;
+            for (slice = 0; slice < 8 && !g.cancel; ++slice) auth_sleep_ms(250);
             continue;
         }
-        set_err("Discord sign-in did not complete. Try again.");
+        /* Anything else is final. Say what it was: a login that dies with a
+         * generic message is the hardest kind to report. */
+        fprintf(stderr, "rnet_account: poll ended with HTTP %d %s\n", st, body);
+        if (st == 403 && strstr(body, "expired")) {
+            set_err("That sign-in expired before it finished. "
+                    "Press Retry to start a new one.");
+        } else if (st < 0) {
+            set_err("Lost contact with the lobby server during sign-in. "
+                    "Press Retry.");
+        } else {
+            set_err("Discord sign-in did not complete. Press Retry.");
+        }
         g.state = RNET_ACCOUNT_FAILED;
         return;
     }
-    set_err("Sign-in timed out. Try again.");
+    if (g.cancel) return; /* superseded by a Retry; that job owns the state */
+    set_err("Discord did not answer in time. Press Retry.");
     g.state = RNET_ACCOUNT_FAILED;
 }
 
@@ -602,11 +629,23 @@ int rnet_account_available(void) {
 
 
 int rnet_account_login_begin(void) {
-    if (g.busy) return -1;
+    /* Retry has to work while a login is still polling, so ask the old worker
+     * to stand down and wait briefly for it. It checks the flag every 250ms. */
+    if (g.busy) {
+        int spins = 0;
+        g.cancel = 1;
+        while (g.busy && spins++ < 40) auth_sleep_ms(50);
+        if (g.busy) {
+            set_err("Still finishing the last sign-in attempt. Try again in a moment.");
+            return -1;
+        }
+    }
+    g.cancel = 0;
     g.error[0] = '\0';
     g.state = RNET_ACCOUNT_WAITING;
     return start_job(JOB_LOGIN);
 }
+
 
 int rnet_account_state(void) { return g.state; }
 const char *rnet_account_handle(void) { return g.handle; }
