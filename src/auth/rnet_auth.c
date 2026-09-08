@@ -310,6 +310,21 @@ static int http_post(const char *path, const char *json, char *body, size_t cap)
         close(fd);
         fd = -1;
     }
+    /* Bound the exchange. There was no timeout at all, so a server that
+     * accepted the connection and then said nothing parked this worker
+     * thread forever -- and with it any hope of the launcher ever answering
+     * "am I signed in?". Retries are worthless if one attempt can hang. */
+    if (fd >= 0) {
+#if defined(_WIN32)
+        DWORD tv = 5000;
+#else
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+#endif
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    }
     freeaddrinfo(res);
     if (fd < 0) return -2;
 
@@ -529,8 +544,43 @@ static void job_login(void) {
     g.state = RNET_ACCOUNT_FAILED;
 }
 
+/*
+ * Redeeming the stored key, with retries for transient failures.
+ *
+ * One connect that happens to lose is not evidence about the credential, but
+ * it used to end the attempt: the launcher fell out to the sign-in prompt and
+ * asked a player with a perfectly good key to do a Discord round trip. Roughly
+ * one launch in eight in practice.
+ *
+ * Retried ONLY for SESSION_UNREACHABLE. A rejection is authoritative -- the
+ * server has looked at the key and said no -- so retrying it would be a
+ * pointless round trip on every launch and, worse, would delay the honest
+ * "you are signed out" answer.
+ *
+ * Three attempts with a short backoff. The budget is deliberately smaller than
+ * the launcher's five-second sign-in gate, so the retries finish inside the
+ * window where the UI is already holding ONLINE and the player sees one
+ * continuous "checking" rather than a card that unlocks and then changes its
+ * mind.
+ */
+enum { SESSION_ATTEMPTS = 3 };
+static const int kSessionBackoffMs[SESSION_ATTEMPTS - 1] = { 250, 750 };
+
 static void job_session(void) {
-    const int verdict = prove_and_get_session();
+    int verdict = SESSION_UNREACHABLE;
+    int attempt;
+
+    for (attempt = 0; attempt < SESSION_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            /* A Retry or a sign-out landing mid-backoff owns the state now. */
+            if (g.cancel) return;
+            auth_sleep_ms(kSessionBackoffMs[attempt - 1]);
+            if (g.cancel) return;
+        }
+        verdict = prove_and_get_session();
+        if (verdict != SESSION_UNREACHABLE) break;
+    }
+
     if (verdict == SESSION_OK) {
         g.state = RNET_ACCOUNT_SIGNED_IN;
         return;
@@ -544,11 +594,10 @@ static void job_session(void) {
         g.state = RNET_ACCOUNT_GUEST;
         return;
     }
-    /* Could not get an answer. KEEP THE KEY. It was previously deleted here
-     * too, so a launch during a network blip -- or against a server having a
-     * bad minute -- silently destroyed a working credential and demanded a
-     * fresh Discord sign-in. Retry on the next launch instead, and say so,
-     * rather than failing silently into guest. */
+    /* Could not get an answer, after retrying. KEEP THE KEY. It was previously
+     * deleted here too, so a launch during a network blip -- or against a
+     * server having a bad minute -- silently destroyed a working credential
+     * and demanded a fresh Discord sign-in. */
     set_err("Could not reach the sign-in server. Your sign-in is saved; "
             "this will retry next time.");
     g.state = RNET_ACCOUNT_FAILED;
