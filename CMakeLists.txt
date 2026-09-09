@@ -106,7 +106,7 @@ if(RNET_ENABLE_ICE)
   if(NOT _rnet_juice_ok)
     include(FetchContent)
     # URL archive (not GIT_REPOSITORY): cmake's file(DOWNLOAD) avoids system
-    # git-remote-https, which breaks under RetComM AppImage LD_LIBRARY_PATH
+    # git-remote-https, which breaks under Retro AppImage LD_LIBRARY_PATH
     # (curl_global_trace / CURL_OPENSSL_4 symbol mismatch).
     #
     # CMP0135 NEW + DOWNLOAD_EXTRACT_TIMESTAMP: stamp extracted files at
@@ -147,7 +147,7 @@ if(RNET_ENABLE_ICE)
     # Unix: _GNU_SOURCE exposes getaddrinfo. Windows/MinGW: that same
     # macro plus __STRICT_ANSI__ skips IN_ADDR in inaddr.h, then
     # mstcpip.h (via ws2tcpip.h) fails; libjuice also needs gnu11 for
-    # <sys/time.h>. C_EXTENSIONS ON alone is not enough under RetComM
+    # <sys/time.h>. C_EXTENSIONS ON alone is not enough under Retro
     # cmake-clang-v1 — toolchain / CMAKE_C_FLAGS often keep -std=c11, so
     # force -std=gnu11 on the juice targets for Clang/GNU on Windows.
     foreach(_rnet_juice IN ITEMS juice-static juice)
