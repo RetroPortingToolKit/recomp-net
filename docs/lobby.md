@@ -2,13 +2,13 @@
 
 `recomp-net` is a delay-sync library only — it does **not** include a lobby
 server. The open-source control plane lives in the sibling repo
-[`recomp-net-server`](https://github.com/TechnicallyComputers/recomp-net-server).
+[`recomp-net-server`](https://github.com/RetroPortingToolKit/recomp-net-server).
 
 Authoritative wire documentation for the MotK / psxrecomp WebSocket JSON
 protocol:
 
-- https://github.com/TechnicallyComputers/recomp-net-server/blob/main/docs/WS_LOBBY.md
-- Architecture: https://github.com/TechnicallyComputers/recomp-net-server/blob/main/docs/HOW_IT_WORKS.md
+- https://github.com/RetroPortingToolKit/recomp-net-server/blob/main/docs/WS_LOBBY.md
+- Architecture: https://github.com/RetroPortingToolKit/recomp-net-server/blob/main/docs/HOW_IT_WORKS.md
 
 Default client URL: `ws://netplay.retcomm.net:8765`  
 Override with env `PSX_NET_LOBBY_URL` (PSX) or `SNES_NET_LOBBY_URL` (SNES).

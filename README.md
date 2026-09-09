@@ -17,14 +17,14 @@ vendor SSB64 code and does not implement rollback, automatch, or game UI.
 - Synchronous RFC 5389 external IPv4 discovery through configurable STUN
 - Host-owned signaling callbacks (ICE); lobby / matchmaking is **not** in this
   repo — see [`docs/lobby.md`](docs/lobby.md) and open-source
-  [`recomp-net-server`](https://github.com/TechnicallyComputers/recomp-net-server)
+  [`recomp-net-server`](https://github.com/RetroPortingToolKit/recomp-net-server)
 - C11, CMake, MIT license
 
 ## Lobby
 
 This library has no lobby binary. The MotK / psxrecomp / SNES WebSocket lobby
 server is the open-source sibling
-[`recomp-net-server`](https://github.com/TechnicallyComputers/recomp-net-server)
+[`recomp-net-server`](https://github.com/RetroPortingToolKit/recomp-net-server)
 (default `ws://netplay.retcomm.net:8765`, or self-host locally).
 Client-facing protocol notes: [`docs/lobby.md`](docs/lobby.md).
 
