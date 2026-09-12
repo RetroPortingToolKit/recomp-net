@@ -27,13 +27,10 @@
 extern "C" {
 #endif
 
-/* Seal span covers the deepest resim span a host can issue; matches the
- * frame-commit validation cadence + slack used by the reference host. */
-#define RNET_RB_SEAL_MAX_SPAN 128u
-/* Peer-seal completion is a uint64_t bitmask — tip-extend cannot grow the
- * sealed span past this even when seal_max_span is larger. Hosts must
- * tip-hold-commit and open a fresh episode when extend would exceed it. */
+/* Every sealed row needs a bit in the uint64_t peer-completion mask.
+ * Hosts must split larger replay windows into separate episodes. */
 #define RNET_RB_PEER_SEAL_MASK_BITS 64u
+#define RNET_RB_SEAL_MAX_SPAN RNET_RB_PEER_SEAL_MASK_BITS
 #define RNET_RB_MAX_SLOTS 8
 /* Tip episode: target - load at or below this may skip the ready-ACK RTT
  * (digests still compared). Sized for tip-extend re-replay after TipHold. */
@@ -280,7 +277,9 @@ RNetInputContractDecision rnet_rb_decide_stick_replace(RNetRbSession *s,
  * peer-authority rows arrive via apply_peer_seal_rows. The sealed table is the
  * sole replay read set. */
 /* begin_tick..target_tick inclusive — pass load_tick (not only mismatch) so
- * Replay can publish sealed pads for every resim quantum. */
+ * Replay can publish sealed pads for every resim quantum. Invalid or oversized
+ * ranges clear the seal without changing the correction target; check
+ * inputs_sealed before replay. Valid calls replace the previous seal. */
 void rnet_rb_seal_inputs(RNetRbSession *s, uint32_t begin_tick, uint32_t target_tick,
                          int32_t correction_slot);
 uint8_t rnet_rb_inputs_sealed(const RNetRbSession *s);
