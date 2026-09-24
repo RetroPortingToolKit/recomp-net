@@ -40,6 +40,12 @@ set(RNET_CORE_SOURCES
   src/auth/rnet_sha256.c
   src/ice/rnet_ice_state.c
   src/ice/rnet_ice_agent.c
+  # RFC 6455 client framing + the SHA-1 the handshake needs. Lifted from
+  # the engines, where psxrecomp and snesrecomp each vendored a copy:
+  # rnet_sha1.{c,h} and rnet_ws.h were byte-identical between them and
+  # rnet_ws.c differed only by two static helpers in swapped order.
+  src/lobby_ws/rnet_ws.c
+  src/lobby_ws/rnet_sha1.c
 )
 
 add_library(recomp_net STATIC ${RNET_CORE_SOURCES})
