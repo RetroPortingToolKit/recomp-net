@@ -461,9 +461,12 @@ typedef struct Scenario {
     const char *refusal;
     /* Seats (0 = 2). With 3 or 4, seat 0 relays for the rest. */
     int seats;
-    /* The LAST seat stops polling for this many ms once, at tick 60 (after
-     * the boot-digest gate, which re-aligns every seat at tick 1), and so runs
-     * that far behind: the follower that has not reached the load tick. */
+    /* The LAST seat stops polling for this many ms every 10 ticks from tick
+     * 60 (after the boot-digest gate, which re-aligns every seat at tick 1):
+     * a field that took that long, the way an N64 field takes 30-70 ms at its
+     * p99. Each one puts it that far behind until the next episode's wait
+     * levels the seats again, so a good share of BEGINs reach it short of
+     * the load tick. */
     unsigned lag_ms;
     /* Every seat publishes / confirms a mod set: the handshake runs. */
     int modset;
@@ -475,10 +478,12 @@ typedef struct Scenario {
      * here the injecting one), and the lag the scenario is about would last a
      * few ticks. */
     int timesync_off;
-    /* The LAST seat paces this many ms slower per frame than the others, so
-     * it falls behind until the others' prediction cap holds them: the
-     * follower that is still short of the load tick, every episode. */
+    /* The LAST seat paces this many ms slower per frame than the others. */
     unsigned slow_ms;
+    /* RNET_SIM_LOSS_PCT on every seat ("" = none). A lost BEGIN is never
+     * answered, so a lossy scenario grades the ledger as the harnesses do:
+     * residual covered by watchdogs, and chain stalls are not a failure. */
+    const char *loss_pct;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -557,6 +562,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
 
     setenv("RNET_SIM_LATENCY_MS", sc->latency_ms, 1);
     setenv("RNET_SIM_JITTER_MS", sc->jitter_ms, 1);
+    setenv("RNET_SIM_LOSS_PCT", sc->loss_pct ? sc->loss_pct : "", 1);
     snprintf(seed, sizeof(seed), "%d", 11 + slot * 12);
     setenv("RNET_SIM_SEED", seed, 1);
     /* Pinned per peer, not inherited: a knob exported for one side must never
@@ -647,7 +653,8 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     start_ms = mono_ms();
     next_tick_ms = start_ms;
     {
-        int ready_sent = 0, asked = 0, lagged = 0;
+        int ready_sent = 0, asked = 0;
+        uint32_t lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
         while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
@@ -669,10 +676,11 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
                     break;
                 }
             }
-            if (sc->lag_ms && slot == slots - 1 && !lagged &&
-                rnet_rb_driver_sim_tick(d) >= 60u) {
+            if (sc->lag_ms && slot == slots - 1 && rnet_rb_driver_sim_tick(d) >= 60u &&
+                rnet_rb_driver_sim_tick(d) % 10u == 0u &&
+                lagged != rnet_rb_driver_sim_tick(d)) {
                 uint32_t t0 = mono_ms();
-                lagged = 1;
+                lagged = rnet_rb_driver_sim_tick(d);
                 while ((uint32_t)(mono_ms() - t0) < sc->lag_ms) {
                     rnet_session_pump(s);
                     sleep_ms(1);
@@ -919,7 +927,10 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     ledger = (int64_t)sum_init * (nseats - 1) - (int64_t)sum_follow - (int64_t)sum_refused;
     snprintf(msg, sizeof(msg), "%s: episode ledger is exact (residual %lld, timeouts %u)",
              sc->name, (long long)ledger, sum_timeout);
-    expect_true(ledger == 0, msg);
+    if (sc->loss_pct && sc->loss_pct[0])
+        expect_true(ledger >= 0 && ledger <= (int64_t)sum_timeout, msg);
+    else
+        expect_true(ledger == 0, msg);
     for (k = 0; k < nseats; ++k) {
         for (j = 0; j < nseats; ++j) {
             uint32_t i, bad = 0, n = 0;
@@ -935,7 +946,8 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
             }
             snprintf(msg, sizeof(msg), "%s: pair %d->%d answered every episode exactly "
                      "once (%u of %u wrong)", sc->name, k, j, bad, n);
-            expect_true(bad == 0u, msg);
+            expect_true(bad == 0u || (sc->loss_pct && sc->loss_pct[0] &&
+                                      bad <= sum_timeout), msg);
         }
     }
     if (sc->expect_no_refusal) {
@@ -947,7 +959,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     /* No advisory stall on a link that loses nothing: an aborted episode no
      * longer leaves a stale digest behind, and nothing else should stall. */
     snprintf(msg, sizeof(msg), "%s: no chain stall (%u)", sc->name, sum_stall);
-    expect_true(sum_stall == 0u, msg);
+    expect_true(sum_stall == 0u || (sc->loss_pct && sc->loss_pct[0]), msg);
     if (sc->mode_a || sc->mode_b) {
         uint32_t ra = 0;
         for (k = 0; k < nseats; ++k)
@@ -1011,28 +1023,38 @@ int main(int argc, char **argv)
          * follow (deferred, or at its tip), never refuse -- and the chain must
          * not stall on the episode. */
         { "follower-behind-0ms", 1, 1,       "0",   "0",   15,    420u,  0,
-          0, 0, NULL, 2, 60u, 0, 1, 1, 2u },
+          0, 0, NULL, 2, 50u, 0, 1, 1, 0u },
         { "follower-behind-inline", 0, 0,    "0",   "0",   15,    420u,  0,
-          0, 0, NULL, 2, 60u, 0, 1, 1, 2u },
+          0, 0, NULL, 2, 50u, 0, 1, 1, 0u },
         /* More than two seats, seat 0 relaying: the per-peer chain, the
          * per-seat mod-set and identity handshakes, per-pair ledger. */
         { "3seat-loopback",      1, 1,       "0",   "0",   45,    420u,  0,
           0, 0, NULL, 3, 0u, 1, 0 },
         { "3seat-behind",        1, 1,       "0",   "0",   30,    420u,  0,
-          0, 0, NULL, 3, 60u, 1, 1, 1, 2u },
+          0, 0, NULL, 3, 50u, 1, 1, 1, 0u },
         { "4seat-rtt200",        1, 1,       "100", "25",  45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0 },
         { "4seat-mixed-rtt60",   0, 1,       "30",  "8",   45,    420u,  1,
           0, 0, NULL, 4, 0u, 1, 0 },
+        /* Four seats losing 2 % of what each receives: a commit needs three
+         * POSTs at each of four peers, so a lost one is common -- re-sent
+         * POSTs keep that from costing the 2 s watchdog. */
+        { "4seat-loss2",         1, 1,       "0",   "0",   45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0, 0, 0u, "2" },
     };
-    unsigned port_base = 30000u + ((unsigned)getpid() % 5000u) * 4u;
+    /* Four ports per scenario from a per-process base; kept inside
+     * 20000..60003 however many scenarios there are (a base near the top of
+     * the old range plus a late scenario's offset used to run past 65535, and
+     * that scenario's sessions never started). */
+    unsigned pid_off = ((unsigned)getpid() % 4000u) * 8u;
     size_t i;
 
     in_process_tests();
     /* An argument runs only the scenarios whose name contains it. */
     for (i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); ++i)
         if (argc < 2 || strstr(scenarios[i].name, argv[1]))
-            run_scenario(&scenarios[i], port_base + (unsigned)i * 2u * 997u % 20000u);
+            run_scenario(&scenarios[i],
+                         20000u + (pid_off + (unsigned)i * 1994u) % 40000u);
 
     if (g_failures == 0) {
         printf("rb_driver_test: ok\n");
