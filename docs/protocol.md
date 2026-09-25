@@ -132,6 +132,37 @@ and `rnet_session_prime_delay_inputs` once at mutual ready — not at apply
 time. Both stay in the app load barrier until `try_admit` succeeds (fresh
 tip + INPUT_CONFIRM). Ready-probe retransmit interval is 8 ms.
 
+### SIO_MULTI_XFER (13)
+
+GBA Multi transfer barrier (0-delay, not pad INPUT). See `recomp_net/session.h`.
+
+### Rollback packets (20–25)
+
+`RB_SYNC` (20), `RB_SEAL_ROWS` (21), `RB_BASELINE` (22), `RB_POST` (23),
+`RB_FRAME_COMMIT` (24) and `RB_RESOLVED` (25) are described in
+[rollback.md](rollback.md#rollback-wire-protocol). Delay-sync peers ignore them.
+
+### MODSET (26) / MODSET_ACK (27)
+
+The host's canonical effective mod set, and each peer's can/cannot answer.
+These are latest-only handshake messages.
+
+### Sender attribution
+
+Every packet except START and DELAY_SYNC begins its body with the sender's
+`local_slot : u8`. That is the sender's seat, or for a spectator its
+relay-namespace wire id (at or above `slot_count`). Receivers drop their own
+reflections by comparing it with their wire slot. The LAN hub learns seat
+endpoints from it.
+
+For rollback packets the session also **records** it: every queued
+FRAME_COMMIT, SYNC, SEAL_ROWS, BASELINE, POST and RESOLVED keeps its sender,
+and `rnet_session_take_rb_*_from` returns it. This is what lets 3+ seat
+rollback require agreement from every seat instead of from whichever seat
+arrived last ([rollback.md](rollback.md#n-peer-rollback-3-seats)). It needed no
+wire change and there is no protocol version bump: the byte was always on the
+wire, and pre-existing peers interoperate unchanged.
+
 ## Wire vs sim
 
 Hosts reason in **sim ticks**. Inputs on the wire are indexed by

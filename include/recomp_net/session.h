@@ -227,16 +227,40 @@ void rnet_session_set_input_send_suppress(RNetSession *s, int suppress);
 /*
  * Rollback FRAME_COMMIT helpers (RNET_PKT_RB_FRAME_COMMIT). Delay-sync peers
  * ignore these opcodes. Hosts call send after each sim tick with their master
- * state digest; pump stores the latest peer commit for take_*.
+ * state digest; pump queues every peer commit for take_*.
+ *
+ * Sender attribution (N > 2). Every rollback queue (FRAME_COMMIT, SYNC,
+ * SEAL_ROWS, BASELINE, POST, RESOLVED) records the sender's wire slot -- the
+ * `local_slot` byte every packet already carries in its body, so this needed
+ * no wire change. The `*_from` takes return it in *sender_slot (NULL = don't
+ * care). The original takes are thin wrappers that discard it; they are fine
+ * at N = 2, where there is only one possible sender, and they drain the SAME
+ * queue, so a host must use one family or the other, not both.
+ *
+ * With three or more seats an unattributed take is a correctness bug: every
+ * seat's commits land in one queue, and a tracker fed without the sender
+ * agrees with whichever seat arrived last. Feed rnet_hc_note_peer_slot (and
+ * the rollback N-way helpers) from the *_from takes instead.
+ *
+ * Seated peers' wire slot equals their seat. A spectator's wire slot is in
+ * the relay's namespace (>= slot_count); N-way trackers ignore it.
  */
 int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
                                       rnet_u32 state_hash);
-/* 1 if a peer FRAME_COMMIT is pending; copies and clears it. */
 /* PSX-Link group scoping: accept rollback episode/state packets only from
- * `slot` (-1 = all, default). Input-plane packets are never filtered. */
+ * `slot` (-1 = all, default). Input-plane packets are never filtered.
+ * Clears any mask set by rnet_session_set_rb_peer_mask. */
 void rnet_session_set_rb_peer_slot(RNetSession *s, int slot);
+/* Group scoping over several seats: accept rollback episode/state packets
+ * only from senders whose bit is set (wire slots 0..31). 0 = accept all.
+ * Clears any single slot set by rnet_session_set_rb_peer_slot. Same packet
+ * set as set_rb_peer_slot (SYNC, BASELINE, POST, STATE_*). */
+void rnet_session_set_rb_peer_mask(RNetSession *s, rnet_u32 mask);
+/* 1 if a peer FRAME_COMMIT is pending; copies and clears it. */
 int rnet_session_take_rb_frame_commit(RNetSession *s, rnet_u32 *through_tick,
                                       rnet_u32 *state_hash);
+int rnet_session_take_rb_frame_commit_from(RNetSession *s, rnet_u8 *sender_slot,
+                                           rnet_u32 *through_tick, rnet_u32 *state_hash);
 
 /*
  * GBA Multi transfer barrier (RNET_PKT_SIO_MULTI_XFER): exchange SIOMLT_SEND
@@ -327,6 +351,12 @@ int rnet_session_send_rb_sync(RNetSession *s, rnet_u32 epoch_id, rnet_u32 mismat
 int rnet_session_take_rb_sync(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *mismatch_tick,
                               rnet_u32 *load_tick, rnet_u32 *target_tick,
                               rnet_u8 *corrected_slot, rnet_u8 *op, rnet_u8 *flags);
+/* *sender_slot of a BEGIN is the episode's initiator seat: feed it to
+ * rnet_rb_arbitrate_begin / rnet_rb_begin_episode_from. */
+int rnet_session_take_rb_sync_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                   rnet_u32 *mismatch_tick, rnet_u32 *load_tick,
+                                   rnet_u32 *target_tick, rnet_u8 *corrected_slot, rnet_u8 *op,
+                                   rnet_u8 *flags);
 
 int rnet_session_send_rb_seal_rows(RNetSession *s, rnet_u32 epoch_id, rnet_u32 mismatch_tick,
                                    rnet_u32 target_tick, rnet_u8 slot, rnet_u32 row_begin,
@@ -334,6 +364,11 @@ int rnet_session_send_rb_seal_rows(RNetSession *s, rnet_u32 epoch_id, rnet_u32 m
 int rnet_session_take_rb_seal_rows(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *mismatch_tick,
                                    rnet_u32 *target_tick, rnet_u8 *slot, rnet_u32 *row_begin,
                                    RNetRbFrame *rows, rnet_u16 *row_count);
+int rnet_session_take_rb_seal_rows_from(RNetSession *s, rnet_u8 *sender_slot,
+                                        rnet_u32 *epoch_id, rnet_u32 *mismatch_tick,
+                                        rnet_u32 *target_tick, rnet_u8 *slot,
+                                        rnet_u32 *row_begin, RNetRbFrame *rows,
+                                        rnet_u16 *row_count);
 
 int rnet_session_send_rb_baseline(RNetSession *s, rnet_u32 epoch_id, rnet_u32 load_tick,
                                   rnet_u32 digest_master, rnet_u32 digest_a, rnet_u32 digest_b,
@@ -341,11 +376,18 @@ int rnet_session_send_rb_baseline(RNetSession *s, rnet_u32 epoch_id, rnet_u32 lo
 int rnet_session_take_rb_baseline(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *load_tick,
                                   rnet_u32 *digest_master, rnet_u32 *digest_a, rnet_u32 *digest_b,
                                   rnet_u32 *digest_c);
+int rnet_session_take_rb_baseline_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                       rnet_u32 *load_tick, rnet_u32 *digest_master,
+                                       rnet_u32 *digest_a, rnet_u32 *digest_b,
+                                       rnet_u32 *digest_c);
 
 int rnet_session_send_rb_post(RNetSession *s, rnet_u32 epoch_id, rnet_u32 target_tick,
                               rnet_u32 digest_master, rnet_u32 input_digest, rnet_u8 match);
 int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *target_tick,
                               rnet_u32 *digest_master, rnet_u32 *input_digest, rnet_u8 *match);
+int rnet_session_take_rb_post_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                   rnet_u32 *target_tick, rnet_u32 *digest_master,
+                                   rnet_u32 *input_digest, rnet_u8 *match);
 
 /*
  * Mod-set negotiation. The host publishes the exact set every peer must run
@@ -369,6 +411,10 @@ int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
 
 int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through);
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through);
+/* Feed to rnet_rb_note_peer_resolved: at N > 2 the shared frontier is the
+ * MINIMUM over peers, which an unattributed take cannot compute. */
+int rnet_session_take_rb_resolved_from(RNetSession *s, rnet_u8 *sender_slot,
+                                       rnet_u32 *resolved_through);
 
 #ifdef __cplusplus
 }

@@ -10,6 +10,7 @@
  */
 
 #include "recomp_net/rollback.h"
+#include "recomp_net/config.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,14 @@ struct RNetRbSession
     uint64_t peer_seal_mask[RNET_RB_MAX_SLOTS];
 
     uint32_t resolved_through; /* shared frontier watermark */
+
+    /* Initiator seat of the current episode (RNET_RB_SLOT_NONE = idle or
+     * unknown). Part of an episode's identity once N > 2. */
+    uint32_t initiator_slot;
+
+    /* Latest RB_RESOLVED frontier each seat advertised (N-way min). */
+    uint32_t peer_resolved[RNET_RB_MAX_SLOTS];
+    uint32_t peer_resolved_mask;
 
     RNetRbEvent events[RNET_RB_EVENT_QUEUE_MAX];
     uint32_t event_head;
@@ -145,6 +154,7 @@ void rnet_rb_session_reset(RNetRbSession *s)
     s->phase = nRNetRbPhaseLive;
     memset(&s->corr, 0, sizeof(s->corr));
     s->corr.slot = -1;
+    s->initiator_slot = RNET_RB_SLOT_NONE;
     s->sealed_span = 0u;
     s->seal_base_tick = 0u;
     s->inputs_sealed = 0u;
@@ -281,7 +291,19 @@ void rnet_rb_begin_episode(RNetRbSession *s, const RNetRbCorrection *corr)
     {
         return;
     }
+    rnet_rb_begin_episode_from(s, corr,
+                               (corr->initiator != 0u) ? s->cfg.local_slot : RNET_RB_SLOT_NONE);
+}
+
+void rnet_rb_begin_episode_from(RNetRbSession *s, const RNetRbCorrection *corr,
+                                uint32_t initiator_slot)
+{
+    if ((s == NULL) || (corr == NULL))
+    {
+        return;
+    }
     s->corr = *corr;
+    s->initiator_slot = initiator_slot;
     /* Light-tip is initiator-authoritative: followers (from_peer_notify) take
      * the wire flags verbatim so both peers classify the episode identically
      * even when their local resolved_through watermarks differ. */
@@ -681,22 +703,19 @@ uint8_t rnet_rb_peer_seal_rows_complete(const RNetRbSession *s, int32_t slot)
 uint8_t rnet_rb_all_peer_seal_rows_complete(const RNetRbSession *s)
 {
     uint32_t slot;
-    uint32_t n;
+    uint32_t want;
 
     if ((s == NULL) || (rnet_rb_inputs_sealed(s) == 0u))
     {
         return 0u;
     }
-    /* Only active match seats — waiting on unused slots (up to MAX=8) deadlocks
-     * 2P MotK episodes forever in SealInputs. */
-    n = s->cfg.slot_count;
-    if (n == 0u || n > RNET_RB_MAX_SLOTS)
+    /* Only occupied match seats — waiting on unused slots (up to MAX=8)
+     * deadlocks 2P MotK episodes forever in SealInputs, and waiting on an
+     * empty seat of a sparse room (seats 0+2 of 4) does the same at N > 2. */
+    want = rnet_rb_expected_peer_mask(s);
+    for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
     {
-        n = RNET_RB_MAX_SLOTS;
-    }
-    for (slot = 0u; slot < n; ++slot)
-    {
-        if (slot == s->cfg.local_slot)
+        if ((want & (1u << slot)) == 0u)
         {
             continue;
         }
@@ -752,6 +771,236 @@ void rnet_rb_set_peer_convergence(RNetRbSession *s, uint32_t peer_target)
     {
         s->resolved_through = peer_target;
     }
+}
+
+uint32_t rnet_rb_expected_peer_mask(const RNetRbSession *s)
+{
+    if (s == NULL)
+    {
+        return 0u;
+    }
+    return rnet_expected_peer_mask(s->cfg.slot_count, s->cfg.occupied_mask, s->cfg.local_slot);
+}
+
+/* Advance resolved_through to min(peer_resolved) over the expected seats once
+ * every one of them has advertised. */
+static uint8_t rnet_rb_try_peer_frontier(RNetRbSession *s)
+{
+    uint32_t want = rnet_rb_expected_peer_mask(s);
+    uint32_t slot;
+    uint32_t lo = 0xffffffffu;
+    if (want == 0u || (s->peer_resolved_mask & want) != want)
+    {
+        return 0u;
+    }
+    for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
+    {
+        if ((want & (1u << slot)) != 0u && s->peer_resolved[slot] < lo)
+        {
+            lo = s->peer_resolved[slot];
+        }
+    }
+    if (lo > s->resolved_through)
+    {
+        s->resolved_through = lo;
+        return 1u;
+    }
+    return 0u;
+}
+
+void rnet_rb_set_occupied_mask(RNetRbSession *s, uint32_t occupied_mask)
+{
+    if (s == NULL)
+    {
+        return;
+    }
+    s->cfg.occupied_mask = occupied_mask;
+    (void)rnet_rb_try_peer_frontier(s);
+}
+
+uint8_t rnet_rb_note_peer_resolved(RNetRbSession *s, uint32_t slot, uint32_t resolved_through)
+{
+    if ((s == NULL) || (slot >= RNET_RB_MAX_SLOTS) ||
+        ((rnet_rb_expected_peer_mask(s) & (1u << slot)) == 0u))
+    {
+        return 0u;
+    }
+    /* Latest wins per seat: a seat that demoted after a NACK advertises a
+     * lower frontier, and the minimum must see it. */
+    s->peer_resolved[slot] = resolved_through;
+    s->peer_resolved_mask |= (1u << slot);
+    return rnet_rb_try_peer_frontier(s);
+}
+
+uint8_t rnet_rb_peer_resolved(const RNetRbSession *s, uint32_t slot, uint32_t *out_tick)
+{
+    if ((s == NULL) || (slot >= RNET_RB_MAX_SLOTS) ||
+        ((s->peer_resolved_mask & (1u << slot)) == 0u))
+    {
+        if (out_tick != NULL)
+        {
+            *out_tick = 0u;
+        }
+        return 0u;
+    }
+    if (out_tick != NULL)
+    {
+        *out_tick = s->peer_resolved[slot];
+    }
+    return 1u;
+}
+
+uint32_t rnet_rb_get_initiator_slot(const RNetRbSession *s)
+{
+    if ((s == NULL) || (s->phase == nRNetRbPhaseLive))
+    {
+        return RNET_RB_SLOT_NONE;
+    }
+    return s->initiator_slot;
+}
+
+RNetRbBeginArb rnet_rb_arbitrate_begin(const RNetRbSession *s, uint32_t sender_slot,
+                                       uint32_t epoch_id)
+{
+    uint32_t cur;
+    if (s == NULL)
+    {
+        return nRNetRbBeginRefuse;
+    }
+    if (sender_slot == s->cfg.local_slot)
+    {
+        return nRNetRbBeginRefuse; /* our own BEGIN reflected: never follow it */
+    }
+    if ((s->phase == nRNetRbPhaseLive) || (s->phase == nRNetRbPhaseCommit) ||
+        (s->phase == nRNetRbPhaseAbort))
+    {
+        return nRNetRbBeginFollow;
+    }
+    cur = s->initiator_slot;
+    if (epoch_id == s->corr.epoch_id && (cur == sender_slot || cur == RNET_RB_SLOT_NONE))
+    {
+        /* Unknown initiator is the legacy N=2 follower: the only other seat
+         * is the initiator, so the same epoch is the same episode. */
+        return nRNetRbBeginSameEpisode;
+    }
+    if (cur != RNET_RB_SLOT_NONE && sender_slot < cur)
+    {
+        return nRNetRbBeginYield;
+    }
+    return nRNetRbBeginRefuse;
+}
+
+void rnet_rb_agree_begin(RNetRbPeerAgree *a, uint32_t peer_mask, uint32_t epoch_id,
+                         uint32_t tick, uint32_t word_count)
+{
+    if (a == NULL)
+    {
+        return;
+    }
+    memset(a, 0, sizeof(*a));
+    a->epoch_id = epoch_id;
+    a->tick = tick;
+    if (word_count == 0u)
+    {
+        word_count = 1u;
+    }
+    if (word_count > RNET_RB_AGREE_MAX_WORDS)
+    {
+        word_count = RNET_RB_AGREE_MAX_WORDS;
+    }
+    a->word_count = word_count;
+    a->peer_mask = peer_mask & ((1u << RNET_RB_MAX_SLOTS) - 1u);
+}
+
+void rnet_rb_agree_set_local(RNetRbPeerAgree *a, const uint32_t *words)
+{
+    if ((a == NULL) || (words == NULL))
+    {
+        return;
+    }
+    memcpy(a->local, words, sizeof(uint32_t) * a->word_count);
+    a->local_valid = 1u;
+}
+
+uint8_t rnet_rb_agree_note(RNetRbPeerAgree *a, uint32_t slot, uint32_t epoch_id,
+                           uint32_t tick, const uint32_t *words)
+{
+    if ((a == NULL) || (words == NULL) || (slot >= RNET_RB_MAX_SLOTS) ||
+        ((a->peer_mask & (1u << slot)) == 0u))
+    {
+        return 0u;
+    }
+    if ((epoch_id != a->epoch_id) || (tick != a->tick))
+    {
+        return 0u;
+    }
+    memcpy(a->peer[slot], words, sizeof(uint32_t) * a->word_count);
+    a->reported_mask |= (1u << slot);
+    return 1u;
+}
+
+RNetRbAgreeStatus rnet_rb_agree_status(const RNetRbPeerAgree *a, uint32_t *mismatch_slot,
+                                       uint32_t *mismatch_word)
+{
+    uint32_t slot, w;
+    if (mismatch_slot != NULL)
+    {
+        *mismatch_slot = RNET_RB_SLOT_NONE;
+    }
+    if (mismatch_word != NULL)
+    {
+        *mismatch_word = RNET_RB_SLOT_NONE;
+    }
+    if ((a == NULL) || (a->local_valid == 0u))
+    {
+        return nRNetRbAgreePending;
+    }
+    for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
+    {
+        uint32_t bit = 1u << slot;
+        if (((a->peer_mask & bit) == 0u) || ((a->reported_mask & bit) == 0u))
+        {
+            continue;
+        }
+        for (w = 0u; w < a->word_count; ++w)
+        {
+            if (a->peer[slot][w] != a->local[w])
+            {
+                if (mismatch_slot != NULL)
+                {
+                    *mismatch_slot = slot;
+                }
+                if (mismatch_word != NULL)
+                {
+                    *mismatch_word = w;
+                }
+                return nRNetRbAgreeMismatch;
+            }
+        }
+    }
+    if ((a->peer_mask == 0u) || ((a->reported_mask & a->peer_mask) != a->peer_mask))
+    {
+        return nRNetRbAgreePending;
+    }
+    return nRNetRbAgreeMatch;
+}
+
+uint32_t rnet_rb_agree_missing_mask(const RNetRbPeerAgree *a)
+{
+    if (a == NULL)
+    {
+        return 0u;
+    }
+    return a->peer_mask & ~a->reported_mask;
+}
+
+void rnet_rb_agree_set_peer_mask(RNetRbPeerAgree *a, uint32_t peer_mask)
+{
+    if (a == NULL)
+    {
+        return;
+    }
+    a->peer_mask = peer_mask & ((1u << RNET_RB_MAX_SLOTS) - 1u);
 }
 
 void rnet_rb_demote_resolved_through(RNetRbSession *s, uint32_t tick)

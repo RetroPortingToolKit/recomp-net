@@ -1,12 +1,14 @@
 # recomp-net
 
-Portable **delay-sync** netcode library for recompilation / modern-runtime hosts
-(N64Recomp, PSX recomp, and similar). Classic lockstep: every peer stalls until
-remote inputs for `wire = sim + D` arrive. Optional **ICE** transport via
-[libjuice](https://github.com/paullouisageneau/libjuice).
+Portable netcode library for recompilation / modern-runtime hosts
+(N64Recomp, PSX recomp, SNES recomp, and similar). It provides **delay-sync**
+lockstep, where every peer stalls until remote inputs for `wire = sim + D`
+arrive, and shared **rollback** built on top of it. Both scale to
+`RNET_MAX_SLOTS` (8) seats over the lobby relay star or a LAN hub. Optional
+**ICE** transport via [libjuice](https://github.com/paullouisageneau/libjuice).
 
-BattleShip’s netplay stack is a **design reference only** — this repo does not
-vendor SSB64 code and does not implement rollback, automatch, or game UI.
+BattleShip’s netplay stack is a **design reference only**. This repo does not
+vendor SSB64 code and does not implement game UI.
 
 ## Features (v0.1)
 
@@ -162,14 +164,16 @@ SNES-oriented checklist: snesrecomp `docs/RECOMP_NET.md` (“Per-game patches”
 | [docs/host_integration.md](docs/host_integration.md) | Hooking a recomp host |
 | [docs/address_discovery.md](docs/address_discovery.md) | Selecting a LAN address to advertise |
 | [docs/lobby.md](docs/lobby.md) | Lobby server contract (sibling repo) |
-| [docs/rollback.md](docs/rollback.md) | Rollback mode contracts (`feat/rollback`) |
+| [docs/rollback.md](docs/rollback.md) | Rollback mode contracts, including N-peer (3+ seat) agreement |
 
 ## Modes
 
-- **Delay-sync (main, v0.1):** shipped `RNetSession` lockstep used by MotK / snes / psx.
-- **Rollback (`feat/rollback` branch):** shared rollback architecture; first layer is the
-  portable input contract (`recomp_net/input_contract.h`), with episode orchestration over
-  a host snapshot/hash vtable planned next. See [docs/rollback.md](docs/rollback.md).
+- **Delay-sync:** `RNetSession` lockstep, used by MotK / snes / psx.
+- **Rollback (on `main`):** the portable input contract (`input_contract.h`), the episode
+  FSM over a host snapshot/digest vtable (`rollback.h`), the `RNET_PKT_RB_*` wire, the
+  hash-confirm watermark, input history, and the admission scheduler. Agreement is N-way
+  for 3+ seats: per-sender takes, all-seats watermark, lowest-slot initiator arbitration.
+  See [docs/rollback.md](docs/rollback.md).
 
 ## Non-goals
 

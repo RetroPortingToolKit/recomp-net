@@ -12,8 +12,10 @@
  *
  * This is the second rollback layer after the portable input contract
  * (recomp_net/input_contract.h). It is transport-agnostic: hosts call the API
- * from their own network ingress (Phase 2 keeps BattleShip's netpeer as the
- * transporter); protocol/ICE alignment is Phase 3.
+ * from their own network ingress -- RNetSession's RNET_PKT_RB_* opcodes
+ * (session.h, take_rb_*_from) or a host's own wire. N-peer (3+ seat)
+ * coordination: see begin_episode_from / arbitrate_begin / RNetRbPeerAgree
+ * below and docs/rollback.md.
  *
  * Single-threaded session ownership, same as delay-sync RNetSession.
  */
@@ -161,9 +163,9 @@ typedef struct RNetRbConfig
     uint32_t delay;            /* committed input delay D */
     uint32_t seal_max_span;    /* <= RNET_RB_SEAL_MAX_SPAN; 0 = default */
     /* Active seats in this match (1..RNET_RB_MAX_SLOTS). Peer-seal completion
-     * only waits on slots in [0, slot_count) excluding local_slot -- so an
-     * observer, whose local_slot is outside that range, waits on all of them.
-     * 0 => 2. */
+     * only waits on OCCUPIED slots in [0, slot_count) excluding local_slot
+     * (see occupied_mask) -- so an observer, whose local_slot is outside that
+     * range, waits on all of them. 0 => 2. */
     uint32_t slot_count;
     /* TipHold quiet window after POST match (0 = finalize immediately;
      * RNET_RB_TIP_RUNWAY_DEFAULT recommended for digital hosts). Also the
@@ -180,7 +182,18 @@ typedef struct RNetRbConfig
      * library default of 16 silently loses the light-tip fast path and pays
      * a second RTT it didn't need to. Clamped like tip_runway (max 32). */
     uint32_t light_tip_max_depth;
+    /* Bit i = seat i is occupied by a real peer (same meaning as
+     * RNetConfig.occupied_mask). 0 = every seat in [0, slot_count) (legacy).
+     * Sparse rooms (e.g. seats 0+2 of 4) must clear the empty bits, or
+     * peer-seal completion and the N-way helpers below wait forever on a seat
+     * nobody sits in. Appended last so a zero-initialised config keeps the
+     * old behaviour. */
+    uint32_t occupied_mask;
 } RNetRbConfig;
+
+/* "No seat": an initiator slot that is not known (legacy begin_episode on a
+ * follower), or no mismatching seat. */
+#define RNET_RB_SLOT_NONE 0xffffffffu
 
 /* Lifecycle. */
 RNetRbSession *rnet_rb_create(const RNetRbConfig *cfg, const RNetRollbackVTable *vt);
@@ -230,6 +243,66 @@ uint8_t rnet_rb_recommend_light_tip(const RNetRbSession *s);
  */
 void rnet_rb_begin_episode(RNetRbSession *s, const RNetRbCorrection *corr);
 void rnet_rb_set_phase(RNetRbSession *s, RNetRbPhase phase);
+
+/*
+ * N-peer episode coordination.
+ *
+ * With two seats the initiator of any episode is "me or the one other seat",
+ * so the FSM never had to remember WHO opened it. With three or more, two
+ * seats can open episodes concurrently and a third can be asked to follow
+ * both, so the initiator's seat is part of the episode's identity.
+ *
+ * rnet_rb_begin_episode_from records it: pass the BEGIN's sender seat
+ * (rnet_session_take_rb_sync_from) for a follow episode, or your own seat
+ * when initiating. Plain rnet_rb_begin_episode records local_slot when
+ * corr->initiator is set and RNET_RB_SLOT_NONE otherwise (unchanged N=2
+ * behaviour: the other seat is implied).
+ */
+void rnet_rb_begin_episode_from(RNetRbSession *s, const RNetRbCorrection *corr,
+                                uint32_t initiator_slot);
+/* Initiator seat of the current episode; RNET_RB_SLOT_NONE when idle or
+ * unknown. */
+uint32_t rnet_rb_get_initiator_slot(const RNetRbSession *s);
+
+/*
+ * Deterministic lowest-slot arbitration for an inbound RB_SYNC BEGIN that is
+ * not flagged REREPLAY (a tip-extend is never a new episode; handle it
+ * first). Every seat applies the same rule to the same facts, so all seats
+ * converge on the lowest initiating seat without another round trip:
+ *
+ *   Follow       -- idle (Live, or a finished Commit/Abort): follow it.
+ *   SameEpisode  -- it is the episode we already hold (same initiator seat,
+ *                   same epoch): a duplicate, not a new episode.
+ *   Yield        -- busy, but the sender's seat is LOWER than the current
+ *                   episode's initiator (ours or the one we follow): tear
+ *                   ours down (no ABORT on the wire -- the sender's BEGIN
+ *                   reaches every seat and each one yields for itself) and
+ *                   follow the sender.
+ *   Refuse       -- busy and the current initiator outranks the sender, the
+ *                   current initiator is unknown, or the sender is our own
+ *                   seat: reply RB_SYNC NACK so the sender aborts at once
+ *                   instead of timing out.
+ *
+ * At N = 2 this is exactly the rule recomp-net hosts already implemented by
+ * hand ("lower initiator slot wins; the loser yields and follows").
+ */
+typedef enum RNetRbBeginArb
+{
+    nRNetRbBeginFollow = 0,
+    nRNetRbBeginSameEpisode,
+    nRNetRbBeginYield,
+    nRNetRbBeginRefuse
+} RNetRbBeginArb;
+
+RNetRbBeginArb rnet_rb_arbitrate_begin(const RNetRbSession *s, uint32_t sender_slot,
+                                       uint32_t epoch_id);
+
+/* Seats whose seal rows / digests / watermark this session must wait on:
+ * rnet_expected_peer_mask(slot_count, occupied_mask, local_slot). */
+uint32_t rnet_rb_expected_peer_mask(const RNetRbSession *s);
+/* Membership change mid-match (a seat left). Same meaning as
+ * RNetRbConfig.occupied_mask; re-evaluates the per-peer frontier. */
+void rnet_rb_set_occupied_mask(RNetRbSession *s, uint32_t occupied_mask);
 
 /*
  * Tip-extend / edge coalesce: grow target_tick and append seal rows for
@@ -308,7 +381,19 @@ uint8_t rnet_rb_export_seal_rows_chunk(const RNetRbSession *s, int32_t slot, uin
 /* Shared frontier / resolved-through watermark (highest sim tick agreed with
  * peers). Drives live-sim caps and input-contract hash_confirm_promote. */
 uint32_t rnet_rb_resolved_through(const RNetRbSession *s);
+/* Unattributed advance (max-wins). Correct only with a single peer. */
 void rnet_rb_set_peer_convergence(RNetRbSession *s, uint32_t peer_target);
+/* N-way advance from an RB_RESOLVED sender (rnet_session_take_rb_resolved_
+ * from). Keeps each expected seat's latest advertised frontier and advances
+ * resolved_through to the MINIMUM over every expected seat once all have
+ * advertised -- the highest tick every seat has proven. Never demotes (use
+ * rnet_rb_demote_resolved_through). Returns 1 if the watermark moved; 0 for
+ * a seat outside the expected mask (own seat, empty seat, spectator). With
+ * one peer this is identical to set_peer_convergence. Per-seat values
+ * survive session_reset, like resolved_through itself. */
+uint8_t rnet_rb_note_peer_resolved(RNetRbSession *s, uint32_t slot, uint32_t resolved_through);
+/* A seat's latest advertised frontier; 0 if it has not advertised. */
+uint8_t rnet_rb_peer_resolved(const RNetRbSession *s, uint32_t slot, uint32_t *out_tick);
 /* Pull resolved_through down to tick when a follow-NACK / unilateral tip is
  * refused (tick < current). set_peer_convergence only advances — without a
  * demote, session_reset keeps a poisoned frontier and the next light-tip /
@@ -321,6 +406,63 @@ void rnet_rb_demote_resolved_through(RNetRbSession *s, uint32_t tick);
 void rnet_rb_on_post_match(RNetRbSession *s);
 void rnet_rb_on_post_diverge(RNetRbSession *s);
 void rnet_rb_commit_promote_sealed(RNetRbSession *s);
+
+/*
+ * N-way digest agreement for one episode checkpoint: RB_BASELINE at the load
+ * tick, RB_POST at the target tick. At N = 2 the host compared one peer's
+ * digest with its own; at N seats it must hear from every expected seat and
+ * stop on the first that disagrees. Pure bookkeeping over caller-supplied
+ * digest words (e.g. BASELINE master + 3 partitions = 4 words; POST master +
+ * input digest = 2), keyed by (epoch, tick).
+ *
+ *   rnet_rb_agree_begin(&a, rnet_rb_expected_peer_mask(s), epoch, tick, 4);
+ *   rnet_rb_agree_set_local(&a, my_words);       (before or after peers)
+ *   while (take_rb_baseline_from(...)) rnet_rb_agree_note(&a, sender, ...);
+ *   switch (rnet_rb_agree_status(&a, &slot, &word)) { ... }
+ *
+ * Status: Mismatch as soon as the local words and any reporting seat differ
+ * (in any word) -- whether or not the others have reported; Match once every
+ * expected seat has reported and all equal local; otherwise Pending. An
+ * empty peer mask never matches (fail closed).
+ */
+#define RNET_RB_AGREE_MAX_WORDS 4u
+
+typedef enum RNetRbAgreeStatus
+{
+    nRNetRbAgreePending = 0,
+    nRNetRbAgreeMatch,
+    nRNetRbAgreeMismatch
+} RNetRbAgreeStatus;
+
+typedef struct RNetRbPeerAgree
+{
+    uint32_t epoch_id;
+    uint32_t tick;
+    uint32_t word_count;
+    uint32_t peer_mask;
+    uint32_t reported_mask;
+    uint8_t local_valid;
+    uint32_t local[RNET_RB_AGREE_MAX_WORDS];
+    uint32_t peer[RNET_RB_MAX_SLOTS][RNET_RB_AGREE_MAX_WORDS];
+} RNetRbPeerAgree;
+
+/* word_count is clamped to 1..RNET_RB_AGREE_MAX_WORDS. */
+void rnet_rb_agree_begin(RNetRbPeerAgree *a, uint32_t peer_mask, uint32_t epoch_id,
+                         uint32_t tick, uint32_t word_count);
+void rnet_rb_agree_set_local(RNetRbPeerAgree *a, const uint32_t *words);
+/* 1 if recorded. 0 when (epoch, tick) is not the checkpoint being agreed
+ * (stale or future -- the caller decides whether to hold it), or the seat is
+ * not expected. A seat reporting again replaces its words (latest wins). */
+uint8_t rnet_rb_agree_note(RNetRbPeerAgree *a, uint32_t slot, uint32_t epoch_id,
+                           uint32_t tick, const uint32_t *words);
+/* Optional outs name the first (lowest) mismatching seat and word index;
+ * RNET_RB_SLOT_NONE otherwise. */
+RNetRbAgreeStatus rnet_rb_agree_status(const RNetRbPeerAgree *a, uint32_t *mismatch_slot,
+                                       uint32_t *mismatch_word);
+/* Expected seats that have not reported yet. */
+uint32_t rnet_rb_agree_missing_mask(const RNetRbPeerAgree *a);
+/* A seat left mid-checkpoint: drop it from the expected set. */
+void rnet_rb_agree_set_peer_mask(RNetRbPeerAgree *a, uint32_t peer_mask);
 
 /* Event queue (peer symmetric notices, frame-commit) drained by the host. */
 void rnet_rb_enqueue_event(RNetRbSession *s, const RNetRbEvent *event);

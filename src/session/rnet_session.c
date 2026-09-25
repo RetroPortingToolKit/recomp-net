@@ -145,32 +145,41 @@ struct RNetSession
     /* ICE TURN auto-fallback timers (monotonic ms). */
     rnet_u64 ice_attempt_ms;
     rnet_u64 ice_completed_ms;
-    /* Peer RB_FRAME_COMMIT queue (host drains via take_*). */
-#define RNET_RB_FC_QUEUE 64
+    /* Peer RB_FRAME_COMMIT queue (host drains via take_*). Every entry
+     * records its sender's wire slot (packet header local_slot) so an N-way
+     * host can attribute each digest to a seat -- see take_*_from. Depth
+     * scales with the number of possible remote senders so N-1 peers get the
+     * same per-peer headroom one peer had at N=2. */
+#define RNET_RB_FC_QUEUE (64 * (RNET_MAX_SLOTS - 1))
     /* PSX-Link group scoping: when >= 0, rollback EPISODE/STATE packets
      * (SYNC, BASELINE, POST, STATE_*) are accepted only from this slot —
      * episode coordination is per-console-group in link sessions. FRAME_COMMIT
      * is NOT filtered (all seats emit the same machine-level pair fold), and
      * input-plane packets (INPUT, INPUT_CONFIRM, SEAL_ROWS, RESOLVED) are
-     * session-wide. -1 = accept all (default). */
+     * session-wide. -1 = accept all (default). rb_peer_mask generalises it to
+     * a group of seats (0 = unused); set_rb_peer_slot/mask keep exactly one of
+     * the two active. */
     int rb_peer_slot;
+    rnet_u32 rb_peer_mask;
     rnet_u32 rb_fc_tick[RNET_RB_FC_QUEUE];
     rnet_u32 rb_fc_hash[RNET_RB_FC_QUEUE];
+    rnet_u8 rb_fc_sender[RNET_RB_FC_QUEUE];
     int rb_fc_q_head; /* next write */
     int rb_fc_q_tail; /* next read */
     int rb_fc_q_count;
 
-    /* Peer RB episode control queues (latest-wins / small FIFO). */
-#define RNET_RB_CTRL_QUEUE 8
+    /* Peer RB episode control queues (small FIFO, newest dropped when full).
+     * Depth: 8 per possible remote sender. */
+#define RNET_RB_CTRL_QUEUE (8 * (RNET_MAX_SLOTS - 1))
     struct {
         rnet_u32 epoch_id, mismatch_tick, load_tick, target_tick;
-        rnet_u8 corrected_slot, initiator, flags;
+        rnet_u8 corrected_slot, initiator, flags, sender;
     } rb_sync_q[RNET_RB_CTRL_QUEUE];
     int rb_sync_head, rb_sync_tail, rb_sync_count;
 
     struct {
         rnet_u32 epoch_id, mismatch_tick, target_tick, row_begin;
-        rnet_u8 slot;
+        rnet_u8 slot, sender;
         rnet_u16 row_count;
         RNetRbWireFrame rows[RNET_RB_SEAL_ROWS_CHUNK_MAX];
     } rb_seal_q[RNET_RB_CTRL_QUEUE];
@@ -178,12 +187,13 @@ struct RNetSession
 
     struct {
         rnet_u32 epoch_id, load_tick, digest_master, digest_a, digest_b, digest_c;
+        rnet_u8 sender;
     } rb_base_q[RNET_RB_CTRL_QUEUE];
     int rb_base_head, rb_base_tail, rb_base_count;
 
     struct {
         rnet_u32 epoch_id, target_tick, digest_master, input_digest;
-        rnet_u8 match;
+        rnet_u8 match, sender;
     } rb_post_q[RNET_RB_CTRL_QUEUE];
     int rb_post_head, rb_post_tail, rb_post_count;
 
@@ -194,6 +204,7 @@ struct RNetSession
     rnet_u8 modset_ack_status;
     rnet_u8 modset_ack_pending;
     rnet_u32 rb_resolved_q[RNET_RB_CTRL_QUEUE];
+    rnet_u8 rb_resolved_sender[RNET_RB_CTRL_QUEUE];
     int rb_resolved_head, rb_resolved_tail, rb_resolved_count;
 
     /* Peer GBA Multi SEND barrier (0-delay; not pad INPUT). */
@@ -427,6 +438,20 @@ static void send_input_confirm_tick(RNetSession *s, rnet_u32 tick,
     s->confirm_last_sent_ms[tick % RNET_HISTORY_LENGTH] = now;
 }
 
+/* Rollback episode/state scoping (see rb_peer_slot / rb_peer_mask). */
+static int rb_peer_accept(const RNetSession *s, rnet_u8 sender)
+{
+    if (s->rb_peer_slot >= 0)
+    {
+        return (int)sender == s->rb_peer_slot;
+    }
+    if (s->rb_peer_mask != 0u)
+    {
+        return (sender < 32u) && ((s->rb_peer_mask & (1u << sender)) != 0u);
+    }
+    return 1;
+}
+
 static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
 {
     int i;
@@ -553,35 +578,35 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_STATE_BEGIN:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
         state_on_begin(s, pkt);
         break;
     case RNET_PKT_STATE_CHUNK:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
         state_on_chunk(s, pkt);
         break;
     case RNET_PKT_STATE_ACK:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
         state_on_ack(s, pkt);
         break;
     case RNET_PKT_STATE_PROBE:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
         state_on_probe(s, pkt);
         break;
     case RNET_PKT_STATE_PROBE_REPLY:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
@@ -624,6 +649,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             {
                 s->rb_fc_tick[s->rb_fc_q_head] = pkt->rb_through_tick;
                 s->rb_fc_hash[s->rb_fc_q_head] = pkt->rb_state_hash;
+                s->rb_fc_sender[s->rb_fc_q_head] = pkt->local_slot;
                 s->rb_fc_q_head = (s->rb_fc_q_head + 1) % RNET_RB_FC_QUEUE;
                 s->rb_fc_q_count++;
             }
@@ -634,13 +660,14 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
                 s->rb_fc_q_count--;
                 s->rb_fc_tick[s->rb_fc_q_head] = pkt->rb_through_tick;
                 s->rb_fc_hash[s->rb_fc_q_head] = pkt->rb_state_hash;
+                s->rb_fc_sender[s->rb_fc_q_head] = pkt->local_slot;
                 s->rb_fc_q_head = (s->rb_fc_q_head + 1) % RNET_RB_FC_QUEUE;
                 s->rb_fc_q_count++;
             }
         }
         break;
     case RNET_PKT_RB_SYNC:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
@@ -654,6 +681,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_sync_q[s->rb_sync_head].corrected_slot = pkt->rb_corrected_slot;
             s->rb_sync_q[s->rb_sync_head].initiator = pkt->rb_initiator;
             s->rb_sync_q[s->rb_sync_head].flags = pkt->rb_flags;
+            s->rb_sync_q[s->rb_sync_head].sender = pkt->local_slot;
             s->rb_sync_head = (s->rb_sync_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_sync_count++;
         }
@@ -668,6 +696,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_seal_q[s->rb_seal_head].row_begin = pkt->rb_row_begin;
             s->rb_seal_q[s->rb_seal_head].slot = pkt->rb_slot;
             s->rb_seal_q[s->rb_seal_head].row_count = pkt->rb_row_count;
+            s->rb_seal_q[s->rb_seal_head].sender = pkt->local_slot;
             if (pkt->rb_row_count > 0)
             {
                 rnet_u16 n = pkt->rb_row_count;
@@ -682,7 +711,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_BASELINE:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
@@ -695,12 +724,13 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_base_q[s->rb_base_head].digest_a = pkt->rb_digest_a;
             s->rb_base_q[s->rb_base_head].digest_b = pkt->rb_digest_b;
             s->rb_base_q[s->rb_base_head].digest_c = pkt->rb_digest_c;
+            s->rb_base_q[s->rb_base_head].sender = pkt->local_slot;
             s->rb_base_head = (s->rb_base_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_base_count++;
         }
         break;
     case RNET_PKT_RB_POST:
-        if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
+        if (!rb_peer_accept(s, pkt->local_slot))
         {
             break;
         }
@@ -712,6 +742,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_post_q[s->rb_post_head].digest_master = pkt->rb_digest_master;
             s->rb_post_q[s->rb_post_head].input_digest = pkt->rb_input_digest;
             s->rb_post_q[s->rb_post_head].match = pkt->rb_match;
+            s->rb_post_q[s->rb_post_head].sender = pkt->local_slot;
             s->rb_post_head = (s->rb_post_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_post_count++;
         }
@@ -739,6 +770,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_resolved_count < RNET_RB_CTRL_QUEUE)
         {
             s->rb_resolved_q[s->rb_resolved_head] = pkt->rb_resolved_through;
+            s->rb_resolved_sender[s->rb_resolved_head] = pkt->local_slot;
             s->rb_resolved_head = (s->rb_resolved_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_resolved_count++;
         }
@@ -2953,14 +2985,35 @@ void rnet_session_set_rb_peer_slot(RNetSession *s, int slot)
         return;
     }
     s->rb_peer_slot = slot;
+    s->rb_peer_mask = 0u;
+}
+
+void rnet_session_set_rb_peer_mask(RNetSession *s, rnet_u32 mask)
+{
+    if (s == NULL)
+    {
+        return;
+    }
+    s->rb_peer_slot = -1;
+    s->rb_peer_mask = mask;
 }
 
 int rnet_session_take_rb_frame_commit(RNetSession *s, rnet_u32 *through_tick,
                                       rnet_u32 *state_hash)
 {
+    return rnet_session_take_rb_frame_commit_from(s, NULL, through_tick, state_hash);
+}
+
+int rnet_session_take_rb_frame_commit_from(RNetSession *s, rnet_u8 *sender_slot,
+                                           rnet_u32 *through_tick, rnet_u32 *state_hash)
+{
     if (s == NULL || s->rb_fc_q_count <= 0)
     {
         return 0;
+    }
+    if (sender_slot)
+    {
+        *sender_slot = s->rb_fc_sender[s->rb_fc_q_tail];
     }
     if (through_tick)
     {
@@ -3138,8 +3191,19 @@ int rnet_session_take_rb_sync(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *mism
                               rnet_u32 *load_tick, rnet_u32 *target_tick,
                               rnet_u8 *corrected_slot, rnet_u8 *op, rnet_u8 *flags)
 {
+    return rnet_session_take_rb_sync_from(s, NULL, epoch_id, mismatch_tick, load_tick,
+                                          target_tick, corrected_slot, op, flags);
+}
+
+int rnet_session_take_rb_sync_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                   rnet_u32 *mismatch_tick, rnet_u32 *load_tick,
+                                   rnet_u32 *target_tick, rnet_u8 *corrected_slot, rnet_u8 *op,
+                                   rnet_u8 *flags)
+{
     if (s == NULL || s->rb_sync_count <= 0)
         return 0;
+    if (sender_slot)
+        *sender_slot = s->rb_sync_q[s->rb_sync_tail].sender;
     if (epoch_id)
         *epoch_id = s->rb_sync_q[s->rb_sync_tail].epoch_id;
     if (mismatch_tick)
@@ -3194,9 +3258,21 @@ int rnet_session_take_rb_seal_rows(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 
                                    rnet_u32 *target_tick, rnet_u8 *slot, rnet_u32 *row_begin,
                                    RNetRbFrame *rows, rnet_u16 *row_count)
 {
+    return rnet_session_take_rb_seal_rows_from(s, NULL, epoch_id, mismatch_tick, target_tick,
+                                               slot, row_begin, rows, row_count);
+}
+
+int rnet_session_take_rb_seal_rows_from(RNetSession *s, rnet_u8 *sender_slot,
+                                        rnet_u32 *epoch_id, rnet_u32 *mismatch_tick,
+                                        rnet_u32 *target_tick, rnet_u8 *slot,
+                                        rnet_u32 *row_begin, RNetRbFrame *rows,
+                                        rnet_u16 *row_count)
+{
     rnet_u16 i, n;
     if (s == NULL || s->rb_seal_count <= 0)
         return 0;
+    if (sender_slot)
+        *sender_slot = s->rb_seal_q[s->rb_seal_tail].sender;
     if (epoch_id)
         *epoch_id = s->rb_seal_q[s->rb_seal_tail].epoch_id;
     if (mismatch_tick)
@@ -3249,8 +3325,19 @@ int rnet_session_take_rb_baseline(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *
                                   rnet_u32 *digest_master, rnet_u32 *digest_a, rnet_u32 *digest_b,
                                   rnet_u32 *digest_c)
 {
+    return rnet_session_take_rb_baseline_from(s, NULL, epoch_id, load_tick, digest_master,
+                                              digest_a, digest_b, digest_c);
+}
+
+int rnet_session_take_rb_baseline_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                       rnet_u32 *load_tick, rnet_u32 *digest_master,
+                                       rnet_u32 *digest_a, rnet_u32 *digest_b,
+                                       rnet_u32 *digest_c)
+{
     if (s == NULL || s->rb_base_count <= 0)
         return 0;
+    if (sender_slot)
+        *sender_slot = s->rb_base_q[s->rb_base_tail].sender;
     if (epoch_id)
         *epoch_id = s->rb_base_q[s->rb_base_tail].epoch_id;
     if (load_tick)
@@ -3287,8 +3374,18 @@ int rnet_session_send_rb_post(RNetSession *s, rnet_u32 epoch_id, rnet_u32 target
 int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *target_tick,
                               rnet_u32 *digest_master, rnet_u32 *input_digest, rnet_u8 *match)
 {
+    return rnet_session_take_rb_post_from(s, NULL, epoch_id, target_tick, digest_master,
+                                          input_digest, match);
+}
+
+int rnet_session_take_rb_post_from(RNetSession *s, rnet_u8 *sender_slot, rnet_u32 *epoch_id,
+                                   rnet_u32 *target_tick, rnet_u32 *digest_master,
+                                   rnet_u32 *input_digest, rnet_u8 *match)
+{
     if (s == NULL || s->rb_post_count <= 0)
         return 0;
+    if (sender_slot)
+        *sender_slot = s->rb_post_q[s->rb_post_tail].sender;
     if (epoch_id)
         *epoch_id = s->rb_post_q[s->rb_post_tail].epoch_id;
     if (target_tick)
@@ -3438,8 +3535,16 @@ int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through)
 
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through)
 {
+    return rnet_session_take_rb_resolved_from(s, NULL, resolved_through);
+}
+
+int rnet_session_take_rb_resolved_from(RNetSession *s, rnet_u8 *sender_slot,
+                                       rnet_u32 *resolved_through)
+{
     if (s == NULL || s->rb_resolved_count <= 0)
         return 0;
+    if (sender_slot)
+        *sender_slot = s->rb_resolved_sender[s->rb_resolved_tail];
     if (resolved_through)
         *resolved_through = s->rb_resolved_q[s->rb_resolved_tail];
     s->rb_resolved_tail = (s->rb_resolved_tail + 1) % RNET_RB_CTRL_QUEUE;

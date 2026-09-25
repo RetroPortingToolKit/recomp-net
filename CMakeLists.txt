@@ -207,6 +207,41 @@ else()
   target_compile_options(recomp_net PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ---- WebSocket lobby client ----
+# A separate target, not core: it starts a connect-worker thread (Threads)
+# and each handle carries ~1 MB of state, which LAN-only consumers of
+# recomp_net do not want. See docs/lobby_client.md.
+set(RNET_LOBBY_SOURCES
+  src/lobby/rnet_lobby_client.c
+  src/lobby/rnet_lobby_json.c
+  src/lobby/rnet_lobby_automatch.c
+  src/lobby/rnet_lobby_mods.c
+  src/lobby/rnet_lobby_latency.c
+)
+add_library(recomp_net_lobby STATIC ${RNET_LOBBY_SOURCES})
+add_library(recomp_net::recomp_net_lobby ALIAS recomp_net_lobby)
+target_include_directories(recomp_net_lobby
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+find_package(Threads REQUIRED)
+target_link_libraries(recomp_net_lobby PUBLIC recomp_net Threads::Threads)
+target_compile_definitions(recomp_net_lobby PRIVATE $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
+if(UNIX)
+  target_compile_definitions(recomp_net_lobby PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  if(APPLE)
+    target_compile_definitions(recomp_net_lobby PRIVATE _DARWIN_C_SOURCE)
+  endif()
+endif()
+if(MSVC)
+  target_compile_options(recomp_net_lobby PRIVATE /W4)
+else()
+  target_compile_options(recomp_net_lobby PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 # ---- Examples ----
 if(RNET_BUILD_EXAMPLES)
   add_executable(lan_delay_2p examples/lan_delay_2p/main.c)
@@ -293,6 +328,20 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(hash_confirm_test PRIVATE recomp_net)
   add_test(NAME hash_confirm_test COMMAND hash_confirm_test)
 
+  # N-peer rollback agreement (per-sender takes, N-way watermark, lowest-slot
+  # arbitration, BASELINE/POST agreement).
+  add_executable(hash_confirm_nway_test tests/hash_confirm_nway_test.c)
+  target_link_libraries(hash_confirm_nway_test PRIVATE recomp_net)
+  add_test(NAME hash_confirm_nway_test COMMAND hash_confirm_nway_test)
+
+  add_executable(rollback_nway_test tests/rollback_nway_test.c)
+  target_link_libraries(rollback_nway_test PRIVATE recomp_net)
+  add_test(NAME rollback_nway_test COMMAND rollback_nway_test)
+
+  add_executable(session_nway_test tests/session_nway_test.c)
+  target_link_libraries(session_nway_test PRIVATE recomp_net)
+  add_test(NAME session_nway_test COMMAND session_nway_test)
+
   add_executable(input_hist_test tests/input_hist_test.c)
   target_link_libraries(input_hist_test PRIVATE recomp_net)
   add_test(NAME input_hist_test COMMAND input_hist_test)
@@ -305,7 +354,20 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(sched_smoke_test PRIVATE recomp_net)
   target_include_directories(sched_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME sched_smoke_test COMMAND sched_smoke_test)
+
+  # WebSocket lobby client (recomp_net_lobby): JSON reader, the snesrecomp
+  # mod-plan suite ported onto the shared client, and the protocol suite
+  # against canned server frames.
+  foreach(_rnet_lobby_test IN ITEMS lobby_json_test lobby_mod_plan_test lobby_client_test
+          lobby_ws_loopback_test)
+    add_executable(${_rnet_lobby_test} tests/${_rnet_lobby_test}.c)
+    target_link_libraries(${_rnet_lobby_test} PRIVATE recomp_net_lobby)
+    target_include_directories(${_rnet_lobby_test} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(${_rnet_lobby_test} PRIVATE $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
+    add_test(NAME ${_rnet_lobby_test} COMMAND ${_rnet_lobby_test})
+  endforeach()
 endif()
 
 install(TARGETS recomp_net ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
+install(TARGETS recomp_net_lobby ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
 install(DIRECTORY include/recomp_net DESTINATION include)

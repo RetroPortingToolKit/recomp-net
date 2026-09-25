@@ -91,6 +91,43 @@ static inline int rnet_config_slot_occupied(const RNetConfig *cfg, rnet_u8 slot)
     return (mask & (1u << slot)) != 0;
 }
 
+/*
+ * The seats whose agreement this peer must wait on: every OCCUPIED seat in
+ * [0, slot_count) except its own. Bit i = seat i.
+ *
+ * occupied_mask == 0 means "every seat in range" (the RNetConfig legacy
+ * default). An observer (local_slot >= slot_count) owns no seat, so it waits
+ * on all occupied seats. Spectators never appear here: they have no seat, and
+ * their wire ids live above the seat range.
+ *
+ * This is the single definition shared by the hash-confirm watermark
+ * (rnet_hc_init_n) and the rollback episode FSM (RNetRbConfig.occupied_mask),
+ * so "who must agree" can never be computed two different ways.
+ */
+static inline rnet_u32 rnet_expected_peer_mask(rnet_u32 slot_count, rnet_u32 occupied_mask,
+                                               rnet_u32 local_slot)
+{
+    rnet_u32 all;
+    rnet_u32 mask;
+    if (slot_count == 0u)
+        return 0u;
+    if (slot_count > RNET_MAX_SLOTS)
+        slot_count = RNET_MAX_SLOTS;
+    all = (1u << slot_count) - 1u;
+    mask = (occupied_mask == 0u) ? all : (occupied_mask & all);
+    if (local_slot < slot_count)
+        mask &= ~(1u << local_slot);
+    return mask;
+}
+
+/* rnet_expected_peer_mask for a session config. */
+static inline rnet_u32 rnet_config_expected_peer_mask(const RNetConfig *cfg)
+{
+    if (cfg == NULL)
+        return 0u;
+    return rnet_expected_peer_mask(cfg->slot_count, cfg->occupied_mask, cfg->local_slot);
+}
+
 #ifdef __cplusplus
 }
 #endif
