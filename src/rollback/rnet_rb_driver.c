@@ -1452,9 +1452,17 @@ static uint32_t rb_claimed_content_fp(const RNetRbDriver *d)
 static void rb_send_identity(RNetRbDriver *d)
 {
     RNetSession *s = rb_session(d);
-    if (!s || d->peer_ident_seen || d->sim > RB_IDENT_RETRY_TICKS)
+    if (!s || d->sim > RB_IDENT_RETRY_TICKS)
         return;
     if (d->local_build_fp == 0u && d->local_content_fp == 0u)
+        return;
+    /* Stop once the peer's identity is in AND ours has gone out. Stopping on
+     * the peer's alone made the exchange one-sided: the peer that started
+     * later usually had the other's IDENT in hand before its own first send
+     * (tick 0, or the next multiple of 8), and then never sent at all -- so
+     * only one side could ever see a mod-set difference and refuse, and the
+     * other left on "peer disconnected" without knowing why. */
+    if (d->peer_ident_seen && d->ident_sent)
         return;
     /* Validation (FORCE_MOD_MISMATCH=1): claim a mod set we do not have, so
      * the refusal path can be proven to fire. A refusal that has never
@@ -1469,7 +1477,7 @@ static void rb_send_identity(RNetRbDriver *d)
     }
     /* Every few ticks, not every tick: one trip is all it needs, and a peer
      * that is simply older should not be pelted. */
-    if ((d->sim % 8u) != 0u)
+    if ((d->sim % 8u) != 0u && !d->peer_ident_seen)
         return;
     if (rnet_session_send_rb_sync(
             s, 0u, d->local_build_fp, d->local_content_fp, 0u,
@@ -2517,6 +2525,10 @@ static void rb_drain_wire(RNetRbDriver *d)
             }
             break;
         case RNET_RB_SYNC_OP_IDENT:
+            /* Retransmits of an identity already judged say nothing new; a
+             * refusal is one verdict, not one per copy. */
+            if (d->peer_ident_seen && d->peer_build_fp == a && d->peer_content_fp == b)
+                break;
             d->peer_build_fp = a;
             d->peer_content_fp = b;
             d->peer_ident_seen = 1u;
@@ -3044,6 +3056,11 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
      * -- no frame, no pump, no handshake, forever. A precondition has to be
      * driven by something that runs whether or not the thing it gates runs. */
     rb_modset_pump(d);
+    /* Identity too, for the same reason: it is sent from finish_frame, and a
+     * peer held at tick 0-1 (boot-digest wait, or already refused on OUR
+     * identity) runs no frame -- so it never answered, and the other side,
+     * never seeing its identity, could not refuse on the same evidence. */
+    rb_send_identity(d);
     rb_reconcile_wire(d);
     rb_pump_episode(d);
     /* A peer that said BYE has left even while the session still reads

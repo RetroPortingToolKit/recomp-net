@@ -751,8 +751,14 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                      "(sim %u -> %u, %u live admits)", sc->name, who,
                      r->sim_at_refusal, r->sim_after_hold, r->live_admits_after);
             expect_true(r->sim_after_hold == r->sim_at_refusal &&
-                            r->live_admits_after == 0u && r->sim_at_refusal <= 1u,
+                            r->live_admits_after == 0u,
                         msg);
+            if (sc->force_boot_fork) {
+                /* Tick 0's digest decides it: tick 1 must never run. */
+                snprintf(msg, sizeof(msg), "%s: %s held at tick 1 (sim %u)", sc->name,
+                         who, r->sim_at_refusal);
+                expect_true(r->sim_at_refusal <= 1u, msg);
+            }
             snprintf(msg, sizeof(msg), "%s: %s opened no episode", sc->name, who);
             expect_true(r->n_ep_init + r->n_ep_follow == 0u, msg);
         }
