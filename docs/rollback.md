@@ -324,6 +324,19 @@ owns:
   path, so "RB chain stall" (ADVISORY) fires and the confirmed watermark waits
   for the tick to age out. Every such stall in the sweep sat on a tick of a
   NACKed episode.
+- **Measured again through n64lle's lobby (2026-09-25, `tools/rb_lobby.sh`,
+  online through a local recomp-net-server's input relay, 0 ms): the stall
+  does not always age out.** In one of fourteen two-process lobby matches
+  the follower refused the episode at tick 810 ("no snapshot at load tick",
+  ring oldest 770), the chain stalled there, and then the follower refused
+  EVERY later episode too (16 refusals in all, each "ring oldest = load -
+  40", i.e. one tick short), and `confirmed_through` stayed at 809 to the end of the match
+  (sim 1501, 691 ticks later) on both peers. No fork, the match drained, the
+  initiator's 33 corrections all changed its guest -- but for the last 45 % of
+  that match nothing past tick 809 was ever confirmed. The other thirteen
+  matches' stalls (0-4 per match) all cleared. So "waits for the tick to age
+  out" is not a bound: once the follower sits exactly one tick behind every
+  load tick, nothing ages. (n64lle `docs/NETPLAY.md` §7.)
 
 ### More than two peers
 
