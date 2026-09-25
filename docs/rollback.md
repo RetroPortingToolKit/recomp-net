@@ -313,8 +313,10 @@ owns:
 - **A follower that has not yet simulated the load tick refuses the episode**
   ("RB follow refused ... no snapshot at load tick", the ring's newest being
   load-1). It has nothing to correct -- it will simulate that tick on the true
-  rows -- but the NACK aborts the initiator's episode. 2 of 57 episodes at 0 ms,
-  3 of 53 at 60 ms RTT.
+  rows -- but the NACK aborts the initiator's episode. At 0 ms it varies run
+  to run with how far the peers' tick clocks sit apart: 2 of 57 episodes in
+  one run, 24 of 56 in a rerun of the same cell on the same build; 0-3 at
+  60 ms RTT, 0 at 200 and 300 ms.
 - **After that abort the chain stalls on a digest the replay already
   replaced.** The initiator's replay completed (it paid the correction, as the
   rule above says) before the NACK arrived, but the hash chain still holds the
