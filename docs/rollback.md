@@ -222,7 +222,7 @@ NULL and refuses.
 | `decode_sample` / `sanitize_row` / `neutral_row` | Pad layout: wire bytes to a row, force a row legal, and what "nothing held" is per seat. Active-high pads (SNES, N64) and active-low (PSX) differ; the driver assumes neither. |
 | `admit_sample` (opt.) | Side data riding the pad bytes, from the sample a LIVE admit used. |
 | `boot_digest_noted` (opt.) | Log what explains a boot mismatch (partitions, frame counters). |
-| `request_return_to_lobby` | End the match (boot fork, mod-set refusal). |
+| `request_return_to_lobby` | The match is refused (boot fork, mod-set refusal): leave it. Called once; the reason is `rnet_rb_driver_refusal()` (`boot_digest_mismatch`, `mod_set_mismatch`, `mod_set_not_agreed`). From the refusal on `poll_admit` admits no Live tick, so a refused match cannot play on while the host gets round to it -- but tearing the session down and returning to the lobby is the host's job. A host that never consumes it freezes its players on the last frame. |
 | `log` (opt.), `now_ms` | Line sink (NULL = stderr) and a monotonic clock. |
 
 `RNetRbDriverConfig` takes live pointers to the session, seat, seat count,
