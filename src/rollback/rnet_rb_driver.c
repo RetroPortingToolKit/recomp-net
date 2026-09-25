@@ -187,6 +187,8 @@ struct RNetRbDriver {
     uint32_t modset_since_ms;
     char     modset_reason[96];
     uint8_t  ident_sent;
+    uint8_t  ident_owed;         /* a peer repeated its IDENT: it may lack ours */
+    uint32_t ident_sent_ms;
     /* Per peer seat, like the chains they watch. */
     uint32_t chain_fork_tick[RB_MAX_SLOTS];    /* last frame-commit fork reported */
     uint32_t chain_pending_tick[RB_MAX_SLOTS]; /* mismatch under observation, 0 = none */
@@ -1677,6 +1679,7 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
  * message will never answer and we must not retransmit for the whole match.
  */
 #define RB_IDENT_RETRY_TICKS 90u
+#define RB_IDENT_RESEND_MS 100u
 
 /* The content fingerprint this peer claims. FORCE_MOD_MISMATCH makes it a
  * peer that really has a different set -- on the wire AND in its own
@@ -1704,29 +1707,40 @@ static void rb_send_identity(RNetRbDriver *d)
      * only one side could ever see a mod-set difference and refuse, and the
      * other left on "peer disconnected" without knowing why. */
     /* ...every peer's identity, not the first one in: with more than two
-     * seats a peer that starts late would otherwise never hear ours. */
-    if ((d->peer_ident_mask & rb_expect_mask(d)) == rb_expect_mask(d) && d->ident_sent)
+     * seats a peer that starts late would otherwise never hear ours. And
+     * every IDENT names the seats whose identity its sender already holds (in
+     * the unused target field), so one that lacks ours is answered again
+     * (ident_owed) -- one lost IDENT used to leave that peer unable to refuse
+     * on our identity (n64lle, 4 seats at 200 ms: the relay never saw seat
+     * 2's). A peer that predates the field sends 0 and is answered until the
+     * bound. */
+    if ((d->peer_ident_mask & rb_expect_mask(d)) == rb_expect_mask(d) && d->ident_sent &&
+        !d->ident_owed)
         return;
-    /* Validation (FORCE_MOD_MISMATCH=1): claim a mod set we do not have, so
-     * the refusal path can be proven to fire. A refusal that has never
-     * refused anything is not a safety feature. */
-    if (d->force_mod_mismatch > 0) {
-        rnet_session_send_rb_sync(
-            s, 0u, d->local_build_fp, rb_claimed_content_fp(d), 0u,
-            (rnet_u8)(rb_local_slot(d) < 0 ? 0 : rb_local_slot(d)),
-            RNET_RB_SYNC_OP_IDENT, 0u);
-        d->ident_sent = 1u;
-        return;
+    /* Paced by time: at most every RB_IDENT_RESEND_MS. It was paced by tick
+     * ("every 8"), which is every POLL while the boot-digest gate holds sim
+     * at 0, and every poll again once any one peer's identity was in: with
+     * three peers at 200 ms that flooded the relay -- its RB_SYNC queue
+     * refused 320 datagrams and the link simulator's hold queue overflowed,
+     * all before tick 1 (n64lle, 4 seats). */
+    {
+        uint32_t now = rb_now(d);
+        if (d->ident_sent && (uint32_t)(now - d->ident_sent_ms) < RB_IDENT_RESEND_MS)
+            return;
+        /* Validation (FORCE_MOD_MISMATCH=1): claim a mod set we do not have,
+         * so the refusal path can be proven to fire. A refusal that has never
+         * refused anything is not a safety feature. */
+        if (rnet_session_send_rb_sync(
+                s, 0u, d->local_build_fp, rb_claimed_content_fp(d),
+                d->peer_ident_mask | (1u << rb_local_slot(d)),
+                (rnet_u8)(rb_local_slot(d) < 0 ? 0 : rb_local_slot(d)),
+                RNET_RB_SYNC_OP_IDENT, 0u) == 0 ||
+            d->force_mod_mismatch > 0) {
+            d->ident_sent = 1u;
+            d->ident_sent_ms = now;
+            d->ident_owed = 0u;
+        }
     }
-    /* Every few ticks, not every tick: one trip is all it needs, and a peer
-     * that is simply older should not be pelted. */
-    if ((d->sim % 8u) != 0u && !d->peer_ident_mask)
-        return;
-    if (rnet_session_send_rb_sync(
-            s, 0u, d->local_build_fp, d->local_content_fp, 0u,
-            (rnet_u8)(rb_local_slot(d) < 0 ? 0 : rb_local_slot(d)),
-            RNET_RB_SYNC_OP_IDENT, 0u) == 0)
-        d->ident_sent = 1u;
 }
 
 void rnet_rb_driver_shutdown(RNetRbDriver *d)
@@ -3089,6 +3103,9 @@ static void rb_drain_wire(RNetRbDriver *d)
                 break;
             /* Retransmits of an identity already judged say nothing new; a
              * refusal is one verdict, not one per copy. */
+            /* c: the seats whose identity the sender holds. */
+            if (!(c & (1u << rb_local_slot(d))))
+                d->ident_owed = 1u;
             if ((d->peer_ident_mask & bit) && d->peer_build_fp[seat] == a &&
                 d->peer_content_fp[seat] == b)
                 break;
@@ -3402,12 +3419,16 @@ static void rb_reconcile_wire(RNetRbDriver *d)
         if (rb_owed_first(d, &t, &oslot)) {
             if (!rb_snap_floor(d, t, &load)) {
                 /* Past every snapshot: nothing can re-run this tick any more.
-                 * Said as what it is -- the peers now differ, and every later
-                 * baseline will show it. */
+                 * Said as what it is. Whether the peers now differ depends on
+                 * whether the guest read that seat's input on that tick: on
+                 * n64lle, 17 corrections to a port the attract scene never
+                 * polls were lost in one 4-seat 2 % run and nothing forked,
+                 * so this line used to overstate it ("the two sides have
+                 * diverged"). The chain and every later baseline say which. */
                 rb_log(d, "RB correction LOST tick=%u slot=%d — no snapshot "
                           "reaches it any more (ring oldest=%u). This peer ran "
-                          "that tick on input its owner never sent; the two "
-                          "sides have diverged.\n",
+                          "that tick on input its owner never sent; unless the "
+                          "guest ignored that input, the peers now differ.\n",
                        (unsigned)t, oslot, (unsigned)rb_snap_oldest_or0(d));
                 rb_owed_clear_span(d, t, t);
                 return;
@@ -3422,7 +3443,8 @@ static void rb_reconcile_wire(RNetRbDriver *d)
                 rb_log(d, "RB correction LOST tick=%u slot=%d — replaying it now "
                           "would re-run %u..%u, more than the %u-row seal mask "
                           "carries. This peer ran that tick on input its owner "
-                          "never sent; the two sides have diverged.\n",
+                          "never sent; unless the guest ignored that input, the "
+                          "peers now differ.\n",
                        (unsigned)t, oslot, (unsigned)t, (unsigned)(d->sim - 1u),
                        (unsigned)RNET_RB_PEER_SEAL_MASK_BITS);
                 rb_owed_clear_span(d, t, t);
@@ -4050,8 +4072,8 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
         if (d->owed_slot[i] >= 0 && d->owed_tick[i] == t) {
             rb_log(d, "RB correction LOST tick=%u slot=%d — it aged out of the "
                       "input history before any episode could replay it. This "
-                      "peer ran that tick on input its owner never sent; the two "
-                      "sides have diverged.\n",
+                      "peer ran that tick on input its owner never sent; unless "
+                      "the guest ignored that input, the peers now differ.\n",
                    (unsigned)t, (int)d->owed_slot[i]);
             d->owed_slot[i] = -1;
         }
