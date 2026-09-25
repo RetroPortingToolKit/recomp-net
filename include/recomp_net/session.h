@@ -309,6 +309,14 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * do. Additive on purpose -- a peer that predates it ignores an unknown op,
  * and a host that never sends one simply gets no explanation. */
 #define RNET_RB_SYNC_OP_IDENT 4u
+/* Coordinated stop (rb_driver.h, rnet_rb_driver_request_quiesce): "I will
+ * open no further episode, and I have none open". mismatch_tick is 1 when the
+ * sender already holds the receiver's own QUIESCE (so the receiver need not
+ * wait for it), load_tick the sender's sim tick; epoch_id is 0. Re-sent while
+ * the sender drains, because it is one datagram on a link that may drop it.
+ * Additive like IDENT: a peer that predates it ignores an unknown op, and the
+ * sender's drain then ends on its bound rather than hanging. */
+#define RNET_RB_SYNC_OP_QUIESCE 5u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */

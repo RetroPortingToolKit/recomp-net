@@ -98,6 +98,7 @@ typedef struct Child {
     /* ledger, counted from the driver's own lines */
     uint32_t n_ep_init, n_ep_follow, n_refused, n_abort, n_fork, n_timeout,
              n_tiphold_extend, n_unapplied, n_lobby, n_forced;
+    uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
     uint32_t replay_admits;
 } Child;
 
@@ -277,6 +278,10 @@ static void h_log(void *ctx, const char *line)
     if (strstr(line, "RB tip-extend epoch")) g_c.n_tiphold_extend++;
     if (strstr(line, "UNAPPLIED")) g_c.n_unapplied++;
     if (strstr(line, "forced late row")) g_c.n_forced++;
+    if (strstr(line, "RB quiesced")) g_c.n_quiesced++;
+    if (strstr(line, "RB quiesce TIMED OUT")) g_c.n_quiesce_timeout++;
+    if (strstr(line, "RB drain: correction not opened")) g_c.n_drain_unopened++;
+    if (strstr(line, "RB tip-hold ended")) g_c.n_tiphold_end++;
     if (g_c.log)
         fputs(line, g_c.log);
 }
@@ -388,6 +393,8 @@ typedef struct Report {
     uint32_t sim, confirmed;
     uint32_t n_ep_init, n_ep_follow, n_refused, n_abort, n_fork, n_timeout,
              n_extend, n_unapplied, n_lobby, n_forced, replay_admits;
+    uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
+    int quiesce_state;
     uint64_t resim_ticks;
     uint32_t episodes_driver;
     uint32_t timeline[TOY_TICKS];
@@ -400,6 +407,9 @@ typedef struct Scenario {
     const char *jitter_ms;
     int force_mispredict;     /* initiator only; 0 = off */
     uint32_t ticks;
+    /* 1: only the initiator is asked to quiesce; the follower must start
+     * draining from the peer's marker alone. */
+    int quiesce_one_side;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -515,61 +525,56 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
      * (a stall presents the held frame and waits for the next one), except
      * that an INCREMENTAL replay tick is followed at once by the next poll --
      * that is the shape a host with an expensive tick runs, pumping between
-     * ticks. The injector counts polls, so this cadence is also what makes an
-     * interval mean what it means in the SNES harness. */
-    /* Run until this peer has played its ticks AND the parent says both have
-     * -- then stop together. An uncoordinated stop left the peer that
-     * finished last opening an episode after the other had exited, which the
-     * ledger rightly reports as unanswered. */
+     * ticks. The injector counts remote rows (one per tick), so an interval
+     * means the same number of ticks here as in the SNES harness.
+     *
+     * Stopping is the driver's own coordinated stop: once both peers have
+     * played their ticks the parent says so, each asks its driver to quiesce
+     * (or, with quiesce_one_side, only the initiator does and the follower
+     * must follow the marker), and each keeps running -- live and replay
+     * alike -- until the driver reports DRAINED. An uncoordinated stop left
+     * the peer that finished last opening an episode after the other had
+     * exited; the ledger below is exact because this stop is. */
     start_ms = mono_ms();
     next_tick_ms = start_ms;
     {
-        int ready_sent = 0;
+        int ready_sent = 0, asked = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
-    while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
-        RNetRbAdmit a;
-        rnet_session_pump(s);
-        if (g_c.n_lobby)
-            break;
-        if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
-            (void)write_all(ready_fd, "R", 1);
-            ready_sent = 1;
+        while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
+            RNetRbAdmit a;
+            RNetRbQuiesce q;
+            rnet_session_pump(s);
+            if (g_c.n_lobby)
+                break;
+            if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
+                (void)write_all(ready_fd, "R", 1);
+                ready_sent = 1;
+            }
+            if (ready_sent && !asked && stop_requested(stop_fd)) {
+                asked = 1;
+                if (!(sc->quiesce_one_side && slot == 1))
+                    rnet_rb_driver_request_quiesce(d);
+            }
+            q = rnet_rb_driver_quiesce_state(d);
+            if (q == RNET_RB_QUIESCE_DRAINED || q == RNET_RB_QUIESCE_TIMED_OUT)
+                break;
+            a = rnet_rb_driver_poll_admit(d);
+            if (a != RNET_RB_ADMIT_STALL) {
+                if (a == RNET_RB_ADMIT_REPLAY)
+                    g_c.replay_admits++;
+                toy_step();   /* the same per-tick function for live and replay */
+                rnet_rb_driver_finish_frame(d);
+                if (a == RNET_RB_ADMIT_REPLAY)
+                    continue;
+            }
+            next_tick_ms += 16u;
+            if ((int32_t)(next_tick_ms - mono_ms()) > 0)
+                sleep_ms(next_tick_ms - mono_ms());
+            else
+                next_tick_ms = mono_ms();
         }
-        if (ready_sent && stop_requested(stop_fd))
-            break;
-        a = rnet_rb_driver_poll_admit(d);
-        if (a != RNET_RB_ADMIT_STALL) {
-            if (a == RNET_RB_ADMIT_REPLAY)
-                g_c.replay_admits++;
-            toy_step();   /* the same per-tick function for live and replay */
-            rnet_rb_driver_finish_frame(d);
-            if (a == RNET_RB_ADMIT_REPLAY)
-                continue;
-        }
-        next_tick_ms += 16u;
-        if ((int32_t)(next_tick_ms - mono_ms()) > 0)
-            sleep_ms(next_tick_ms - mono_ms());
-        else
-            next_tick_ms = mono_ms();
-    }
         if (!ready_sent)
             (void)write_all(ready_fd, "R", 1);
-    }
-    /* Quiesce: no new live tick runs (so nothing new can be predicted), but
-     * episodes keep being served -- followed, replayed, verified -- until the
-     * last late row has landed and every episode it opens has been answered.
-     * A replayed tick still runs: it re-runs the past, it adds no future. */
-    start_ms = mono_ms();
-    while ((uint32_t)(mono_ms() - start_ms) < 1500u) {
-        RNetRbAdmit a;
-        rnet_session_pump(s);
-        a = rnet_rb_driver_poll_admit(d);
-        if (a == RNET_RB_ADMIT_REPLAY) {
-            toy_step();
-            rnet_rb_driver_finish_frame(d);
-            continue;
-        }
-        sleep_ms(16);
     }
 
 report:
@@ -578,7 +583,12 @@ report:
         r->confirmed = rnet_rb_driver_confirmed_through(d);
         r->resim_ticks = rnet_rb_driver_resim_ticks(d);
         r->episodes_driver = rnet_rb_driver_episode_count(d);
+        r->quiesce_state = (int)rnet_rb_driver_quiesce_state(d);
     }
+    r->n_quiesced = g_c.n_quiesced;
+    r->n_quiesce_timeout = g_c.n_quiesce_timeout;
+    r->n_drain_unopened = g_c.n_drain_unopened;
+    r->n_tiphold_end = g_c.n_tiphold_end;
     r->n_ep_init = g_c.n_ep_init;
     r->n_ep_follow = g_c.n_ep_follow;
     r->n_refused = g_c.n_refused;
@@ -655,14 +665,16 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
 
     printf("%-22s init=%u+%u follow=%u+%u refused=%u abort=%u+%u timeout=%u fork=%u "
            "extend=%u unapplied=%u forced=%u replay_admits=%u+%u resim=%llu+%llu "
-           "sim=%u/%u confirmed=%u/%u\n",
+           "sim=%u/%u confirmed=%u/%u quiesce=%d/%d unopened=%u tiphold_end=%u\n",
            sc->name, ra->n_ep_init, rb->n_ep_init, ra->n_ep_follow, rb->n_ep_follow,
            ra->n_refused + rb->n_refused, ra->n_abort, rb->n_abort,
            ra->n_timeout + rb->n_timeout, ra->n_fork + rb->n_fork,
            ra->n_extend + rb->n_extend, ra->n_unapplied + rb->n_unapplied,
            ra->n_forced, ra->replay_admits, rb->replay_admits,
            (unsigned long long)ra->resim_ticks, (unsigned long long)rb->resim_ticks,
-           ra->sim, rb->sim, ra->confirmed, rb->confirmed);
+           ra->sim, rb->sim, ra->confirmed, rb->confirmed, ra->quiesce_state,
+           rb->quiesce_state, ra->n_drain_unopened + rb->n_drain_unopened,
+           ra->n_tiphold_end + rb->n_tiphold_end);
 
     snprintf(msg, sizeof(msg), "%s: both children reported", sc->name);
     expect_true(got_a && got_b, msg);
@@ -678,15 +690,22 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     expect_true(ra->n_fork + rb->n_fork == 0u, msg);
     snprintf(msg, sizeof(msg), "%s: no match refused to start", sc->name);
     expect_true(ra->n_lobby + rb->n_lobby == 0u, msg);
+    snprintf(msg, sizeof(msg), "%s: both peers drained (state %d/%d, %u/%u quiesced lines)",
+             sc->name, ra->quiesce_state, rb->quiesce_state, ra->n_quiesced, rb->n_quiesced);
+    expect_true(ra->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
+                    rb->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
+                    ra->n_quiesced == 1u && rb->n_quiesced == 1u,
+                msg);
     /* The exact ledger, by role and in both directions: every episode one
-     * side opens is followed or refused by the other; a lost BEGIN (loss or
-     * reordering) is explained only by a watchdog timeout. */
+     * side opens is followed or refused by the other. No scenario here drops
+     * a datagram, and the drain leaves nothing in flight, so there is no
+     * third category -- the residual is 0, not "at most the timeouts". */
     ledger = (int64_t)(ra->n_ep_init + rb->n_ep_init) -
              (int64_t)(ra->n_ep_follow + rb->n_ep_follow) -
              (int64_t)(ra->n_refused + rb->n_refused);
-    snprintf(msg, sizeof(msg), "%s: episode ledger balances (residual %lld, timeouts %u)",
+    snprintf(msg, sizeof(msg), "%s: episode ledger is exact (residual %lld, timeouts %u)",
              sc->name, (long long)ledger, ra->n_timeout + rb->n_timeout);
-    expect_true(ledger >= 0 && ledger <= (int64_t)(ra->n_timeout + rb->n_timeout), msg);
+    expect_true(ledger == 0, msg);
     if (sc->mode_a || sc->mode_b) {
         snprintf(msg, sizeof(msg), "%s: the incremental peer replayed tick by tick", sc->name);
         expect_true((sc->mode_a ? ra->replay_admits : 0u) +
@@ -724,10 +743,12 @@ int main(void)
      * 60 Hz frontend cadence, so a pass here means what a pass there means.
      * RNET_SIM_LATENCY_MS is one-way per peer: RTT is double. */
     static const Scenario scenarios[] = {
-        /* name                  mode A, B   latency jitter force  ticks */
-        { "inline-loopback",     0, 0,       "0",   "0",   45,    420u },
-        { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u },
-        { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u },
+        /* name                  mode A, B   latency jitter force  ticks  one-side */
+        { "inline-loopback",     0, 0,       "0",   "0",   45,    420u,  0 },
+        { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u,  0 },
+        { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
+        /* The stop propagates: only the initiator is asked. */
+        { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },
     };
     unsigned port_base = 30000u + ((unsigned)getpid() % 5000u) * 4u;
     size_t i;
