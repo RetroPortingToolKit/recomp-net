@@ -11,6 +11,15 @@ lands here in layers so hosts opt in without breaking MotK / snes / psx titles.
 | Portable input contract | Landed | [`include/recomp_net/input_contract.h`](../include/recomp_net/input_contract.h), [`src/input/rnet_input_contract.c`](../src/input/rnet_input_contract.c) |
 | Rollback episode orchestration | Landed | [`include/recomp_net/rollback.h`](../include/recomp_net/rollback.h), [`src/rollback/rnet_rollback.c`](../src/rollback/rnet_rollback.c) |
 | Rollback wire protocol | Landed | `RNET_PKT_RB_*` (opcodes 20–25) in [`src/protocol/rnet_protocol.{h,c}`](../src/protocol/rnet_protocol.h) |
+| Admission scheduler | Moved from retcomm-rbengine | [`include/recomp_net/sched.h`](../include/recomp_net/sched.h), [`src/sched/rnet_sched.c`](../src/sched/rnet_sched.c) |
+| Input history (invent / promote) | Moved from retcomm-rbengine | [`include/recomp_net/input_hist.h`](../include/recomp_net/input_hist.h), [`src/input/rnet_input_hist.c`](../src/input/rnet_input_hist.c) |
+| Hash-confirm watermark | Moved from retcomm-rbengine | [`include/recomp_net/hash_confirm.h`](../include/recomp_net/hash_confirm.h), [`src/rollback/rnet_hash_confirm.c`](../src/rollback/rnet_hash_confirm.c) |
+| RB_POST tip filter | Moved from retcomm-rbengine | [`include/recomp_net/rb_post.h`](../include/recomp_net/rb_post.h) |
+
+The four moved modules were MotK host policy lifted into retcomm-rbengine. Every
+decision they make is about peers, so they belong beside the session and the
+episode FSM. retcomm-rbengine keeps what works with netplay compiled out — the
+snapshot ring and a monotonic clock — and neither library depends on the other.
 
 ## Rollback wire protocol
 
@@ -155,6 +164,38 @@ rest NULL (portable defaults).
 - Release always rewinds on both completed-sim and runway paths.
 - Dash-gate X disagree blocks all same-intent promotes.
 - `hash_confirm_promote` fails closed when NULL.
+
+## Admission scheduler
+
+`rnet_sched_bind` takes live pointers into the host session (`RNetSchedBridge`)
+and game-specific gates (`RNetSchedGates`). Minimum for non-media digital
+titles (SNES / NES):
+
+| Gate | Required? | Notes |
+|------|-----------|--------|
+| `now_ms` | **yes** | Monotonic; retcomm-rbengine's `rbe_mono_ms` is suitable |
+| `rtt_ms` | recommended | ICE/POST sample; 0 = synth from D |
+| `episode_active` | recommended | 1 during Seal/Replay/Verify |
+| `tip_holding` | recommended | TipHold Live invent-cap |
+| media / lockstep | optional | MotK FMV only |
+
+NULL media gates → never lockstep-stall invent; auto-D always samples.
+
+Env knobs keep the `RBE_` names they had in retcomm-rbengine so existing tuning
+and soak scripts keep working; MotK-era `PSX_RB_*` /
+`PSX_NETPLAY_CROSS_OS_PACING_DIAG` names are honoured when the `RBE_*` one is
+unset.
+
+| Variable | Effect |
+|----------|--------|
+| `RBE_RB_ZERO_DELAY=1` | Legacy consume wire=`sim+D` (no cushion) |
+| `RBE_RB_INVENT_GRACE_MS` | Floor ms before invent (default 8, clamped 0–200) |
+| `RBE_RB_GAP1_GRACE_MS` | Flat gap=1 grace override |
+| `RBE_RB_GAP1_INVENT=0` | Wait for tip-stale instead of gap1 invent |
+| `RBE_RB_TIMESYNC=0` | Disable mispredict pacing debt |
+| `RBE_RB_AUTO_DELAY=0` | Disable arrival-driven D controller |
+| `RBE_RB_ADAPT_DELAY=0` | Disable pcap-freeze D bumps |
+| `RBE_CROSS_OS_PACING_DIAG=1` | 1 Hz pacing diag line |
 
 ## Host guarantees for rollback mode
 

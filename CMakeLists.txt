@@ -24,7 +24,10 @@ set(RNET_CORE_SOURCES
   src/protocol/rnet_protocol.c
   src/input/rnet_rings.c
   src/input/rnet_input_contract.c
+  src/input/rnet_input_hist.c
   src/rollback/rnet_rollback.c
+  src/rollback/rnet_hash_confirm.c
+  src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
   src/lobby/rnet_lan_beacon.c
@@ -40,6 +43,12 @@ set(RNET_CORE_SOURCES
   src/auth/rnet_sha256.c
   src/ice/rnet_ice_state.c
   src/ice/rnet_ice_agent.c
+  # RFC 6455 client framing + the SHA-1 the handshake needs. Lifted from
+  # the engines, where psxrecomp and snesrecomp each vendored a copy:
+  # rnet_sha1.{c,h} and rnet_ws.h were byte-identical between them and
+  # rnet_ws.c differed only by two static helpers in swapped order.
+  src/lobby_ws/rnet_ws.c
+  src/lobby_ws/rnet_sha1.c
 )
 
 add_library(recomp_net STATIC ${RNET_CORE_SOURCES})
@@ -278,6 +287,24 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(rb_wire_test PRIVATE recomp_net)
   target_include_directories(rb_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME rb_wire_test COMMAND rb_wire_test)
+
+  # Moved from retcomm-rbengine with the modules they cover.
+  add_executable(hash_confirm_test tests/hash_confirm_test.c)
+  target_link_libraries(hash_confirm_test PRIVATE recomp_net)
+  add_test(NAME hash_confirm_test COMMAND hash_confirm_test)
+
+  add_executable(input_hist_test tests/input_hist_test.c)
+  target_link_libraries(input_hist_test PRIVATE recomp_net)
+  add_test(NAME input_hist_test COMMAND input_hist_test)
+
+  add_executable(rb_post_test tests/rb_post_test.c)
+  target_link_libraries(rb_post_test PRIVATE recomp_net)
+  add_test(NAME rb_post_test COMMAND rb_post_test)
+
+  add_executable(sched_smoke_test tests/sched_smoke_test.c)
+  target_link_libraries(sched_smoke_test PRIVATE recomp_net)
+  target_include_directories(sched_smoke_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME sched_smoke_test COMMAND sched_smoke_test)
 endif()
 
 install(TARGETS recomp_net ARCHIVE DESTINATION lib LIBRARY DESTINATION lib)
