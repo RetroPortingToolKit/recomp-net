@@ -1,8 +1,9 @@
-# Rollback mode (feat/rollback)
+# Rollback mode
 
-This branch extends recomp-net beyond delay-sync into shared rollback
-architecture. Delay-sync `RNetSession` remains the shipped v0.1 path; rollback
-lands here in layers so hosts opt in without breaking MotK / snes / psx titles.
+recomp-net carries delay-sync (`RNetSession`) and, beside it, a shared
+rollback stack that hosts opt into without changing delay-sync behaviour. (This
+file used to say rollback lived on a `feat/rollback` branch; it is on `main`,
+where `rollback_episode_test` was failing, so the sentence was stale.)
 
 ## Layers
 
@@ -15,6 +16,7 @@ lands here in layers so hosts opt in without breaking MotK / snes / psx titles.
 | Input history (invent / promote) | Moved from retcomm-rbengine | [`include/recomp_net/input_hist.h`](../include/recomp_net/input_hist.h), [`src/input/rnet_input_hist.c`](../src/input/rnet_input_hist.c) |
 | Hash-confirm watermark | Moved from retcomm-rbengine | [`include/recomp_net/hash_confirm.h`](../include/recomp_net/hash_confirm.h), [`src/rollback/rnet_hash_confirm.c`](../src/rollback/rnet_hash_confirm.c) |
 | RB_POST tip filter | Moved from retcomm-rbengine | [`include/recomp_net/rb_post.h`](../include/recomp_net/rb_post.h) |
+| **Episode driver** | Lifted from snesrecomp (2026-09-24) | [`include/recomp_net/rb_driver.h`](../include/recomp_net/rb_driver.h), [`src/rollback/rnet_rb_driver.c`](../src/rollback/rnet_rb_driver.c) |
 
 The four moved modules were MotK host policy lifted into retcomm-rbengine. Every
 decision they make is about peers, so they belong beside the session and the
@@ -56,7 +58,17 @@ flags byte (`recomp_net/session.h`):
 Hosts should partition epoch ids by initiator slot
 (`epoch = counter << k | slot`) so concurrent dual initiation never collides
 and a deterministic tie-break (lower initiator slot wins; the loser yields and
-follows) can derive any episode's initiator from its id.
+follows) can derive any episode's initiator from its id. The episode driver
+uses `k = RNET_RB_EPOCH_SLOT_BITS` (3, all eight seats):
+`rnet_rb_epoch_make` / `rnet_rb_epoch_initiator`.
+
+`RB_SEAL_ROWS` carries at most `RNET_RB_SEAL_ROWS_CHUNK_MAX` (24) rows; the
+send path truncates a larger chunk, so a host that chunks wider posts a partial
+span and waits forever for the rest. `row_begin` is an OFFSET into the sealed
+span and the `mismatch` field carries the seal base (the LOAD tick) -- sending
+ticks in either posts nothing. `rnet_session_rb_last_take_from` names the
+sender of the rb_* message just taken, which an episode with more than one
+peer needs to count answers per peer.
 
 Hosts map their existing wire onto these when aligning transports (BattleShip's
 soak-hardened `SYNETPEER_*` format stays authoritative for live matches); new
@@ -65,10 +77,21 @@ unification is a follow-up — the delay-sync ICE path is unchanged.
 
 ## Rollback episode orchestration
 
-`RNetRbSession` owns the episode FSM (`Live → SealInputs → AwaitingBaseline →
-Replay → Verify → Commit|Abort`), the correction tuple, the sealed input table,
-and the resolved-through (shared frontier) watermark. The host owns snapshots,
-the deterministic sim step, state digests, and the wire transport.
+`RNetRbSession` holds the episode state (`Live → SealInputs →
+AwaitingBaseline → Replay → Verify → TipHold → Commit|Abort`), the correction
+tuple, the sealed input table, and the resolved-through (shared frontier)
+watermark. It is PASSIVE: `rnet_rb_set_phase` validates nothing, the event
+queue has no producer inside the library, and the only host callback it ever
+invokes is `get_input_row`. What runs an episode is the driver below; a host
+that does not use it must do all of that itself.
+
+TipHold is the stage after a POST match: the sealed rows stay open for
+`tip_runway` ticks while Live runs, so a late edge can tip-extend the same
+episode instead of opening a second one. `rnet_rb_enter_tip_hold` IS the
+post-match transition (it promotes the sealed rows) and requires Verify --
+calling `rnet_rb_on_post_match` first moves the phase to Commit and makes it
+fail on every episode (measured on SNES: 0 tip-hold entries in 281 episodes).
+`on_post_match` is the other branch, never a preceding step.
 
 ### Tip-extend / edge coalesce
 
@@ -114,29 +137,131 @@ explicit demote the refused tip stays as the library watermark and the next
 light-tip / host HC advance reopens it. Hosts that demote their own agreed
 watermark on NACK should demote the library watermark in the same step.
 
-Required `RNetRollbackVTable` callbacks: `save_state` / `load_state` /
-`advance_sim` / `get_input_row` (+ `state_digest`, `hash_confirm_through`).
-Host stick gates ride through `stick_gates` and feed
-`rnet_rb_decide_stick_replace`.
+`RNetRollbackVTable`: `rnet_rb_create` refuses a vtable without `load_state`,
+`advance_sim` or `get_input_row`. Of the six callbacks the core itself calls
+only `get_input_row`; `save_state`, `load_state`, `advance_sim`,
+`state_digest` and `hash_confirm_through` exist for the host's (or the
+driver's) own replay loop and are never invoked from inside the library.
+(This section and `rollback.h` previously listed save/load/advance/digest as
+required and called by the library; neither was true.) Host stick gates ride
+through `stick_gates` and feed `rnet_rb_decide_stick_replace`.
 
-Minimal host loop during an episode:
+Minimal host loop during an episode, if not using the driver. Seal from the
+LOAD tick: the replay publishes a sealed row for every tick it re-runs, and
+`load..mismatch-1` are among them -- sealing from the mismatch leaves the
+first replayed ticks without a row.
 
 ```c
 rnet_rb_begin_episode(s, &corr);                 /* mismatch identified */
-rnet_rb_seal_inputs(s, corr.mismatch_tick, corr.target_tick, corr.slot);
+rnet_rb_seal_inputs(s, corr.load_tick, corr.target_tick, corr.slot);
 /* exchange peer seal rows via host transport: rnet_rb_export_seal_rows_chunk /
  * rnet_rb_apply_peer_seal_rows until rnet_rb_all_peer_seal_rows_complete */
 rnet_rb_set_phase(s, nRNetRbPhaseAwaitingBaseline);
 vt.load_state(vt.ctx, corr.load_tick);
 for (t = corr.load_tick; t <= corr.target_tick; ++t)
     vt.advance_sim(vt.ctx, t);                   /* reads sealed rows */
-/* compare vt.state_digest against peer; then: */
-rnet_rb_on_post_match(s);                        /* or rnet_rb_on_post_diverge */
+/* compare vt.state_digest against peer; then, on a match: */
+if (!rnet_rb_enter_tip_hold(s))                  /* TipHold, rows promoted */
+    rnet_rb_on_post_match(s);                    /* runway 0: straight to Commit */
+/* on a mismatch: rnet_rb_on_post_diverge(s) and abort */
 ```
 
-The library is transport-agnostic in Phase 2 — BattleShip's `netpeer.c` calls
-these entry points from its existing packet ingress. Protocol/ICE opcodes are
-Phase 3.
+The core is transport-agnostic; the driver speaks `RNET_PKT_RB_*` through
+`RNetSession`.
+
+## Episode driver
+
+`recomp_net/rb_driver.h` is the code that runs an episode, lifted out of
+snesrecomp's `snes_netplay_rb.c` (36d6ce5) by owner ruling on 2026-09-24 so
+every engine binds one driver instead of writing its own. It owns live admit
+(local tip, remote rows, hold-last invent, the scheduler and every gate it
+asks for), reconcile (late wire against predicted history), the whole episode
+FSM (open, follow, dual-initiation arbitration, NACK, seal-row exchange,
+baseline gate, replay, POST verify, commit, tip-hold, tip-extend, abort
+classes and mirrored cooldowns, a watchdog on every stage that waits on a
+peer), snapshot policy (interval, floor, the baseline fork cap), the
+FRAME_COMMIT hash chain, the boot-digest gate, the mod-set and identity
+handshakes, lockstep degrade, the advisory chain-stall report, and a cold
+reset on every start.
+
+Two rules it adds over what snesrecomp shipped, each found by
+`tests/rb_driver_test.c`'s toy engine (which folds every seat's row into its
+state, so a correction that never lands is a measurable divergence):
+
+- **A correction is owed until it commits.** Reconcile promotes the true row
+  the moment it decides to rewind; if the episode does not commit (NACK,
+  abort, watchdog, dual-initiation yield, a stage that cannot take it, the
+  initiator cooldown) the tick is re-opened later ("RB correction retried"),
+  or declared "RB correction LOST" once no snapshot reaches it.
+- **An abort after the baseline load restores the live tip** ("RB tip
+  restored"), instead of leaving the engine on the load tick while sim stays
+  at the old tip.
+
+### Integrating a host (n64lle, psxrecomp, the next engine)
+
+The host implements `RNetRbHost`; `start()` names any required callback left
+NULL and refuses.
+
+| Callback | What the host supplies |
+|---|---|
+| `snap_save/load/has/oldest/drop_after` | Snapshot storage keyed by tick. Key T = the state BEFORE tick T runs. The host owns the bytes (rbengine's ring works; recomp-net does not depend on it). |
+| `publish(tick, rows, slots, replay)` | The rows every seat simulates at `tick`, sanitized. Called for every live tick and every replayed tick. |
+| `run_tick(tick)` | INLINE shape only: run one tick on the rows last published. |
+| `resim_begin / resim_end` | Suppress presentation and audio production for a replay (NETPLAY.md §1). |
+| `digest_master` / `digest_parts` | Simulation-state digest (FRAME_COMMIT, POST) and master + three named partitions (BASELINE); `cfg.part_names` names them. The digested domain must equal the snapshotted domain. |
+| `decode_sample` / `sanitize_row` / `neutral_row` | Pad layout: wire bytes to a row, force a row legal, and what "nothing held" is per seat. Active-high pads (SNES, N64) and active-low (PSX) differ; the driver assumes neither. |
+| `admit_sample` (opt.) | Side data riding the pad bytes, from the sample a LIVE admit used. |
+| `boot_digest_noted` (opt.) | Log what explains a boot mismatch (partitions, frame counters). |
+| `request_return_to_lobby` | End the match (boot fork, mod-set refusal). |
+| `log` (opt.), `now_ms` | Line sink (NULL = stderr) and a monotonic clock. |
+
+`RNetRbDriverConfig` takes live pointers to the session, seat, seat count,
+delay and prediction exactly as the scheduler bridge does, plus the replay
+shape, partition names, the store's depth (reported only), a log tag, and an
+environment alias (knobs are `RNET_RB_<NAME>`; `<alias>_<NAME>` is read first,
+so snesrecomp's `SNES_RB_*` names keep working).
+
+The loop is the same in both shapes:
+
+```c
+for (;;) {
+    RNetRbAdmit a = rnet_rb_driver_poll_admit(d);
+    if (a != RNET_RB_ADMIT_STALL) {
+        run_one_tick();                  /* the SAME function, live or replay */
+        rnet_rb_driver_finish_frame(d);
+    }
+    present_and_pump();                  /* the held frame during a replay */
+}
+```
+
+- **INLINE** (`RNET_RB_REPLAY_INLINE`): the driver loads the baseline and
+  runs the whole replay inside one `poll_admit` through `host->run_tick`;
+  `poll_admit` only ever returns STALL or LIVE. Right when a tick is cheap and
+  returns (SNES `RtlRunFrame`).
+- **INCREMENTAL** (`RNET_RB_REPLAY_INCREMENTAL`): each `poll_admit` during a
+  replay publishes ONE replayed tick and returns `RNET_RB_ADMIT_REPLAY`; the
+  host runs it with its live per-tick function, calls `finish_frame`, and may
+  pump, present and service audio before the next poll. No FRAME_COMMIT is
+  sent for a replayed tick. Right when a tick is expensive or must run in the
+  host's own loop -- an N64 field. `run_tick` may be NULL.
+
+Neither shape drains episode wire mid-replay, so both see the same messages
+at the same point of an episode; `rb_driver_test` runs a mixed pair (one peer
+inline, one incremental) to hold that. The session keeps receiving meanwhile;
+a queue that fills is logged (`rnet_session_rb_ctrl_dropped`).
+
+The scheduler is process-global (`rnet_sched_bind`): one started driver per
+process.
+
+### More than two peers
+
+Built, not exercised. Epochs carry the initiator's seat, dual initiation reads
+the winner from the epoch, and BASELINE / POST / COMMIT are tracked per peer
+(`cfg.occupied_mask` names the seats that answer). Still two-peer in shape:
+the mod-set handshake settles on the first ack (the session keeps only the
+latest), the hash chain keeps one peer ring (every peer's FRAME_COMMIT lands in
+it), and the boot-digest gate reads that ring. No multi-peer harness exists;
+do not claim N-player rollback until one does.
 
 ## Portable input contract
 

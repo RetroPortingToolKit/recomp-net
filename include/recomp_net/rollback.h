@@ -122,9 +122,16 @@ typedef struct RNetRbEvent
 } RNetRbEvent;
 
 /*
- * Host callbacks. save/load/advance/digest are required; the gates mirror the
+ * Host callbacks. rnet_rb_create refuses a vtable without load_state,
+ * advance_sim or get_input_row. The core itself calls ONLY get_input_row:
+ * save_state, load_state, advance_sim, state_digest and hash_confirm_through
+ * are for the host's (or the episode driver's, rb_driver.h) own replay loop
+ * and are never invoked from inside the library. The stick gates mirror the
  * input contract and may be NULL (portable defaults). All runs on the host's
  * thread; the library does not spawn work.
+ *
+ * (This comment used to say save/load/advance/digest were required and
+ * implied the library drove them; it never did.)
  */
 typedef struct RNetRollbackVTable
 {
@@ -236,6 +243,9 @@ uint8_t rnet_rb_recommend_light_tip(const RNetRbSession *s);
  * peer notice) identifies a mismatch; the library takes the phase to
  * SealInputs. The host then drives sealing and peer exchange, advancing the
  * FSM with set_phase as its transport confirms baseline/replay/verify.
+ * set_phase VALIDATES NOTHING -- any phase may follow any other. The episode
+ * driver (rb_driver.h) is the maintained caller; prefer it to driving this by
+ * hand.
  */
 void rnet_rb_begin_episode(RNetRbSession *s, const RNetRbCorrection *corr);
 void rnet_rb_set_phase(RNetRbSession *s, RNetRbPhase phase);
@@ -285,8 +295,10 @@ RNetInputContractDecision rnet_rb_decide_stick_replace(RNetRbSession *s,
 /* Sealed input table. Local-authority rows seal from the host's input history;
  * peer-authority rows arrive via apply_peer_seal_rows. The sealed table is the
  * sole replay read set. */
-/* begin_tick..target_tick inclusive — pass load_tick (not only mismatch) so
- * Replay can publish sealed pads for every resim quantum. */
+/* begin_tick..target_tick inclusive. Pass the LOAD tick, not the mismatch:
+ * the replay publishes a sealed row for every tick it re-runs, and
+ * load..mismatch-1 are among them. Only active seats [0, slot_count) are
+ * filled. */
 void rnet_rb_seal_inputs(RNetRbSession *s, uint32_t begin_tick, uint32_t target_tick,
                          int32_t correction_slot);
 uint8_t rnet_rb_inputs_sealed(const RNetRbSession *s);

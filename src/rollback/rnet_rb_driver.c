@@ -1685,10 +1685,21 @@ static void rb_commit_episode(RNetRbDriver *d)
     /* Every correction inside the replayed span has now been applied. */
     rb_owed_clear_span(d, d->corr.load_tick, d->corr.target_tick);
     rnet_sched_note_episode_boundary();
+    /* Counted, not inferred: on SNES tip-hold was graded "present" for weeks
+     * while the transition into it failed on every episode, and nothing in
+     * the log could have said so. */
     if (rnet_rb_enter_tip_hold(d->rb)) {
+        rb_log(d, "RB committed epoch=%u span=%u..%u — tip-hold for %u ticks\n",
+               (unsigned)d->corr.epoch_id, (unsigned)d->corr.load_tick,
+               (unsigned)d->corr.target_tick,
+               (unsigned)rnet_rb_get_tip_runway(d->rb));
         d->peer_commit_mask = 0;
         rb_stage_set(d, kRbTipHold);
     } else {
+        rb_log(d, "RB committed epoch=%u span=%u..%u — no tip-hold (the core "
+                  "refused it); cleared\n",
+               (unsigned)d->corr.epoch_id, (unsigned)d->corr.load_tick,
+               (unsigned)d->corr.target_tick);
         rnet_rb_on_post_match(d->rb);
         rb_episode_clear(d);
     }
