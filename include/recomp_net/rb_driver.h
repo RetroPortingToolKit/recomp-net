@@ -246,6 +246,47 @@ void rnet_rb_driver_shutdown(RNetRbDriver *d);
 RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d);
 void rnet_rb_driver_finish_frame(RNetRbDriver *d);
 
+/*
+ * Coordinated stop: drain, then tell the host it may exit.
+ *
+ * A harness that simply kills both peers at a wall-clock deadline cannot tell
+ * an episode that was in flight at the kill from one that was lost: the
+ * initiator logged its BEGIN, the follower died before reading it, and the
+ * ledger reports an unanswered episode that nothing was wrong with (measured
+ * on SNES: the runway-4 cell failed 1 of 1 in a sweep and passed 4 of 4 on
+ * repeat). Tolerating that residual would put the coin flip back into the
+ * verdict, so the stop is made exact instead.
+ *
+ * After request_quiesce this peer opens no new episode -- a mispredict found
+ * while draining is logged ("RB drain: correction not opened") and counted,
+ * never silently dropped -- no local tip-extend, and the validation injector
+ * stops. It still FOLLOWS a peer's BEGIN, and every episode already open
+ * finishes (commit, tip-hold, or an abort that says why). Once idle it tells
+ * each peer so (RNET_RB_SYNC_OP_QUIESCE: "I will open no more episodes"). A
+ * peer that receives that marker starts draining too, so asking one side
+ * drains the match. The state reaches DRAINED when this peer is idle and holds
+ * every peer's marker; by then no episode either side opened can still be
+ * unanswered, so the two ledgers balance by construction. Live keeps running
+ * throughout: the host keeps calling poll_admit / finish_frame until DRAINED.
+ *
+ * Bounded: TIMED_OUT after RNET_RB_QUIESCE_TIMEOUT_MS with a line naming what
+ * was still outstanding (a peer that vanished, or predates the marker).
+ * Idempotent. Harnesses send it on a signal (snesrecomp: SIGUSR1); the host
+ * decides what triggers it.
+ */
+typedef enum RNetRbQuiesce
+{
+    RNET_RB_QUIESCE_NONE = 0,      /* not requested */
+    RNET_RB_QUIESCE_DRAINING = 1,  /* requested; episodes or peers outstanding */
+    RNET_RB_QUIESCE_DRAINED = 2,   /* nothing in flight on either side: exit */
+    RNET_RB_QUIESCE_TIMED_OUT = 3  /* bound expired: exit, ledger not guaranteed */
+} RNetRbQuiesce;
+
+#define RNET_RB_QUIESCE_TIMEOUT_MS 10000u
+
+void rnet_rb_driver_request_quiesce(RNetRbDriver *d);
+RNetRbQuiesce rnet_rb_driver_quiesce_state(const RNetRbDriver *d);
+
 /* Diagnostics. */
 uint32_t rnet_rb_driver_sim_tick(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_episode_count(const RNetRbDriver *d);
