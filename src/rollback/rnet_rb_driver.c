@@ -12,8 +12,10 @@
  * tools/rb_sweep.sh count lines by substring ('RESIM episode', 'RB abort',
  * 'FORK', 'RB follow refused', 'timed out waiting', 'RB tip-extend epoch',
  * 'RB chain stall', 'UNAPPLIED stage=', 'BOOT DIGEST MISMATCH', 'MOD SETS
- * DIFFER', 'MOD SET NOT AGREED', 'forced late row'). Change a line only with
- * every script that parses it.
+ * DIFFER', 'MOD SET NOT AGREED', 'forced late row', 'tip-hold for', 'RB
+ * tip-hold ended ... held=', 'RB quiesced', 'RB quiesce TIMED OUT', 'RB drain:
+ * correction not opened', 'tip_runway='). Change a line only with every
+ * script that parses it.
  */
 
 #include "recomp_net/rb_driver.h"
@@ -195,6 +197,60 @@ struct RNetRbDriver {
     char     allow_boot_fork_env[96];
     int      allow_mod_mismatch;
     char     allow_mod_mismatch_env[96];
+
+    /* The injector counts remote ROWS, once per seat per tick, as its
+     * interval is documented. It used to count polls, and a poll that stalls
+     * on a missing remote row is retried at the same tick -- so under latency
+     * the interval shrank with the stall rate (measured at 300 ms RTT: forced
+     * rows 2 ticks apart at an interval of 45), and cells at different
+     * latencies were injected at different rates. tick+1 of the last row
+     * counted per seat; 0 = none. */
+    uint32_t force_mispredict_row[RB_MAX_SLOTS];
+
+    /* Episodes opened, by role. The harness counts log lines; these are the
+     * same numbers from the other side, printed when a drain completes. */
+    uint32_t ep_initiated;
+    uint32_t ep_followed;
+
+    /* Tip-hold duration. Entries alone said tip-hold was reachable; how long
+     * it actually held is what says whether the runway did anything. */
+    uint32_t    tiphold_enter_sim;
+    const char *tiphold_exit_why;   /* set just before leaving; NULL = "cleared" */
+
+    /* Answers that arrived before the BEGIN that opens their episode.
+     *
+     * An initiator whose corrected seat is already confirmed in its history
+     * seals without the peer, so BEGIN, BASELINE and POST leave in ONE poll.
+     * They travel as separate datagrams, and under jitter the POST can land a
+     * frame before the BEGIN; it used to be dropped because no episode was
+     * open. The follower then sat in Verifying for the whole episode budget
+     * (2 s of frozen sim) and aborted "timed out waiting for peer POST" while
+     * the initiator had already committed the same epoch -- every POST
+     * timeout in the SNES sweeps at 200 and 300 ms RTT was one of these.
+     * Held per sending seat, matched by exact epoch when the BEGIN arrives.
+     * begin_seen_seq is the newest BEGIN sequence per initiator seat, so an
+     * answer for an episode that already ended is told apart from an early
+     * one (epochs only grow per seat). */
+    uint32_t early_post_mask;
+    uint32_t early_post_epoch[RB_MAX_SLOTS];
+    uint32_t early_post_target[RB_MAX_SLOTS];
+    uint32_t early_post_digest[RB_MAX_SLOTS];
+    uint32_t early_base_mask;
+    uint32_t early_base_epoch[RB_MAX_SLOTS];
+    uint32_t early_base_load[RB_MAX_SLOTS];
+    RNetRbDigestParts early_base[RB_MAX_SLOTS];
+    uint32_t begin_seen_seq[RB_MAX_SLOTS];
+
+    /* Coordinated stop (rnet_rb_driver_request_quiesce). */
+    RNetRbQuiesce quiesce;
+    uint32_t quiesce_req_ms;
+    uint32_t quiesce_req_sim;
+    const char *quiesce_origin;
+    uint32_t quiesce_sent_ms;       /* last marker sent; 0 = never */
+    uint32_t quiesce_all_ms;        /* when every peer's marker was first held */
+    uint32_t peer_quiesce_mask;     /* peers that promised no more episodes */
+    uint32_t peer_quiesce_ack_mask; /* ...and said they hold ours */
+    uint32_t drain_unopened;        /* mispredicts found while draining, not opened */
 
     int      rollback_flag;      /* the scheduler bridge's live "rollback" */
 };
@@ -1399,8 +1455,24 @@ void rnet_rb_driver_shutdown(RNetRbDriver *d)
 
 #define RB_COOLDOWN_TICKS 30u
 
+/* Every stage change goes through here, so tip-hold's entry and every one of
+ * its exits are paired in the log whatever path took it: "RB tip-hold ended
+ * ... held=N ticks". The runway is an upper bound, not a duration -- a peer's
+ * COMMIT, a tip-extend, an abort or a yield all end the hold sooner -- so a
+ * sweep that reports only the runway it configured says nothing about how
+ * long the quiet window was actually open. */
 static void rb_stage_set(RNetRbDriver *d, RbEpisodeStage stage)
 {
+    if (d->stage == kRbTipHold && stage != kRbTipHold) {
+        rb_log(d, "RB tip-hold ended epoch=%u held=%u ticks (runway %u) — %s\n",
+               (unsigned)d->corr.epoch_id,
+               (unsigned)(d->sim > d->tiphold_enter_sim ? d->sim - d->tiphold_enter_sim : 0u),
+               (unsigned)rnet_rb_get_tip_runway(d->rb),
+               d->tiphold_exit_why ? d->tiphold_exit_why : "cleared");
+    } else if (stage == kRbTipHold && d->stage != kRbTipHold) {
+        d->tiphold_enter_sim = d->sim;
+    }
+    d->tiphold_exit_why = NULL;
     d->stage = stage;
     d->stage_entered_ms = rb_now(d);
 }
@@ -1459,6 +1531,7 @@ static void rb_episode_abort(RNetRbDriver *d, uint8_t abort_class, const char *w
                                   (rnet_u8)(d->corr.slot < 0 ? 0 : d->corr.slot),
                                   RNET_RB_SYNC_OP_ABORT, 0u);
     rb_restore_tip(d);
+    d->tiphold_exit_why = "aborted";
     rb_episode_clear(d);
     d->cooldown_until_tick = d->sim + RB_COOLDOWN_TICKS;
 }
@@ -1756,6 +1829,15 @@ static int rb_tip_extend(RNetRbDriver *d, uint32_t tick, int slot, int notify_pe
     if (!d->rb ||
         (d->stage != kRbTipHold && d->stage != kRbVerifying))
         return 0;
+    /* A local extend is new work the peer has to take on; a drain opens none.
+     * One the PEER asked for is still followed -- it is the peer's episode,
+     * and refusing it would only turn its extend into an abort. */
+    if (notify_peer && d->quiesce != RNET_RB_QUIESCE_NONE) {
+        rb_log(d, "RB tip-extend refused epoch=%u tick=%u — draining, so "
+                  "no new work opens\n",
+               (unsigned)d->corr.epoch_id, (unsigned)tick);
+        return 0;
+    }
     if (d->tip_extends >= RB_MAX_TIP_EXTENDS) {
         rb_log(d, "RB tip-extend refused epoch=%u tick=%u — %u "
                   "already spent on this episode; let it commit so a fresh one "
@@ -1810,6 +1892,7 @@ static int rb_tip_extend(RNetRbDriver *d, uint32_t tick, int slot, int notify_pe
     d->peer_base_mask = 0;
     rnet_rb_set_phase(d->rb, nRNetRbPhaseSealInputs);
     rb_send_local_seal_rows(d);
+    d->tiphold_exit_why = notify_peer ? "tip-extend (local)" : "tip-extend (from peer)";
     rb_stage_set(d, kRbSealing);
     return 1;
 }
@@ -1856,6 +1939,17 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
     }
     if (as_initiator && rb_cooldown_active(d))
         return 0;
+    /* Draining: nothing new opens, and saying so is what keeps a stop from
+     * hiding a correction -- the tick stays simulated on the predicted row,
+     * and the count of these is printed when the drain completes. Following
+     * is unaffected (below): a BEGIN the peer sent is its episode, in flight. */
+    if (as_initiator && d->quiesce != RNET_RB_QUIESCE_NONE) {
+        d->drain_unopened++;
+        rb_log(d, "RB drain: correction not opened mismatch=%u slot=%d — "
+                  "draining, so no new episode opens (%u so far)\n",
+               (unsigned)mismatch_tick, slot, (unsigned)d->drain_unopened);
+        return 0;
+    }
     if (mismatch_tick == 0u) {
         if (!as_initiator)
             rb_log(d, "RB follow refused epoch=%u — BEGIN carried "
@@ -2021,6 +2115,42 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
     d->peer_base_mask = 0;
     rb_stage_set(d, kRbSealing);
     d->episode_count++;
+    if (as_initiator)
+        d->ep_initiated++;
+    else
+        d->ep_followed++;
+    /* Answers that beat this BEGIN here (see early_post_mask). Anything held
+     * for a different epoch is for an episode that will now never open. */
+    if (!as_initiator) {
+        uint32_t m = d->early_post_mask;
+        while (m) {
+            uint32_t bit = m & (~m + 1u);
+            int i = rb_bit_slot(bit);
+            m &= ~bit;
+            if (d->early_post_epoch[i] != d->corr.epoch_id)
+                continue;
+            d->peer_post_digest[i] = d->early_post_digest[i];
+            d->peer_post_target[i] = d->early_post_target[i];
+            d->peer_post_mask |= bit;
+            rb_log(d, "RB POST epoch=%u taken from the early buffer\n",
+                   (unsigned)d->corr.epoch_id);
+        }
+        m = d->early_base_mask;
+        while (m) {
+            uint32_t bit = m & (~m + 1u);
+            int i = rb_bit_slot(bit);
+            m &= ~bit;
+            if (d->early_base_epoch[i] != d->corr.epoch_id ||
+                d->early_base_load[i] != d->corr.load_tick)
+                continue;
+            d->peer_base[i] = d->early_base[i];
+            d->peer_base_mask |= bit;
+            rb_log(d, "RB BASELINE epoch=%u taken from the early buffer\n",
+                   (unsigned)d->corr.epoch_id);
+        }
+        d->early_post_mask = 0u;
+        d->early_base_mask = 0u;
+    }
     /* A resim episode is the whole point of rollback and must leave a trace:
      * "mispredict=N" counts DETECTIONS (and one of its call sites is the
      * refusal path), so it cannot answer "did we actually rewind and
@@ -2109,10 +2239,36 @@ static void rb_baseline_try_compare(RNetRbDriver *d)
     }
 }
 
+/* An answer for a PEER's episode whose BEGIN we have not processed yet. Our
+ * own epochs never qualify (their BEGIN is ours), nor does one at or below
+ * the newest BEGIN already seen from that seat (that episode is over). */
+static int rb_epoch_is_early(const RNetRbDriver *d, uint32_t epoch)
+{
+    uint32_t init = rnet_rb_epoch_initiator(epoch);
+    if ((int)init == rb_local_slot(d) || init >= RB_MAX_SLOTS)
+        return 0;
+    if (d->stage != kRbIdle && epoch == d->corr.epoch_id)
+        return 0;
+    return (epoch >> RNET_RB_EPOCH_SLOT_BITS) > d->begin_seen_seq[init];
+}
+
 static void rb_on_peer_baseline(RNetRbDriver *d, int from, uint32_t epoch,
                                 uint32_t load_tick, const RNetRbDigestParts *p)
 {
     uint32_t bit;
+    if (rb_epoch_is_early(d, epoch)) {
+        bit = rb_from_bit(d, from);
+        if (bit) {
+            int i = rb_bit_slot(bit);
+            d->early_base_epoch[i] = epoch;
+            d->early_base_load[i] = load_tick;
+            d->early_base[i] = *p;
+            d->early_base_mask |= bit;
+            rb_log(d, "RB BASELINE epoch=%u arrived before its BEGIN — held "
+                      "for it\n", (unsigned)epoch);
+        }
+        return;
+    }
     if (d->stage == kRbIdle || epoch != d->corr.epoch_id ||
         load_tick != d->corr.load_tick)
         return;
@@ -2145,6 +2301,19 @@ static void rb_on_peer_post(RNetRbDriver *d, int from, uint32_t epoch,
                             uint32_t target, uint32_t master)
 {
     uint32_t bit;
+    if (rb_epoch_is_early(d, epoch)) {
+        bit = rb_from_bit(d, from);
+        if (bit) {
+            int i = rb_bit_slot(bit);
+            d->early_post_epoch[i] = epoch;
+            d->early_post_target[i] = target;
+            d->early_post_digest[i] = master;
+            d->early_post_mask |= bit;
+            rb_log(d, "RB POST epoch=%u arrived before its BEGIN — held for "
+                      "it\n", (unsigned)epoch);
+        }
+        return;
+    }
     if (d->stage == kRbIdle || epoch != d->corr.epoch_id)
         return;
     bit = rb_from_bit(d, from);
@@ -2218,12 +2387,19 @@ static void rb_drain_wire(RNetRbDriver *d)
                 }
                 break;
             }
+            {
+                uint32_t init = rnet_rb_epoch_initiator(epoch);
+                uint32_t seq = epoch >> RNET_RB_EPOCH_SLOT_BITS;
+                if (init < RB_MAX_SLOTS && seq > d->begin_seen_seq[init])
+                    d->begin_seen_seq[init] = seq;
+            }
             /* Concurrent dual initiation: lower initiator seat wins, the
              * loser yields and follows. The initiator's seat is in the epoch
              * id, so this holds for any number of seats. */
             if (d->stage != kRbIdle) {
                 int peer_init = (int)rnet_rb_epoch_initiator(epoch);
                 if (d->initiator && peer_init < rb_local_slot(d)) {
+                    d->tiphold_exit_why = "yielded to a peer BEGIN";
                     rb_episode_clear(d);
                 } else {
                     /* We are busy — either mid-episode of our own, or we won
@@ -2277,6 +2453,7 @@ static void rb_drain_wire(RNetRbDriver *d)
                        (unsigned)d->corr.epoch_id,
                        (unsigned)d->corr.load_tick,
                        (unsigned)d->corr.target_tick, (unsigned)a);
+                d->tiphold_exit_why = "peer aborted";
                 rb_episode_clear(d);
                 /* Mirror the sender's cooldown class so both peers re-arm on
                  * the same schedule. */
@@ -2334,10 +2511,33 @@ static void rb_drain_wire(RNetRbDriver *d)
                 d->peer_commit_mask |= bit;
                 /* Every peer has committed and left: nothing can tip-extend
                  * this episode any more. */
-                if ((d->peer_commit_mask & expect) == expect)
+                if ((d->peer_commit_mask & expect) == expect) {
+                    d->tiphold_exit_why = "every peer committed";
                     rb_episode_clear(d);
+                }
             }
             break;
+        case RNET_RB_SYNC_OP_QUIESCE: {
+            /* The peer will open no more episodes. Counted per peer; a peer
+             * that is draining makes us drain too, so asking one side stops
+             * the match rather than leaving the other opening episodes into a
+             * peer that is about to leave. */
+            uint32_t bit = rb_from_bit(d, from);
+            if (!bit)
+                break;
+            if (!(d->peer_quiesce_mask & bit))
+                rb_log(d, "RB quiesce: seat %d will open no more episodes "
+                          "(its sim=%u, ours=%u)\n",
+                       rb_bit_slot(bit), (unsigned)b, (unsigned)d->sim);
+            d->peer_quiesce_mask |= bit;
+            if (a)
+                d->peer_quiesce_ack_mask |= bit;
+            if (d->quiesce == RNET_RB_QUIESCE_NONE) {
+                d->quiesce_origin = "the peer is draining";
+                rnet_rb_driver_request_quiesce(d);
+            }
+            break;
+        }
         default:
             break;
         }
@@ -2460,6 +2660,7 @@ static void rb_pump_episode(RNetRbDriver *d)
     }
     case kRbTipHold:
         if (d->sim > d->corr.target_tick + rnet_rb_get_tip_runway(d->rb)) {
+            d->tiphold_exit_why = "runway spent";
             rb_episode_clear(d);
         } else if (rb_stage_expired(d)) {
             /* A tip-hold that never met its exit condition wedged silently —
@@ -2474,6 +2675,7 @@ static void rb_pump_episode(RNetRbDriver *d)
                       "sim=%u — releasing\n",
                    (unsigned)d->corr.epoch_id,
                    (unsigned)d->corr.target_tick, (unsigned)d->sim);
+            d->tiphold_exit_why = "watchdog expired";
             rb_episode_clear(d);
         }
         break;
@@ -2504,7 +2706,8 @@ static void rb_reconcile_wire(RNetRbDriver *d)
 
     /* A correction owed from an episode that did not commit comes first: it is
      * the oldest thing wrong with our timeline. */
-    if (d->stage == kRbIdle && !rb_cooldown_active(d) && d->sim >= d->owed_retry_after) {
+    if (d->stage == kRbIdle && !rb_cooldown_active(d) && d->sim >= d->owed_retry_after &&
+        d->quiesce == RNET_RB_QUIESCE_NONE) {
         uint32_t t, load;
         int oslot;
         if (rb_owed_first(d, &t, &oslot)) {
@@ -2611,6 +2814,118 @@ static void rb_reconcile_wire(RNetRbDriver *d)
     }
 }
 
+/* ── coordinated stop ────────────────────────────────────────────────── */
+
+/* How often an unanswered marker is re-sent, and how long a peer that holds
+ * every other peer's marker waits to hear that they hold ITS marker too before
+ * it leaves anyway. The last message of any exchange can be lost, so the wait
+ * is bounded; by then nothing either side opened is outstanding, so leaving
+ * early can only cost the peer its clean exit, never the ledger. */
+#define RB_QUIESCE_RESEND_MS 50u
+#define RB_QUIESCE_ACK_GRACE_MS 500u
+
+static uint32_t rb_owed_outstanding(const RNetRbDriver *d)
+{
+    uint32_t n = 0u, t;
+    uint32_t from = d->sim > RNET_INPUT_HIST_DEPTH ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    for (t = from; t < d->sim; ++t) {
+        uint32_t i = t % RNET_INPUT_HIST_DEPTH;
+        if (d->owed_slot[i] >= 0 && d->owed_tick[i] == t)
+            n++;
+    }
+    return n;
+}
+
+static void rb_quiesce_send(RNetRbDriver *d)
+{
+    RNetSession *s = rb_session(d);
+    uint32_t expect = rb_expect_mask(d);
+    uint32_t have_all = (d->peer_quiesce_mask & expect) == expect ? 1u : 0u;
+    if (s)
+        rnet_session_send_rb_sync(s, 0u, have_all, d->sim, 0u,
+                                  (rnet_u8)rb_local_slot(d),
+                                  RNET_RB_SYNC_OP_QUIESCE, 0u);
+    d->quiesce_sent_ms = rb_now(d);
+    if (d->quiesce_sent_ms == 0u)
+        d->quiesce_sent_ms = 1u;
+}
+
+/* Pumped from poll_admit. wire_ok = 0 when the session is not running: the
+ * timeout still counts and a drain that already holds every marker can still
+ * finish, but nothing is sent. */
+static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
+{
+    uint32_t now, expect;
+
+    if (d->quiesce != RNET_RB_QUIESCE_DRAINING)
+        return;
+    now = rb_now(d);
+    expect = rb_expect_mask(d);
+    if ((uint32_t)(now - d->quiesce_req_ms) > RNET_RB_QUIESCE_TIMEOUT_MS) {
+        d->quiesce = RNET_RB_QUIESCE_TIMED_OUT;
+        rb_log(d, "RB quiesce TIMED OUT after %u ms at sim=%u — stage=%s, "
+                  "peer markers held %x of %x, acknowledged %x. The episode "
+                  "ledger is NOT guaranteed to balance: a peer vanished, "
+                  "predates the marker, or an episode never resolved.\n",
+               (unsigned)(now - d->quiesce_req_ms), (unsigned)d->sim,
+               rb_stage_name(d->stage), (unsigned)(d->peer_quiesce_mask & expect),
+               (unsigned)expect, (unsigned)(d->peer_quiesce_ack_mask & expect));
+        return;
+    }
+    /* In flight: let it finish. The marker promises "none open here", so it
+     * is only ever sent from idle. */
+    if (d->stage != kRbIdle)
+        return;
+    if (wire_ok && (d->quiesce_sent_ms == 0u ||
+                    (uint32_t)(now - d->quiesce_sent_ms) >= RB_QUIESCE_RESEND_MS))
+        rb_quiesce_send(d);
+    if ((d->peer_quiesce_mask & expect) != expect)
+        return;
+    if (d->quiesce_all_ms == 0u)
+        d->quiesce_all_ms = now ? now : 1u;
+    /* With the session down the peer has left, and it could only leave
+     * holding our marker: there is no acknowledgement left to wait for. */
+    if (wire_ok && (d->peer_quiesce_ack_mask & expect) != expect &&
+        (uint32_t)(now - d->quiesce_all_ms) < RB_QUIESCE_ACK_GRACE_MS)
+        return;
+    if (wire_ok)
+        rb_quiesce_send(d);   /* the last word: we hold theirs */
+    d->quiesce = RNET_RB_QUIESCE_DRAINED;
+    rb_log(d, "RB quiesced at sim=%u after %u ms (requested at sim=%u: %s) — "
+              "no episode open here and every peer has promised to open none. "
+              "Opened here: %u as initiator, %u as follower; corrections not "
+              "opened while draining: %u; still owed: %u; peers acknowledged "
+              "%x of %x\n",
+           (unsigned)d->sim, (unsigned)(now - d->quiesce_req_ms),
+           (unsigned)d->quiesce_req_sim,
+           d->quiesce_origin ? d->quiesce_origin : "host request",
+           (unsigned)d->ep_initiated, (unsigned)d->ep_followed,
+           (unsigned)d->drain_unopened, (unsigned)rb_owed_outstanding(d),
+           (unsigned)(d->peer_quiesce_ack_mask & expect), (unsigned)expect);
+}
+
+void rnet_rb_driver_request_quiesce(RNetRbDriver *d)
+{
+    if (!d || !d->started || d->quiesce != RNET_RB_QUIESCE_NONE)
+        return;
+    d->quiesce = RNET_RB_QUIESCE_DRAINING;
+    d->quiesce_req_ms = rb_now(d);
+    d->quiesce_req_sim = d->sim;
+    /* An armed injection would add one more mispredict that the drain then
+     * refuses to open; the injector perturbs a running match, not its end. */
+    d->force_invent_slot = -1;
+    rb_log(d, "RB quiesce requested at sim=%u (%s) — stage=%s; no new episode "
+              "or local tip-extend opens from here, open ones finish, peer "
+              "BEGINs are still followed\n",
+           (unsigned)d->sim, d->quiesce_origin ? d->quiesce_origin : "host request",
+           rb_stage_name(d->stage));
+}
+
+RNetRbQuiesce rnet_rb_driver_quiesce_state(const RNetRbDriver *d)
+{
+    return d ? d->quiesce : RNET_RB_QUIESCE_NONE;
+}
+
 /* ── live admit ──────────────────────────────────────────────────────── */
 
 /* INCREMENTAL: hand the host the next replayed tick. */
@@ -2651,8 +2966,19 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
      * messages at the same point in the episode. */
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);
-    if (!rnet_session_is_running(s))
+    if (!rnet_session_is_running(s)) {
+        /* A draining peer that has left ends our session (its BYE), and its
+         * last marker may be sitting in the queue behind it. Read what is
+         * there -- a peer cannot open anything after its marker, so nothing
+         * taken here starts new work -- and let the drain finish or time out.
+         * Measured before this: the survivor of a drain never pumped again
+         * once the session dropped, and left through the 1.5 s peer-gone path
+         * with no "RB quiesced" line. */
+        if (d->quiesce == RNET_RB_QUIESCE_DRAINING)
+            rb_drain_wire(d);
+        rb_quiesce_pump(d, 0);
         return RNET_RB_ADMIT_STALL;
+    }
     slots = rb_slot_count(d);
     local = rb_local_slot(d);
 
@@ -2664,6 +2990,7 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     rb_modset_pump(d);
     rb_reconcile_wire(d);
     rb_pump_episode(d);
+    rb_quiesce_pump(d, 1);
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
@@ -2736,7 +3063,11 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
          * corrupts the boot tick itself, and everything measured afterwards
          * is of a session that was never valid. A validation knob must
          * perturb the thing under test, not the premise of the test. */
-        if (d->force_mispredict_every > 0 && slot != local && d->boot_dig_settled) {
+        if (d->force_mispredict_every > 0 && slot != local && d->boot_dig_settled &&
+            d->quiesce == RNET_RB_QUIESCE_NONE &&
+            d->force_mispredict_row[slot] != d->sim + 1u) {
+            /* Once per row: a stalled poll retries the same tick. */
+            d->force_mispredict_row[slot] = d->sim + 1u;
             if ((++d->force_mispredict_n % (unsigned long)d->force_mispredict_every) == 0ul) {
                 d->force_invent_slot = slot;
                 rb_log_raw(d, "rbe: forced late row slot=%d sim=%u "

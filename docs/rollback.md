@@ -255,6 +255,42 @@ a queue that fills is logged (`rnet_session_rb_ctrl_dropped`).
 The scheduler is process-global (`rnet_sched_bind`): one started driver per
 process.
 
+### Coordinated stop (for harnesses)
+
+A two-process harness that kills both peers at a deadline cannot tell an
+episode in flight at the kill from a lost one, so its ledger fails on an
+end-of-run race (snesrecomp's runway-4 cell: 1 of 1 in a sweep, 4 of 4 clean
+on repeat). `rnet_rb_driver_request_quiesce` makes the stop exact instead of
+tolerated:
+
+- from the request on, this peer opens no episode (a mispredict found while
+  draining logs `RB drain: correction not opened` and is counted), no local
+  tip-extend, and the validation injector stops. It still follows a peer's
+  BEGIN, and every open episode finishes or aborts with its usual line;
+- once idle it sends `RNET_RB_SYNC_OP_QUIESCE` ("I will open no more
+  episodes, and have none open"), re-sent every 50 ms; a peer that receives
+  one starts draining too, so asking either side drains the match;
+- `rnet_rb_driver_quiesce_state` reaches `RNET_RB_QUIESCE_DRAINED` when this
+  peer is idle and holds every peer's marker (`RB quiesced ... Opened here: I
+  as initiator, F as follower`). Nothing either side opened can then be
+  unanswered, so `initiated - followed - refused == 0` with no loss. The
+  host keeps running live ticks until then and exits after;
+- bounded: `RNET_RB_QUIESCE_TIMED_OUT` after `RNET_RB_QUIESCE_TIMEOUT_MS`
+  with a line naming what was outstanding (a vanished peer, or one that
+  predates the op -- it ignores the unknown op, so the drain ends on the
+  bound rather than hanging).
+
+The trigger is the host's: snesrecomp maps SIGUSR1 to it and
+`tools/rb_loopback.sh` sends SIGUSR1 to both peers at the deadline, then
+grades the ledger only if both logged `RB quiesced`. A port of that harness
+(n64lle) needs the same two pieces: a host trigger that calls
+`request_quiesce`, and an exit once the state is DRAINED or TIMED_OUT.
+
+Tip-hold now logs every exit with how long it actually held:
+`RB tip-hold ended epoch=E held=N ticks (runway R) — <why>` (runway spent,
+every peer committed, tip-extend, aborted, peer aborted, yielded, watchdog
+expired). The runway is a ceiling, not a duration.
+
 ### More than two peers
 
 Built, not exercised. Epochs carry the initiator's seat, dual initiation reads
