@@ -154,6 +154,10 @@ struct RNetRbDriver {
     uint8_t  boot_dig_peer_valid;
     uint8_t  boot_dig_settled;
     uint8_t  boot_dig_waiting_logged;
+    /* The match was REFUSED (boot digest, mod set): a stable code the host can
+     * show a player, NULL = not refused. Latched until the next start. From
+     * the refusal on, Live admits nothing -- see rb_refuse. */
+    const char *refusal;
     /* Degrade mode: stop predicting remote input until this tick. */
     uint32_t lockstep_until;
 
@@ -781,6 +785,37 @@ static uint8_t rb_gate_episode_active(void *ctx)
  */
 #define RB_BOOT_DIGEST_TIMEOUT_MS 4000u
 
+/*
+ * Refuse the match: latch why, stop admitting Live ticks, ask the host to leave.
+ *
+ * The refusal used to be only the host callback. Everything after it then
+ * depended on the host acting on it -- and the gates that had been holding the
+ * sim (the boot-digest wait, the mod-set wait) RELEASED the moment they
+ * settled, refusal or not. A host that did not consume the request (snesrecomp's
+ * desktop host never did) went on to play the match that had just been
+ * declared unplayable: every episode forking at its baseline after a boot
+ * fork, or a match between two different mod sets. That is the silent
+ * degradation NETPLAY.md section 4 rules out ("abort rather than degrade").
+ *
+ * So the driver now enforces its own verdict: once refused, poll_admit admits
+ * no Live tick again this match (an episode already open still finishes). The
+ * host still owns LEAVING -- tearing down the session and returning its player
+ * to the lobby -- and reads the reason from rnet_rb_driver_refusal(). The
+ * first refusal names the match; a second one (both mod checks can fire) is
+ * the same verdict and is not re-reported.
+ */
+static void rb_refuse(RNetRbDriver *d, const char *code)
+{
+    if (d->refusal)
+        return;
+    d->refusal = code;
+    d->stall_tag = "refused";
+    rb_log(d, "RB match refused (%s) at sim=%u — no further tick is "
+              "admitted; asking the host to return to the lobby\n",
+           code, (unsigned)d->sim);
+    d->host.request_return_to_lobby(d->host.ctx);
+}
+
 static int rb_boot_digest_gate(RNetRbDriver *d)
 {
     uint32_t local = 0u, peer = 0u;
@@ -867,7 +902,7 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
                       "baseline\n", d->allow_boot_fork_env);
             return 0;
         }
-        d->host.request_return_to_lobby(d->host.ctx);
+        rb_refuse(d, "boot_digest_mismatch");
         return 0;
     }
     rb_log(d, "RB boot digest agreed (%08x)\n", (unsigned)local);
@@ -891,6 +926,14 @@ static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
     if (sim == 1u && d->stage == kRbIdle && rb_boot_digest_gate(d)) {
         if (tag_out)
             *tag_out = "boot_digest_wait";
+        return 1u;
+    }
+    /* The boot-digest gate refuses from inside this call and then reports
+     * itself settled; without this the same admission would let tick 1 run on
+     * the match it had just refused. */
+    if (d->refusal) {
+        if (tag_out)
+            *tag_out = "refused";
         return 1u;
     }
     return 0u;
@@ -931,7 +974,7 @@ static void rb_modset_fail(RNetRbDriver *d, const char *why)
         d->modset_ok = 1u;
         return;
     }
-    d->host.request_return_to_lobby(d->host.ctx);
+    rb_refuse(d, "mod_set_not_agreed");
 }
 
 static void rb_modset_pump(RNetRbDriver *d)
@@ -1394,19 +1437,39 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
  */
 #define RB_IDENT_RETRY_TICKS 90u
 
+/* The content fingerprint this peer claims. FORCE_MOD_MISMATCH makes it a
+ * peer that really has a different set -- on the wire AND in its own
+ * comparison. Perturbing only what it sends made the knob one-sided: the
+ * forcing peer compared the honest reply against its honest fingerprint, saw a
+ * match, and never refused, where two peers with genuinely different sets both
+ * refuse. A validation knob must model the fault, not half of it. */
+static uint32_t rb_claimed_content_fp(const RNetRbDriver *d)
+{
+    return d->force_mod_mismatch > 0 ? (d->local_content_fp ^ 0x5a5a5a5au)
+                                     : d->local_content_fp;
+}
+
 static void rb_send_identity(RNetRbDriver *d)
 {
     RNetSession *s = rb_session(d);
-    if (!s || d->peer_ident_seen || d->sim > RB_IDENT_RETRY_TICKS)
+    if (!s || d->sim > RB_IDENT_RETRY_TICKS)
         return;
     if (d->local_build_fp == 0u && d->local_content_fp == 0u)
+        return;
+    /* Stop once the peer's identity is in AND ours has gone out. Stopping on
+     * the peer's alone made the exchange one-sided: the peer that started
+     * later usually had the other's IDENT in hand before its own first send
+     * (tick 0, or the next multiple of 8), and then never sent at all -- so
+     * only one side could ever see a mod-set difference and refuse, and the
+     * other left on "peer disconnected" without knowing why. */
+    if (d->peer_ident_seen && d->ident_sent)
         return;
     /* Validation (FORCE_MOD_MISMATCH=1): claim a mod set we do not have, so
      * the refusal path can be proven to fire. A refusal that has never
      * refused anything is not a safety feature. */
     if (d->force_mod_mismatch > 0) {
         rnet_session_send_rb_sync(
-            s, 0u, d->local_build_fp, d->local_content_fp ^ 0x5a5a5a5au, 0u,
+            s, 0u, d->local_build_fp, rb_claimed_content_fp(d), 0u,
             (rnet_u8)(rb_local_slot(d) < 0 ? 0 : rb_local_slot(d)),
             RNET_RB_SYNC_OP_IDENT, 0u);
         d->ident_sent = 1u;
@@ -1414,7 +1477,7 @@ static void rb_send_identity(RNetRbDriver *d)
     }
     /* Every few ticks, not every tick: one trip is all it needs, and a peer
      * that is simply older should not be pelted. */
-    if ((d->sim % 8u) != 0u)
+    if ((d->sim % 8u) != 0u && !d->peer_ident_seen)
         return;
     if (rnet_session_send_rb_sync(
             s, 0u, d->local_build_fp, d->local_content_fp, 0u,
@@ -2462,12 +2525,16 @@ static void rb_drain_wire(RNetRbDriver *d)
             }
             break;
         case RNET_RB_SYNC_OP_IDENT:
+            /* Retransmits of an identity already judged say nothing new; a
+             * refusal is one verdict, not one per copy. */
+            if (d->peer_ident_seen && d->peer_build_fp == a && d->peer_content_fp == b)
+                break;
             d->peer_build_fp = a;
             d->peer_content_fp = b;
             d->peer_ident_seen = 1u;
             if ((d->local_build_fp | d->local_content_fp) != 0u) {
                 int build_ok = (a == d->local_build_fp);
-                int content_ok = (b == d->local_content_fp);
+                int content_ok = (b == rb_claimed_content_fp(d));
                 if (content_ok && build_ok) {
                     rb_log(d, "peer identity matches "
                               "(build=%08x content=%08x)\n",
@@ -2493,14 +2560,14 @@ static void rb_drain_wire(RNetRbDriver *d)
                               "so the two sides are running different games. "
                               "Compare the \"game: mod set\" line in each log; "
                               "the host's selection is the one to match.\n",
-                           (unsigned)d->local_content_fp, (unsigned)b);
+                           (unsigned)rb_claimed_content_fp(d), (unsigned)b);
                     if (d->allow_mod_mismatch) {
                         rb_log(d, "  %s=1 — continuing "
                                   "anyway; expect an immediate desync\n",
                                d->allow_mod_mismatch_env);
                         break;
                     }
-                    d->host.request_return_to_lobby(d->host.ctx);
+                    rb_refuse(d, "mod_set_mismatch");
                 }
             }
             break;
@@ -2989,6 +3056,11 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
      * -- no frame, no pump, no handshake, forever. A precondition has to be
      * driven by something that runs whether or not the thing it gates runs. */
     rb_modset_pump(d);
+    /* Identity too, for the same reason: it is sent from finish_frame, and a
+     * peer held at tick 0-1 (boot-digest wait, or already refused on OUR
+     * identity) runs no frame -- so it never answered, and the other side,
+     * never seeing its identity, could not refuse on the same evidence. */
+    rb_send_identity(d);
     rb_reconcile_wire(d);
     rb_pump_episode(d);
     /* A peer that said BYE has left even while the session still reads
@@ -3000,6 +3072,13 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     /* Seal / Verify own the sim; Live must not advance under them. */
     if (d->stage == kRbSealing || d->stage == kRbVerifying) {
         d->stall_tag = "episode";
+        return RNET_RB_ADMIT_STALL;
+    }
+    /* A refused match plays no further tick (rb_refuse). Checked after the
+     * wire and the episode pump, so an episode already open still finishes
+     * and a drain still completes; only Live is closed. */
+    if (d->refusal) {
+        d->stall_tag = "refused";
         return RNET_RB_ADMIT_STALL;
     }
 
@@ -3279,6 +3358,11 @@ int rnet_rb_driver_in_resim(const RNetRbDriver *d)
 const char *rnet_rb_driver_stall_tag(const RNetRbDriver *d)
 {
     return d ? d->stall_tag : NULL;
+}
+
+const char *rnet_rb_driver_refusal(const RNetRbDriver *d)
+{
+    return d ? d->refusal : NULL;
 }
 
 int rnet_rb_driver_last_fork(const RNetRbDriver *d, uint32_t *tick, const char **partition)

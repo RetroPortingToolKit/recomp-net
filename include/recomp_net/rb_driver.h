@@ -160,7 +160,13 @@ typedef struct RNetRbHost
     /* Optional: tick 0's digest was just latched -- log whatever explains a
      * boot mismatch (partitions, frame counters). */
     void (*boot_digest_noted)(void *ctx);
-    /* End the match and go back to the lobby (boot fork, mod refusal). */
+    /* The match is REFUSED (boot fork, mod-set refusal): end it and go back
+     * to the lobby. Called once per match; the reason is
+     * rnet_rb_driver_refusal(). From the refusal on the driver admits no Live
+     * tick, so a host that is slow to act stalls rather than plays a match
+     * that was declared unplayable -- but LEAVING is the host's job: tear the
+     * session down and soft-return (a host that never consumes this request
+     * leaves its players on a frozen frame; NETPLAY.md section 4). */
     void (*request_return_to_lobby)(void *ctx);
 
     /* Optional log sink: one complete line (with '\n') per call. NULL writes
@@ -318,6 +324,12 @@ int rnet_rb_driver_episode_active(const RNetRbDriver *d);
 /* 1 between resim_begin and resim_end. */
 int rnet_rb_driver_in_resim(const RNetRbDriver *d);
 const char *rnet_rb_driver_stall_tag(const RNetRbDriver *d);
+/* Why this match was refused, NULL if it was not: "boot_digest_mismatch" (the
+ * peers did not start from the same state), "mod_set_mismatch" (the peers'
+ * content fingerprints differ), "mod_set_not_agreed" (the host's set could not
+ * be confirmed or honoured). Stable codes, suitable for a launcher's
+ * last_error. Latched until the next start. */
+const char *rnet_rb_driver_refusal(const RNetRbDriver *d);
 /* Last digest fork: tick + partition name, and both peers' master digests. */
 int rnet_rb_driver_last_fork(const RNetRbDriver *d, uint32_t *tick, const char **partition);
 int rnet_rb_driver_fork_digests(const RNetRbDriver *d, uint32_t *mine, uint32_t *theirs);

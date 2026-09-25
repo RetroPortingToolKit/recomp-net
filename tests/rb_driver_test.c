@@ -100,6 +100,7 @@ typedef struct Child {
              n_tiphold_extend, n_unapplied, n_lobby, n_forced;
     uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
     uint32_t replay_admits;
+    uint32_t n_refusal_lines;   /* "RB match refused" */
 } Child;
 
 static Child g_c;
@@ -282,6 +283,7 @@ static void h_log(void *ctx, const char *line)
     if (strstr(line, "RB quiesce TIMED OUT")) g_c.n_quiesce_timeout++;
     if (strstr(line, "RB drain: correction not opened")) g_c.n_drain_unopened++;
     if (strstr(line, "RB tip-hold ended")) g_c.n_tiphold_end++;
+    if (strstr(line, "RB match refused")) g_c.n_refusal_lines++;
     if (g_c.log)
         fputs(line, g_c.log);
 }
@@ -397,6 +399,14 @@ typedef struct Report {
     int quiesce_state;
     uint64_t resim_ticks;
     uint32_t episodes_driver;
+    /* Refusal scenarios: when it came, where the sim stood, where it stood a
+     * second of polling later, and why. */
+    uint32_t n_refusal_lines;
+    uint32_t refused_after_ms;
+    uint32_t sim_at_refusal;
+    uint32_t sim_after_hold;
+    uint32_t live_admits_after;
+    char refusal[32];
     uint32_t timeline[TOY_TICKS];
 } Report;
 
@@ -410,6 +420,12 @@ typedef struct Scenario {
     /* 1: only the initiator is asked to quiesce; the follower must start
      * draining from the peer's marker alone. */
     int quiesce_one_side;
+    /* Refusal scenarios: the initiator runs RNET_RB_FORCE_BOOT_FORK=1 or
+     * RNET_RB_FORCE_MOD_MISMATCH=1 (never the follower), and `refusal` is the
+     * code both peers must report. NULL = an ordinary match. */
+    int force_boot_fork;
+    int force_mod_mismatch;
+    const char *refusal;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -481,6 +497,8 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     } else {
         setenv("RNET_RB_FORCE_MISPREDICT", "0", 1);
     }
+    setenv("RNET_RB_FORCE_BOOT_FORK", (slot == 0 && sc->force_boot_fork) ? "1" : "0", 1);
+    setenv("RNET_RB_FORCE_MOD_MISMATCH", (slot == 0 && sc->force_mod_mismatch) ? "1" : "0", 1);
 
     rnet_config_init_defaults(&rc);
     rc.slot_count = 2;
@@ -518,6 +536,11 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     cfg.snap_depth = TOY_SNAPS;
     cfg.log_prefix = "rb_test";
     fill_host(&host);
+    /* Identity only where a scenario is about it: the ordinary scenarios stay
+     * exactly what they were. Same build, same content -- any difference the
+     * peers see is the injected one. */
+    if (sc->refusal)
+        rnet_rb_driver_set_identity(d, 0x0b0b0b0bu, 0x0c0c0c0cu);
     if (!rnet_rb_driver_start(d, &cfg, &host))
         goto report;
 
@@ -539,13 +562,27 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     next_tick_ms = start_ms;
     {
         int ready_sent = 0, asked = 0;
+        uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
         while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
             RNetRbAdmit a;
             RNetRbQuiesce q;
             rnet_session_pump(s);
-            if (g_c.n_lobby)
-                break;
+            if (g_c.n_lobby) {
+                /* An ordinary scenario treats a refusal as the end (and fails
+                 * on it below). A refusal scenario keeps polling for a second,
+                 * as a host that has not yet acted on the request would, to
+                 * prove the driver itself admits nothing more. */
+                if (!sc->refusal)
+                    break;
+                if (!refused_ms) {
+                    refused_ms = mono_ms();
+                    r->refused_after_ms = refused_ms - start_ms;
+                    r->sim_at_refusal = rnet_rb_driver_sim_tick(d);
+                } else if ((uint32_t)(mono_ms() - refused_ms) >= 1000u) {
+                    break;
+                }
+            }
             if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
                 (void)write_all(ready_fd, "R", 1);
                 ready_sent = 1;
@@ -560,6 +597,8 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
                 break;
             a = rnet_rb_driver_poll_admit(d);
             if (a != RNET_RB_ADMIT_STALL) {
+                if (refused_ms && a == RNET_RB_ADMIT_LIVE)
+                    r->live_admits_after++;
                 if (a == RNET_RB_ADMIT_REPLAY)
                     g_c.replay_admits++;
                 toy_step();   /* the same per-tick function for live and replay */
@@ -584,7 +623,11 @@ report:
         r->resim_ticks = rnet_rb_driver_resim_ticks(d);
         r->episodes_driver = rnet_rb_driver_episode_count(d);
         r->quiesce_state = (int)rnet_rb_driver_quiesce_state(d);
+        r->sim_after_hold = rnet_rb_driver_sim_tick(d);
+        snprintf(r->refusal, sizeof(r->refusal), "%s",
+                 rnet_rb_driver_refusal(d) ? rnet_rb_driver_refusal(d) : "");
     }
+    r->n_refusal_lines = g_c.n_refusal_lines;
     r->n_quiesced = g_c.n_quiesced;
     r->n_quiesce_timeout = g_c.n_quiesce_timeout;
     r->n_drain_unopened = g_c.n_drain_unopened;
@@ -680,6 +723,49 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     expect_true(got_a && got_b, msg);
     snprintf(msg, sizeof(msg), "%s: both sessions reached RUNNING", sc->name);
     expect_true(ra->running && rb->running, msg);
+    if (sc->refusal) {
+        const Report *rr[2];
+        int k;
+        rr[0] = ra;
+        rr[1] = rb;
+        printf("%-22s refusal=%s/%s after=%u/%u ms sim@refusal=%u/%u "
+               "sim+1s=%u/%u live_after=%u/%u lobby=%u/%u\n",
+               sc->name, ra->refusal, rb->refusal, ra->refused_after_ms,
+               rb->refused_after_ms, ra->sim_at_refusal, rb->sim_at_refusal,
+               ra->sim_after_hold, rb->sim_after_hold, ra->live_admits_after,
+               rb->live_admits_after, ra->n_lobby, rb->n_lobby);
+        for (k = 0; k < 2; ++k) {
+            const Report *r = rr[k];
+            const char *who = k ? "follower" : "initiator";
+            snprintf(msg, sizeof(msg), "%s: %s asked for the lobby exactly once (%u)",
+                     sc->name, who, r->n_lobby);
+            expect_true(r->n_lobby == 1u, msg);
+            snprintf(msg, sizeof(msg), "%s: %s says why (\"%s\", want \"%s\")",
+                     sc->name, who, r->refusal, sc->refusal);
+            expect_true(strcmp(r->refusal, sc->refusal) == 0 && r->n_refusal_lines == 1u,
+                        msg);
+            snprintf(msg, sizeof(msg), "%s: %s refused within the bound (%u ms)",
+                     sc->name, who, r->refused_after_ms);
+            expect_true(r->refused_after_ms < 6000u, msg);
+            snprintf(msg, sizeof(msg), "%s: %s admitted nothing after refusing "
+                     "(sim %u -> %u, %u live admits)", sc->name, who,
+                     r->sim_at_refusal, r->sim_after_hold, r->live_admits_after);
+            expect_true(r->sim_after_hold == r->sim_at_refusal &&
+                            r->live_admits_after == 0u,
+                        msg);
+            if (sc->force_boot_fork) {
+                /* Tick 0's digest decides it: tick 1 must never run. */
+                snprintf(msg, sizeof(msg), "%s: %s held at tick 1 (sim %u)", sc->name,
+                         who, r->sim_at_refusal);
+                expect_true(r->sim_at_refusal <= 1u, msg);
+            }
+            snprintf(msg, sizeof(msg), "%s: %s opened no episode", sc->name, who);
+            expect_true(r->n_ep_init + r->n_ep_follow == 0u, msg);
+        }
+        free(ra);
+        free(rb);
+        return;
+    }
     snprintf(msg, sizeof(msg), "%s: both peers ran the match", sc->name);
     expect_true(ra->sim >= sc->ticks && rb->sim >= sc->ticks / 2u, msg);
     snprintf(msg, sizeof(msg), "%s: episodes ran (nothing exercised otherwise)", sc->name);
@@ -749,6 +835,12 @@ int main(void)
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
         /* The stop propagates: only the initiator is asked. */
         { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },
+        /* Refusals: both peers name the same reason and admit nothing more,
+         * whether or not the host has acted on the request yet. */
+        { "refuse-boot-fork",    0, 0,       "30",  "8",   0,     420u,  0,
+          1, 0, "boot_digest_mismatch" },
+        { "refuse-mod-mismatch", 0, 1,       "30",  "8",   0,     420u,  0,
+          0, 1, "mod_set_mismatch" },
     };
     unsigned port_base = 30000u + ((unsigned)getpid() % 5000u) * 4u;
     size_t i;
