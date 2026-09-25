@@ -473,6 +473,24 @@ episodes, 12 and 9 watchdogs, one residual covered by a watchdog, 17
 corrections LOST in one run (to a port the scene never reads, so nothing
 forked). Per-peer counts are in n64lle `docs/NETPLAY.md` §5.
 
+**A lost START (found 2026-09-25, final regression of the merged branches).**
+`rb_driver_test`'s 4seat-loss2 cell failed 2 of 10 full-suite runs (0 of 12
+run alone): seat 2 never reached RUNNING, so no seat simulated a tick. Cause:
+the session sent `START` exactly once; a seat's 2 % receive loss can drop it,
+and nothing else moves a seat from READY to RUNNING (the injected loss is
+seeded per seat, so whether the dropped datagram is START depends on arrival
+order -- hence the suite-vs-alone difference). Forcing one START drop at seat
+2 reproduced the exact failure (13 identical FAIL lines). The authority now
+answers a READY that arrives after it started with START again (`architecture.md`,
+session phases); with the same forced drop the cell passes. Two seats were
+exposed the same way: one forced START drop at mixed-rtt60's seat 1 fails
+unfixed (seat 1 never RUNNING, sim 0 on both) and passes fixed.
+
+Seen in the same regression and NOT this defect: 4seat-rtt200's "no chain
+stall" check failed 1 of 8 runs alone on the unfixed tree (one seat stalls=1
+after a dual-initiation abort, 0 % loss) and 1 of 4 full runs on the fixed one.
+Open; not root-caused.
+
 **Not covered.** One injecting seat: organic episodes from several seats at
 once (true dual and triple initiation under a real game) have run only in
 `rb_driver_test`. The relay is seat 0's own process, so a relay that is slow

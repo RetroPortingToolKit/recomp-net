@@ -522,6 +522,23 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         if (pkt->local_slot < s->cfg.slot_count)
         {
             s->peer_ready[pkt->local_slot] = 1;
+            /* START goes out once (maybe_bootstrap). A seat only sends READY
+             * until it has seen START, so a READY that reaches the authority
+             * after it started is a seat whose START was lost -- and nothing
+             * else would ever move that seat to RUNNING: the rest of the room
+             * starts, waits on its input, and the match never begins. Answer
+             * it with START again (tick 0, as the first one said; a seat that
+             * is already running ignores it). Paced by the peer's READY
+             * (100 ms). Seats only: an observer's wire slot is at or past
+             * slot_count and never reaches here. */
+            if (s->is_sim_authority && s->start_sent && s->phase == RNET_PHASE_RUNNING &&
+                rnet_config_slot_occupied(&s->cfg, pkt->local_slot))
+            {
+                rnet_u8 sbuf[RNET_MAX_PACKET];
+                int slen = rnet_proto_encode_start(sbuf, sizeof(sbuf), s->cfg.protocol_magic,
+                                                   s->cfg.session_id, 0);
+                send_raw(s, sbuf, slen);
+            }
         }
         break;
     case RNET_PKT_START:
