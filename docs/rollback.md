@@ -408,6 +408,26 @@ sweep on it: 14/14, 0 forks, 0 NACKs in every cell. `rb_driver_test`'s
 follower-behind cells (the lagging seat stalls 50 ms every 10 ticks) hold it:
 on e06b75f they refuse 7 and 7 episodes and stall 6 and 7 times; here 0 and 0.
 
+**Also seen before the fix, through n64lle's lobby** (filed from branch
+feat/n64-lobby-notes, kept as the record):
+
+- **Measured again through n64lle's lobby (2026-09-25, `tools/rb_lobby.sh`,
+  online through a local recomp-net-server's input relay, 0 ms): the stall
+  does not always age out.** In one of fourteen two-process lobby matches
+  the follower refused the episode at tick 810 ("no snapshot at load tick",
+  ring oldest 770), the chain stalled there, and then the follower refused
+  EVERY later episode too (16 refusals in all, each "ring oldest = load -
+  40", i.e. one tick short), and `confirmed_through` stayed at 809 to the end of the match
+  (sim 1501, 691 ticks later) on both peers. No fork, the match drained, the
+  initiator's 33 corrections all changed its guest -- but for the last 45 % of
+  that match nothing past tick 809 was ever confirmed. The other thirteen
+  matches' stalls (0-4 per match) all cleared. So "waits for the tick to age
+  out" is not a bound: once the follower sits exactly one tick behind every
+  load tick, nothing ages. (n64lle `docs/NETPLAY.md` §7.)
+
+Same root cause -- the follower one tick short of every load tick -- which the
+hold above now covers. The lobby case has NOT been re-run on the fixed driver.
+
 ### More than two peers
 
 **Run, 2026-09-25**, on two harnesses: `rb_driver_test` (three and four forked
