@@ -27,6 +27,7 @@ set(RNET_CORE_SOURCES
   src/input/rnet_input_hist.c
   src/rollback/rnet_rollback.c
   src/rollback/rnet_hash_confirm.c
+  src/rollback/rnet_rb_driver.c
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
@@ -274,6 +275,12 @@ if(RNET_BUILD_TESTS)
   add_executable(input_contract_test tests/input_contract_test.c)
   target_link_libraries(input_contract_test PRIVATE recomp_net)
   add_test(NAME input_contract_test COMMAND input_contract_test)
+
+  # The episode driver: in-process contracts, then a forked pair over UDP
+  # loopback with the link simulator (both replay shapes, and a mixed pair).
+  add_executable(rb_driver_test tests/rb_driver_test.c)
+  target_link_libraries(rb_driver_test PRIVATE recomp_net)
+  add_test(NAME rb_driver_test COMMAND rb_driver_test)
 
   add_executable(rollback_episode_test tests/rollback_episode_test.c)
   target_link_libraries(rollback_episode_test PRIVATE recomp_net)
