@@ -304,6 +304,25 @@ Tip-hold now logs every exit with how long it actually held:
 every peer committed, tip-extend, aborted, peer aborted, yielded, watchdog
 expired). The runway is a ceiling, not a duration.
 
+### Measured on n64lle, not yet fixed here (2026-09-25)
+
+n64lle's two-process sweep (n64lle `docs/NETPLAY.md` §5, the incremental
+shape, Pokemon Stadium) forked nowhere, but shows two behaviours this driver
+owns:
+
+- **A follower that has not yet simulated the load tick refuses the episode**
+  ("RB follow refused ... no snapshot at load tick", the ring's newest being
+  load-1). It has nothing to correct -- it will simulate that tick on the true
+  rows -- but the NACK aborts the initiator's episode. 2 of 57 episodes at 0 ms,
+  3 of 53 at 60 ms RTT.
+- **After that abort the chain stalls on a digest the replay already
+  replaced.** The initiator's replay completed (it paid the correction, as the
+  rule above says) before the NACK arrived, but the hash chain still holds the
+  live, mispredicted digest for that tick; nothing re-notes it on the abort
+  path, so "RB chain stall" (ADVISORY) fires and the confirmed watermark waits
+  for the tick to age out. Every such stall in the sweep sat on a tick of a
+  NACKed episode.
+
 ### More than two peers
 
 Built, not exercised. Epochs carry the initiator's seat, dual initiation reads
