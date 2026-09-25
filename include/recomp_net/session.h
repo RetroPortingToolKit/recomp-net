@@ -231,7 +231,10 @@ void rnet_session_set_input_send_suppress(RNetSession *s, int suppress);
  */
 int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
                                       rnet_u32 state_hash);
-/* 1 if a peer FRAME_COMMIT is pending; copies and clears it. */
+/* 1 if a peer FRAME_COMMIT is pending; copies and clears it (FIFO). The
+ * sender is rnet_session_rb_last_take_from(): with more than two seats a
+ * hash chain is kept per peer, and one ring shared by every peer's commits
+ * would confirm a tick against whichever peer spoke last. */
 /* PSX-Link group scoping: accept rollback episode/state packets only from
  * `slot` (-1 = all, default). Input-plane packets are never filtered. */
 void rnet_session_set_rb_peer_slot(RNetSession *s, int slot);
@@ -261,6 +264,13 @@ int rnet_session_peek_input(const RNetSession *s, int slot, rnet_u32 wire_tick,
                             RNetInputSample *out);
 int rnet_session_peek_remote_input(const RNetSession *s, int slot, rnet_u32 wire_tick,
                                    RNetInputSample *out);
+/* One remote seat's input tip: the highest wire tick its ring holds. 1 and
+ * *tip set for an occupied remote seat, 0 otherwise. RNetSessionStats'
+ * highest_remote_wire is the HIGHEST over every remote seat, which is the
+ * one tip there is with two seats -- but with more, a seat that stopped
+ * sending hides behind the others, and a prediction cap measured against it
+ * never trips (the rollback driver uses this per seat). */
+int rnet_session_remote_tip(const RNetSession *s, int slot, rnet_u32 *tip);
 /* §56 pipeline diagnostics: ms since the remote row for wire_tick arrived
  * (first-wins latch). 0xffffffff if unknown / not yet arrived. Consumption
  * slack at admit = this value; ~0 means rows arrive just-in-time (no cushion
@@ -372,13 +382,16 @@ int rnet_session_send_modset(RNetSession *s, const char *text);
 int rnet_session_take_modset(RNetSession *s, char *out, rnet_u32 cap);
 int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
                                  const char *reason);
-/* 1 and fills status/reason when an ack has arrived since the last take. */
+/* 1 and fills status/reason when an ack has arrived since the last take.
+ * Latest-only PER SEAT, lowest seat first: with more than two seats every
+ * guest answers, and one slot for all of them let a second answer overwrite
+ * the first. rnet_session_rb_last_take_from() names the seat that answered. */
 int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
                                  rnet_u32 cap);
 
 /* Sender slot (packet header) of the rb_* message most recently returned by
- * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post, or -1
- * before any. Call it right after the take it describes. With two seats there
+ * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post /
+ * take_rb_frame_commit / take_modset_ack, or -1 before any. Call it right after the take it describes. With two seats there
  * is one peer and this is redundant; with more, an episode needs a BASELINE
  * and a POST from EVERY peer, and without the sender the first reply to
  * arrive would answer for all of them. */

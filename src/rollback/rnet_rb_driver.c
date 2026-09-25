@@ -14,8 +14,10 @@
  * 'RB chain stall', 'UNAPPLIED stage=', 'BOOT DIGEST MISMATCH', 'MOD SETS
  * DIFFER', 'MOD SET NOT AGREED', 'forced late row', 'tip-hold for', 'RB
  * tip-hold ended ... held=', 'RB quiesced', 'RB quiesce TIMED OUT', 'RB drain:
- * correction not opened', 'tip_runway='). Change a line only with every
- * script that parses it.
+ * correction not opened', 'tip_runway='), and n64lle's tools/rb_loopback.sh
+ * also reads 'RB follow deferred epoch=N span=', 'RB follow at our live tip'
+ * and the trailing 'epoch=N' of the RESIM line (its per-pair ledger). Change a
+ * line only with every script that parses it.
  */
 
 #include "recomp_net/rb_driver.h"
@@ -60,7 +62,13 @@ struct RNetRbDriver {
     /* Late-wire corrections that arrived while an episode was open and were
      * therefore never resimulated, per stage. See rb_reconcile_wire. */
     uint32_t           drop_stage_n[kRbTipHold + 1];
-    RNetHashConfirm    hc;
+    /* The FRAME_COMMIT hash chain, one per peer seat. With two seats only
+     * the one peer's is used and every rule is the one snesrecomp shipped.
+     * With more, a single ring took every peer's commits, so a tick was
+     * "confirmed" against whichever peer spoke last and the boot gate read
+     * whichever tick-0 digest landed first. A tick is confirmed when EVERY
+     * peer's chain has it (rb_hc_resolved). */
+    RNetHashConfirm    hc[RB_MAX_SLOTS];
 
     int      started;
     uint32_t sim;            /* authoritative local sim tick */
@@ -129,9 +137,9 @@ struct RNetRbDriver {
     /* Identity (survives start). */
     uint32_t local_build_fp;     /* our build fingerprint, 0 = not supplied */
     uint32_t local_content_fp;   /* our content/mod fingerprint */
-    uint32_t peer_build_fp;
-    uint32_t peer_content_fp;
-    uint8_t  peer_ident_seen;
+    uint32_t peer_build_fp[RB_MAX_SLOTS];
+    uint32_t peer_content_fp[RB_MAX_SLOTS];
+    uint32_t peer_ident_mask;    /* seats whose IDENT is in */
     /* Mod-set handshake. The host publishes and each peer confirms; nobody
      * simulates until it has settled, because a peer running a different set
      * is running a different game. */
@@ -139,19 +147,21 @@ struct RNetRbDriver {
     RNetRbModSetCheckFn modset_check;
     RNetRbModSetAdoptFn modset_adopt;
     uint8_t  modset_settled;    /* handshake finished, one way or the other */
+    uint32_t modset_ack_mask;   /* host: seats that confirmed the set */
     uint8_t  modset_ok;         /* ...and it finished in agreement */
     uint8_t  modset_sent;
     uint32_t modset_since_ms;
     char     modset_reason[96];
     uint8_t  ident_sent;
-    uint32_t chain_fork_tick;    /* last frame-commit fork reported */
-    uint32_t chain_pending_tick; /* mismatch under observation, 0 = none */
-    uint32_t chain_pending_ms;   /* when we first saw it */
+    /* Per peer seat, like the chains they watch. */
+    uint32_t chain_fork_tick[RB_MAX_SLOTS];    /* last frame-commit fork reported */
+    uint32_t chain_pending_tick[RB_MAX_SLOTS]; /* mismatch under observation, 0 = none */
+    uint32_t chain_pending_ms[RB_MAX_SLOTS];   /* when we first saw it */
     uint32_t boot_dig_local;
-    uint32_t boot_dig_peer;
+    uint32_t boot_dig_peer[RB_MAX_SLOTS];
     uint32_t boot_dig_hold_since_ms;
     uint8_t  boot_dig_local_valid;
-    uint8_t  boot_dig_peer_valid;
+    uint32_t boot_dig_peer_mask;        /* seats whose tick-0 digest is in */
     uint8_t  boot_dig_settled;
     uint8_t  boot_dig_waiting_logged;
     /* The match was REFUSED (boot digest, mod set): a stable code the host can
@@ -244,6 +254,60 @@ struct RNetRbDriver {
     uint32_t early_base_load[RB_MAX_SLOTS];
     RNetRbDigestParts early_base[RB_MAX_SLOTS];
     uint32_t begin_seen_seq[RB_MAX_SLOTS];
+
+    /* A BEGIN whose load tick we have not simulated yet (deferred follow).
+     *
+     * A follower that has not yet reached the load tick used to refuse the
+     * episode ("no snapshot at load tick") although it had nothing to
+     * correct: it would simulate that tick on the true rows anyway. The NACK
+     * aborted the initiator's episode and cost a 30-tick cooldown and a retry.
+     * Measured on n64lle at 0 ms: 2 of 57 episodes in one run, 24 of 56 in a
+     * rerun of the same cell -- whichever peer's tick clock happened to lead.
+     * The ring's newest snapshot was always load-1, i.e. the follower was
+     * exactly at the load tick, one field behind the initiator.
+     *
+     * Now it is held until our sim reaches the load tick (the live state then
+     * IS the snapshot keyed load -- see rb_begin_episode), bounded by half the
+     * episode budget so a NACK still lands before the initiator's own
+     * watchdog. Answers for the held epoch (BASELINE, POST, SEAL_ROWS) are
+     * held with it (rb_epoch_is_early). One at a time; a second BEGIN is
+     * arbitrated like any other (rb_defer_arbitrate). */
+    int      defer_valid;
+    uint32_t defer_epoch;
+    uint32_t defer_mismatch;
+    uint32_t defer_load;
+    uint32_t defer_target;
+    int      defer_slot;
+    uint8_t  defer_flags;
+    uint32_t defer_since_ms;
+    /* Counted for the drain report: follows that waited for the load tick,
+     * and follows that took the load snapshot at our own live tip. */
+    uint32_t n_follow_deferred;
+    uint32_t n_follow_at_tip;
+
+    /* SEAL_ROWS chunks for an epoch whose BEGIN has not opened here yet: a
+     * deferred follow, or a chunk that overtook its BEGIN under jitter. Same
+     * reasoning as early_post: rows that arrive early are still the rows. */
+#define RB_EARLY_SEAL_MAX 16
+    struct {
+        uint32_t epoch, base, target, row_begin;
+        int      slot;
+        uint16_t count;
+        RNetRbFrame rows[RNET_RB_SEAL_ROWS_CHUNK_MAX];
+    } early_seal[RB_EARLY_SEAL_MAX];
+    uint32_t early_seal_n;
+
+    /* Each replayed tick's digest, kept until the replay completes and then
+     * written into the hash chain and sent as FRAME_COMMITs (rb_replay_finish).
+     * The chain used to keep the LIVE (mispredicted) digest of every replayed
+     * tick; a commit re-primes the chain, but an episode that aborted after
+     * its replay (a peer NACK) left the stale digest in place, and "RB chain
+     * stall" then fired on the very tick the replay had already corrected --
+     * every stall in n64lle's 0 ms sweep sat on a NACKed episode. Held until
+     * the replay completes so that a replay undone by a tip restore leaves no
+     * trace. Indexed by tick - load; a span never exceeds the 64-row seal mask. */
+    uint32_t replay_dig[RNET_RB_PEER_SEAL_MASK_BITS];
+    uint64_t replay_dig_mask;
 
     /* Coordinated stop (rnet_rb_driver_request_quiesce). */
     RNetRbQuiesce quiesce;
@@ -400,6 +464,76 @@ static int rb_bit_slot(uint32_t bit)
         if (bit & (1u << i))
             return i;
     return -1;
+}
+
+static int rb_popcount(uint32_t m)
+{
+    int n = 0;
+    while (m) {
+        m &= m - 1u;
+        n++;
+    }
+    return n;
+}
+
+/* ── hash chain, one per peer ────────────────────────────────────────── */
+
+/* Our digest goes into every peer's chain; each peer's FRAME_COMMITs only
+ * into its own. The watermark is the lowest of them: a tick is confirmed only
+ * when every peer agrees with it. With one peer these are exactly the single
+ * chain the driver always had. */
+static void rb_hc_note_local(RNetRbDriver *d, uint32_t tick, uint32_t dig)
+{
+    uint32_t m = rb_expect_mask(d);
+    int i;
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        if (m & (1u << i))
+            rnet_hc_note_local(&d->hc[i], tick, dig);
+}
+
+static uint32_t rb_hc_resolved(const RNetRbDriver *d)
+{
+    uint32_t m = rb_expect_mask(d);
+    uint32_t best = 0u;
+    int any = 0, i;
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        uint32_t r;
+        if (!(m & (1u << i)))
+            continue;
+        r = rnet_hc_resolved_through(&d->hc[i]);
+        if (!any || r < best)
+            best = r;
+        any = 1;
+    }
+    return best;
+}
+
+static uint8_t rb_hc_confirm_through(const RNetRbDriver *d, uint32_t tick)
+{
+    uint32_t m = rb_expect_mask(d);
+    int i;
+    if (!m)
+        return 0u;
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        if ((m & (1u << i)) && !rnet_hc_confirm_through(&d->hc[i], tick))
+            return 0u;
+    return 1u;
+}
+
+static void rb_hc_prime_after(RNetRbDriver *d, uint32_t last_ok)
+{
+    int i;
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        rnet_hc_prime_after(&d->hc[i], last_ok);
+}
+
+static void rb_hc_heal(RNetRbDriver *d)
+{
+    uint32_t m = rb_expect_mask(d);
+    int i;
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        if (m & (1u << i))
+            (void)rnet_hc_heal_stale_gap(&d->hc[i]);
 }
 
 /* ── row helpers ─────────────────────────────────────────────────────── */
@@ -580,6 +714,21 @@ static int rb_load_sealed_rows(RNetRbDriver *d, uint32_t tick)
     return 1;
 }
 
+/* A replayed tick just ran: keep its digest for the chain (see replay_dig).
+ * The same digest the live path notes after the same tick, so the chain
+ * compares like with like. */
+static void rb_replay_note(RNetRbDriver *d, uint32_t tick)
+{
+    uint32_t off;
+    if (tick < d->corr.load_tick)
+        return;
+    off = tick - d->corr.load_tick;
+    if (off >= RNET_RB_PEER_SEAL_MASK_BITS)
+        return;
+    d->replay_dig[off] = d->host.digest_master(d->host.ctx);
+    d->replay_dig_mask |= 1ull << off;
+}
+
 /* One replayed tick, INLINE shape. */
 static int rb_advance_sim(void *ctx, uint32_t tick)
 {
@@ -592,6 +741,7 @@ static int rb_advance_sim(void *ctx, uint32_t tick)
         d->missing_tick = tick;
         return 0;
     }
+    rb_replay_note(d, tick);
     d->resim_ticks++;
     return 1;
 }
@@ -624,7 +774,7 @@ static uint32_t rb_vt_state_digest(void *ctx, uint32_t tick, uint32_t partition)
 static uint8_t rb_vt_hash_confirm_through(void *ctx, uint32_t tick)
 {
     RNetRbDriver *d = (RNetRbDriver *)ctx;
-    return rnet_hc_confirm_through(&d->hc, tick);
+    return rb_hc_confirm_through(d, tick);
 }
 
 /*
@@ -816,37 +966,68 @@ static void rb_refuse(RNetRbDriver *d, const char *code)
     d->host.request_return_to_lobby(d->host.ctx);
 }
 
+/* One peer's identity, next to ours, for a refusal line. */
+static void rb_log_peer_identity(RNetRbDriver *d, int seat)
+{
+    if (d->peer_ident_mask & (1u << seat))
+        rb_log(d, "  peer identity (seat %d): build ours=%08x "
+                  "peer=%08x%s, content ours=%08x peer=%08x%s\n",
+               seat, (unsigned)d->local_build_fp, (unsigned)d->peer_build_fp[seat],
+               d->local_build_fp == d->peer_build_fp[seat] ? "" : "  <-- DIFFERENT",
+               (unsigned)d->local_content_fp,
+               (unsigned)d->peer_content_fp[seat],
+               d->local_content_fp == d->peer_content_fp[seat] ? "" : "  <-- DIFFERENT");
+    else
+        rb_log(d, "  peer identity (seat %d) not in yet — it travels "
+                  "with the same tick and can lose the race by a hair. If "
+                  "no \"peer identity\" line follows, the peer predates the "
+                  "message, which is itself a likely cause.\n", seat);
+}
+
 static int rb_boot_digest_gate(RNetRbDriver *d)
 {
-    uint32_t local = 0u, peer = 0u;
+    uint32_t local = 0u;
+    uint32_t expect, missing, bad = 0u;
     uint32_t now;
+    int i;
 
     if (d->boot_dig_settled || !d->started)
         return 0;
+    expect = rb_expect_mask(d);
 
     if (d->boot_dig_local_valid) {
         local = d->boot_dig_local;
-    } else if (rnet_hc_local_digest(&d->hc, 0u, &local)) {
-        d->boot_dig_local = local;
-        d->boot_dig_local_valid = 1u;
-        /* Break tick 0 down, always, on both peers: the chain carries only the
-         * master digest, so a mismatch says the sides differ without saying
-         * WHERE. Establishing that on SNES took a long forensic pass over two
-         * logs and three wrong guesses, every one of which would have been a
-         * glance had the partitions been in the log. What to print is the
-         * engine's to say. */
-        if (d->host.boot_digest_noted)
-            d->host.boot_digest_noted(d->host.ctx);
     } else {
-        return 1; /* our own tick 0 not published yet — nothing to compare */
+        int first = rb_bit_slot(expect);
+        if (first >= 0 && rnet_hc_local_digest(&d->hc[first], 0u, &local)) {
+            d->boot_dig_local = local;
+            d->boot_dig_local_valid = 1u;
+            /* Break tick 0 down, always, on both peers: the chain carries only
+             * the master digest, so a mismatch says the sides differ without
+             * saying WHERE. Establishing that on SNES took a long forensic pass
+             * over two logs and three wrong guesses, every one of which would
+             * have been a glance had the partitions been in the log. What to
+             * print is the engine's to say. */
+            if (d->host.boot_digest_noted)
+                d->host.boot_digest_noted(d->host.ctx);
+        } else {
+            return 1; /* our own tick 0 not published yet — nothing to compare */
+        }
     }
 
-    if (d->boot_dig_peer_valid) {
-        peer = d->boot_dig_peer;
-    } else if (rnet_hc_peer_digest(&d->hc, 0u, &peer)) {
-        d->boot_dig_peer = peer;
-        d->boot_dig_peer_valid = 1u;
-    } else {
+    /* Every peer's tick 0, not the first to land: with more than two seats a
+     * peer that booted differently is as fatal as it is with two. */
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        uint32_t peer = 0u;
+        if (!(expect & (1u << i)) || (d->boot_dig_peer_mask & (1u << i)))
+            continue;
+        if (rnet_hc_peer_digest(&d->hc[i], 0u, &peer)) {
+            d->boot_dig_peer[i] = peer;
+            d->boot_dig_peer_mask |= 1u << i;
+        }
+    }
+    missing = expect & ~d->boot_dig_peer_mask;
+    if (missing) {
         now = rb_now(d);
         if (d->boot_dig_hold_since_ms == 0u)
             d->boot_dig_hold_since_ms = now;
@@ -858,9 +1039,10 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
         if ((uint32_t)(now - d->boot_dig_hold_since_ms) >
             RB_BOOT_DIGEST_TIMEOUT_MS) {
             rb_log(d, "RB boot digest TIMED OUT after %u ms — "
-                      "starting UNVERIFIED. If this match desyncs, suspect the "
-                      "starting state, not the netcode.\n",
-                   (unsigned)RB_BOOT_DIGEST_TIMEOUT_MS);
+                      "starting UNVERIFIED (seats %x never sent tick 0). If this "
+                      "match desyncs, suspect the starting state, not the "
+                      "netcode.\n",
+                   (unsigned)RB_BOOT_DIGEST_TIMEOUT_MS, (unsigned)missing);
             d->boot_dig_settled = 1u;
             return 0;
         }
@@ -868,7 +1050,10 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
     }
 
     d->boot_dig_settled = 1u;
-    if (local != peer) {
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        if ((expect & (1u << i)) && d->boot_dig_peer[i] != local)
+            bad |= 1u << i;
+    if (bad) {
         /* END THE MATCH. This used to warn and play on, and a real session did
          * exactly that: the mismatch was named at tick 0 and the first fork
          * landed at tick 4681, about 78 seconds of a fight that never had a
@@ -876,26 +1061,18 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
          * differently, so there is nothing downstream that can recover it and
          * nothing to be gained by continuing.
          *
-         * Both peers reach this independently and agree, so both return to the
-         * lobby rather than one waiting on the other. */
-        rb_log(d, "RB BOOT DIGEST MISMATCH ours=%08x peer=%08x — "
-                  "the two sides did not start from the same state, so this "
-                  "match cannot be played. Rollback corrects inputs, not a "
-                  "divergent start.\n",
-               (unsigned)local, (unsigned)peer);
-        if (d->peer_ident_seen)
-            rb_log(d, "  peer identity: build ours=%08x "
-                      "peer=%08x%s, content ours=%08x peer=%08x%s\n",
-                   (unsigned)d->local_build_fp, (unsigned)d->peer_build_fp,
-                   d->local_build_fp == d->peer_build_fp ? "" : "  <-- DIFFERENT",
-                   (unsigned)d->local_content_fp,
-                   (unsigned)d->peer_content_fp,
-                   d->local_content_fp == d->peer_content_fp ? "" : "  <-- DIFFERENT");
-        else
-            rb_log(d, "  peer identity not in yet — it travels "
-                      "with the same tick and can lose the race by a hair. If "
-                      "no \"peer identity\" line follows, the peer predates the "
-                      "message, which is itself a likely cause.\n");
+         * Every peer reaches this independently and agrees, so all return to
+         * the lobby rather than one waiting on another. */
+        for (i = 0; i < RB_MAX_SLOTS; ++i) {
+            if (!(bad & (1u << i)))
+                continue;
+            rb_log(d, "RB BOOT DIGEST MISMATCH ours=%08x peer=%08x (seat %d) — "
+                      "the two sides did not start from the same state, so this "
+                      "match cannot be played. Rollback corrects inputs, not a "
+                      "divergent start.\n",
+                   (unsigned)local, (unsigned)d->boot_dig_peer[i], i);
+            rb_log_peer_identity(d, i);
+        }
         if (d->allow_boot_fork) {
             rb_log(d, "  %s=1 — "
                       "continuing anyway; every episode will fork at its "
@@ -905,7 +1082,8 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
         rb_refuse(d, "boot_digest_mismatch");
         return 0;
     }
-    rb_log(d, "RB boot digest agreed (%08x)\n", (unsigned)local);
+    rb_log(d, "RB boot digest agreed (%08x)%s\n", (unsigned)local,
+           rb_popcount(expect) > 1 ? " with every peer" : "");
     return 0;
 }
 
@@ -952,9 +1130,13 @@ static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
  * "we could not confirm" has to be a refusal rather than a shrug: an
  * unverified match is exactly the thing this exists to prevent.
  *
- * Seat 0 is the host. With more than two seats only the most recent ack is
- * held by the session, so settlement is on the first peer to answer: the
- * handshake is not yet per-peer (docs/rollback.md, "More than two peers").
+ * Seat 0 is the host, and it settles only once EVERY peer has confirmed (the
+ * session keeps each seat's latest answer). It used to settle on the first
+ * answer, and the session kept one answer for all seats, so with more than two
+ * a second guest's answer overwrote the first and a guest that could not run
+ * the set could be outvoted by one that could. A guest answers every copy the
+ * host sends, not only the first: the host re-sends until it holds them all,
+ * and an answer lost on the link would otherwise end the match on the bound.
  */
 #define RB_MODSET_TIMEOUT_MS 4000u
 
@@ -985,8 +1167,14 @@ static void rb_modset_pump(RNetRbDriver *d)
     rnet_u8 status = 0;
     char reason[96];
 
-    if (!s || d->modset_settled || !d->local_modset)
+    if (!s || !d->local_modset)
         return;
+    if (d->modset_settled) {
+        if (!host && rnet_session_take_modset(s, text, sizeof(text)))
+            rnet_session_send_modset_ack(s, d->modset_ok ? 0u : 1u,
+                                         d->modset_ok ? "" : "cannot honour the host's set");
+        return;
+    }
     if (d->modset_since_ms == 0u)
         d->modset_since_ms = rb_now(d);
 
@@ -1000,17 +1188,25 @@ static void rb_modset_pump(RNetRbDriver *d)
             if (rnet_session_send_modset(s, t) == 0)
                 d->modset_sent = 1u;
         }
-        if (rnet_session_take_modset_ack(s, &status, reason, sizeof(reason))) {
+        while (rnet_session_take_modset_ack(s, &status, reason, sizeof(reason))) {
+            uint32_t bit = rb_from_bit(d, rnet_session_rb_last_take_from(s));
+            if (!bit)
+                continue;   /* a seat that takes no part */
             if (status == 0u) {
-                d->modset_settled = 1u;
-                d->modset_ok = 1u;
-                rb_log(d, "peer confirmed the mod set\n");
+                if (!(d->modset_ack_mask & bit))
+                    rb_log(d, "peer confirmed the mod set (seat %d)\n", rb_bit_slot(bit));
+                d->modset_ack_mask |= bit;
             } else {
                 char why[160];
-                snprintf(why, sizeof(why), "peer reports: %s",
+                snprintf(why, sizeof(why), "peer (seat %d) reports: %s", rb_bit_slot(bit),
                          reason[0] ? reason : "(no reason given)");
                 rb_modset_fail(d, why);
+                return;
             }
+        }
+        if ((d->modset_ack_mask & rb_expect_mask(d)) == rb_expect_mask(d)) {
+            d->modset_settled = 1u;
+            d->modset_ok = 1u;
             return;
         }
     } else if (rnet_session_take_modset(s, text, sizeof(text))) {
@@ -1045,10 +1241,18 @@ static void rb_modset_pump(RNetRbDriver *d)
     }
 
     if ((uint32_t)(rb_now(d) - d->modset_since_ms) > RB_MODSET_TIMEOUT_MS)
-        rb_modset_fail(d, host ? "the peer never confirmed it (an older build "
-                                 "cannot answer)"
-                               : "the host never published one (an older build "
-                                 "does not send it)");
+    {
+        char why[160];
+        if (host)
+            snprintf(why, sizeof(why), "the peer never confirmed it (seats %x of %x "
+                     "answered; an older build cannot answer)",
+                     (unsigned)(d->modset_ack_mask & rb_expect_mask(d)),
+                     (unsigned)rb_expect_mask(d));
+        else
+            snprintf(why, sizeof(why), "the host never published one (an older build "
+                     "does not send it)");
+        rb_modset_fail(d, why);
+    }
 }
 
 /*
@@ -1384,7 +1588,8 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
     }
 
     rnet_ih_reset(&d->ih, slots);
-    rnet_hc_reset(&d->hc);
+    for (i = 0; i < RB_MAX_SLOTS; ++i)
+        rnet_hc_reset(&d->hc[i]);
 
     /* Seed a neutral row per seat, and tell the history what neutral IS, so
      * hold-last never falls back to input_hist's PSX-shaped 0xFFFF. */
@@ -1397,12 +1602,14 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
 
     rb_bind_sched(d);
     /* Filter rb episode traffic to the one peer when there is one. With more
-     * seats every peer takes part, so accept all and attribute per sender. */
-    if (rb_session(d))
+     * peers every one takes part, so accept all and attribute per sender
+     * (rnet_session_rb_last_take_from). "One peer" is the expected set, not
+     * the seat count: a four-seat room with one other occupant has one peer. */
+    if (rb_session(d)) {
+        uint32_t expect = rb_expect_mask(d);
         rnet_session_set_rb_peer_slot(rb_session(d),
-                                      (slots == 2 && rb_local_slot(d) < 2)
-                                          ? 1 - rb_local_slot(d)
-                                          : -1);
+                                      rb_popcount(expect) == 1 ? rb_bit_slot(expect) : -1);
+    }
 
     d->sim = 0;
     d->stage = kRbIdle;
@@ -1462,7 +1669,9 @@ static void rb_send_identity(RNetRbDriver *d)
      * (tick 0, or the next multiple of 8), and then never sent at all -- so
      * only one side could ever see a mod-set difference and refuse, and the
      * other left on "peer disconnected" without knowing why. */
-    if (d->peer_ident_seen && d->ident_sent)
+    /* ...every peer's identity, not the first one in: with more than two
+     * seats a peer that starts late would otherwise never hear ours. */
+    if ((d->peer_ident_mask & rb_expect_mask(d)) == rb_expect_mask(d) && d->ident_sent)
         return;
     /* Validation (FORCE_MOD_MISMATCH=1): claim a mod set we do not have, so
      * the refusal path can be proven to fire. A refusal that has never
@@ -1477,7 +1686,7 @@ static void rb_send_identity(RNetRbDriver *d)
     }
     /* Every few ticks, not every tick: one trip is all it needs, and a peer
      * that is simply older should not be pelted. */
-    if ((d->sim % 8u) != 0u && !d->peer_ident_seen)
+    if ((d->sim % 8u) != 0u && !d->peer_ident_mask)
         return;
     if (rnet_session_send_rb_sync(
             s, 0u, d->local_build_fp, d->local_content_fp, 0u,
@@ -1700,7 +1909,24 @@ static void rb_replay_missing_abort(RNetRbDriver *d)
  * on the corrected timeline. */
 static void rb_replay_finish(RNetRbDriver *d)
 {
+    RNetSession *s = rb_session(d);
+    uint32_t off;
+
     d->rewound = 0;
+    /* The replayed ticks' digests replace the live ones in the chain -- ours,
+     * and, by FRAME_COMMIT, every peer's copy of ours. A commit re-primes the
+     * chain anyway; an episode that ends any other way after this point (a
+     * NACK or abort while verifying) used to leave the mispredicted digests
+     * behind, and the chain stalled on a tick this replay had already fixed. */
+    for (off = 0; off < RNET_RB_PEER_SEAL_MASK_BITS; ++off) {
+        uint32_t t = d->corr.load_tick + off;
+        if (!(d->replay_dig_mask & (1ull << off)))
+            continue;
+        rb_hc_note_local(d, t, d->replay_dig[off]);
+        if (s)
+            rnet_session_send_rb_frame_commit(s, t, d->replay_dig[off]);
+    }
+    d->replay_dig_mask = 0u;
     /* What was owed is paid the moment the span has been re-run on sealed --
      * i.e. authoritative -- rows, whether or not the episode then commits.
      * Waiting for the commit re-opened episodes for ticks already fixed: a
@@ -1746,6 +1972,7 @@ static int rb_run_replay(RNetRbDriver *d)
         return 0;
     }
     d->rewound = 1;
+    d->replay_dig_mask = 0u;
     rb_send_baseline(d);
     /* rb_send_baseline compares digests and may abort the episode outright on
      * a fork, which clears corr and resets the session. Carrying on into the
@@ -1823,7 +2050,7 @@ static void rb_commit_episode(RNetRbDriver *d)
     /* Ticks through the target are now agreed; drop the live-invent
      * FRAME_COMMITs that preceded the correction so the watermark restarts
      * from a tick both peers actually ran. */
-    rnet_hc_prime_after(&d->hc, d->corr.target_tick);
+    rb_hc_prime_after(d, d->corr.target_tick);
     rnet_sched_note_episode_boundary();
     /* Counted, not inferred: on SNES tip-hold was graded "present" for weeks
      * while the transition into it failed on every episode, and nothing in
@@ -1960,6 +2187,70 @@ static int rb_tip_extend(RNetRbDriver *d, uint32_t tick, int slot, int notify_pe
     return 1;
 }
 
+/* ── early seal rows ─────────────────────────────────────────────────── */
+
+static int rb_epoch_is_early(const RNetRbDriver *d, uint32_t epoch);
+
+/* A SEAL_ROWS chunk for a peer epoch that has not opened here yet (see
+ * early_seal). Sanitized on arrival, like every row. */
+static void rb_early_seal_hold(RNetRbDriver *d, uint32_t epoch, uint32_t base,
+                               uint32_t target, int slot, uint32_t row_begin,
+                               const RNetRbFrame *rows, uint16_t count)
+{
+    uint32_t n;
+    if (count > RNET_RB_SEAL_ROWS_CHUNK_MAX)
+        count = RNET_RB_SEAL_ROWS_CHUNK_MAX;
+    if (d->early_seal_n >= RB_EARLY_SEAL_MAX) {
+        rb_log(d, "RB SEAL_ROWS epoch=%u held early, but the buffer is full "
+                  "(%u chunks) — the oldest (epoch=%u) is dropped\n",
+               (unsigned)epoch, (unsigned)RB_EARLY_SEAL_MAX,
+               (unsigned)d->early_seal[0].epoch);
+        memmove(&d->early_seal[0], &d->early_seal[1],
+                sizeof(d->early_seal[0]) * (RB_EARLY_SEAL_MAX - 1u));
+        d->early_seal_n = RB_EARLY_SEAL_MAX - 1u;
+    }
+    n = d->early_seal_n++;
+    d->early_seal[n].epoch = epoch;
+    d->early_seal[n].base = base;
+    d->early_seal[n].target = target;
+    d->early_seal[n].slot = slot;
+    d->early_seal[n].row_begin = row_begin;
+    d->early_seal[n].count = count;
+    memcpy(d->early_seal[n].rows, rows, sizeof(RNetRbFrame) * count);
+}
+
+/* The episode just opened as a follower: apply the chunks that were waiting
+ * for it, in arrival order (a narrower chunk sent before a tip-extend is
+ * refused by the core as stale; the re-sent wider one is taken). Anything held
+ * for another epoch is for an episode that will now never open here. */
+static void rb_early_seal_take(RNetRbDriver *d)
+{
+    uint32_t i, n = 0u;
+    for (i = 0; i < d->early_seal_n; ++i) {
+        if (d->early_seal[i].epoch != d->corr.epoch_id)
+            continue;
+        rnet_rb_apply_peer_seal_rows(d->rb, d->early_seal[i].epoch,
+                                     d->early_seal[i].base, d->early_seal[i].target,
+                                     (int32_t)d->early_seal[i].slot,
+                                     d->early_seal[i].row_begin, d->early_seal[i].rows,
+                                     d->early_seal[i].count);
+        n++;
+    }
+    if (n)
+        rb_log(d, "RB SEAL_ROWS epoch=%u: %u chunk(s) taken from the early buffer\n",
+               (unsigned)d->corr.epoch_id, (unsigned)n);
+    /* Keep what is still early for another episode (see early_post_mask). */
+    for (i = 0, n = 0u; i < d->early_seal_n; ++i) {
+        if (d->early_seal[i].epoch == d->corr.epoch_id ||
+            !rb_epoch_is_early(d, d->early_seal[i].epoch))
+            continue;
+        if (n != i)
+            d->early_seal[n] = d->early_seal[i];
+        n++;
+    }
+    d->early_seal_n = n;
+}
+
 /* ── episode open ────────────────────────────────────────────────────── */
 
 static int rb_cooldown_active(const RNetRbDriver *d)
@@ -2053,14 +2344,27 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
     } else {
         load = peer_load;
         target = peer_target;
+        /* The load tick is our live tip: we have simulated everything before
+         * it and nothing of it. A snapshot keyed T is the state BEFORE tick T
+         * runs, which is exactly the machine as it stands between two polls
+         * at sim == T -- the same state the live admit of T would have saved.
+         * Take it now instead of refusing (see defer_valid for what refusing
+         * cost). Never mid-replay: the machine is then not at sim. */
+        if (!rb_snap_has(d, load) && load == d->sim && !d->in_resim &&
+            d->host.snap_save(d->host.ctx, load)) {
+            d->n_follow_at_tip++;
+            rb_log(d, "RB follow at our live tip epoch=%u load=%u — the load "
+                      "snapshot is the live state; taken now\n",
+                   (unsigned)peer_epoch, (unsigned)load);
+        }
         if (!rb_snap_has(d, load)) {
             /* Every BEGIN we turn down has to be countable, or the two peers'
              * episode ledgers cannot be reconciled — which is exactly how a
              * spurious follow episode hid in the counts. */
             rb_log(d, "RB follow refused epoch=%u span=%u..%u — "
-                      "no snapshot at load tick (ring oldest=%u)\n",
+                      "no snapshot at load tick (ring oldest=%u, our sim=%u)\n",
                    (unsigned)peer_epoch, (unsigned)load, (unsigned)target,
-                   (unsigned)rb_snap_oldest_or0(d));
+                   (unsigned)rb_snap_oldest_or0(d), (unsigned)d->sim);
             rb_send_nack(d, peer_epoch, mismatch_tick, load, slot);
             return 0;
         }
@@ -2182,16 +2486,25 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
         d->ep_initiated++;
     else
         d->ep_followed++;
-    /* Answers that beat this BEGIN here (see early_post_mask). Anything held
-     * for a different epoch is for an episode that will now never open. */
+    /* Answers that beat this BEGIN here (see early_post_mask). One held for
+     * another epoch is dropped only if that episode can no longer open here
+     * (its seat has since sent a BEGIN at or past it). With more than two
+     * seats two episodes are routinely in flight at once, and discarding the
+     * other's answers here cost it: a follower that switched to the winning
+     * episode had already thrown away the winner's POST while briefly
+     * following the loser, and waited out the 2 s budget for it. */
     if (!as_initiator) {
         uint32_t m = d->early_post_mask;
+        uint32_t keep_post = 0u, keep_base = 0u;
         while (m) {
             uint32_t bit = m & (~m + 1u);
             int i = rb_bit_slot(bit);
             m &= ~bit;
-            if (d->early_post_epoch[i] != d->corr.epoch_id)
+            if (d->early_post_epoch[i] != d->corr.epoch_id) {
+                if (rb_epoch_is_early(d, d->early_post_epoch[i]))
+                    keep_post |= bit;
                 continue;
+            }
             d->peer_post_digest[i] = d->early_post_digest[i];
             d->peer_post_target[i] = d->early_post_target[i];
             d->peer_post_mask |= bit;
@@ -2204,29 +2517,97 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
             int i = rb_bit_slot(bit);
             m &= ~bit;
             if (d->early_base_epoch[i] != d->corr.epoch_id ||
-                d->early_base_load[i] != d->corr.load_tick)
+                d->early_base_load[i] != d->corr.load_tick) {
+                if (d->early_base_epoch[i] != d->corr.epoch_id &&
+                    rb_epoch_is_early(d, d->early_base_epoch[i]))
+                    keep_base |= bit;
                 continue;
+            }
             d->peer_base[i] = d->early_base[i];
             d->peer_base_mask |= bit;
             rb_log(d, "RB BASELINE epoch=%u taken from the early buffer\n",
                    (unsigned)d->corr.epoch_id);
         }
-        d->early_post_mask = 0u;
-        d->early_base_mask = 0u;
+        d->early_post_mask = keep_post;
+        d->early_base_mask = keep_base;
+        rb_early_seal_take(d);
     }
     /* A resim episode is the whole point of rollback and must leave a trace:
      * "mispredict=N" counts DETECTIONS (and one of its call sites is the
      * refusal path), so it cannot answer "did we actually rewind and
      * replay?". load..target is the replayed span, INCLUSIVE — a one-tick
      * span replays 1 frame, not 0. */
+    /* epoch= is last so the substrings harnesses count ('RESIM episode',
+     * 'initiator', 'follower') are unchanged; an N-seat ledger pairs each
+     * initiated epoch with every other seat's answer to it. */
     rb_log_raw(d, "rbe: RESIM episode #%u %s slot=%d mismatch=%u load=%u target=%u "
-                  "(rewind %u frames, replay %u)\n",
+                  "(rewind %u frames, replay %u) epoch=%u\n",
                (unsigned)d->episode_count,
                as_initiator ? "initiator" : "follower", slot,
                (unsigned)mismatch_tick, (unsigned)load, (unsigned)target,
                (unsigned)(d->sim > load ? d->sim - load : 0u),
-               (unsigned)(target >= load ? target - load + 1u : 0u));
+               (unsigned)(target >= load ? target - load + 1u : 0u),
+               (unsigned)d->corr.epoch_id);
     return 1;
+}
+
+/* ── deferred follow ─────────────────────────────────────────────────── */
+
+/* Follow a peer's BEGIN now, or hold it until our sim reaches its load tick
+ * (defer_valid). A load tick we have passed, or are standing on, is followed
+ * at once -- rb_begin_episode takes the snapshot at our tip if it has to. */
+static void rb_follow_or_defer(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
+                               uint32_t load, uint32_t target, int slot, uint8_t flags)
+{
+    if (load > d->sim && mismatch != 0u && d->stage == kRbIdle) {
+        if (!d->defer_valid || d->defer_epoch != epoch) {
+            d->defer_valid = 1;
+            d->defer_epoch = epoch;
+            d->defer_mismatch = mismatch;
+            d->defer_load = load;
+            d->defer_target = target;
+            d->defer_slot = slot;
+            d->defer_flags = flags;
+            d->defer_since_ms = rb_now(d);
+            d->n_follow_deferred++;
+            rb_log(d, "RB follow deferred epoch=%u span=%u..%u — our sim=%u has "
+                      "not reached the load tick; following when it does\n",
+                   (unsigned)epoch, (unsigned)load, (unsigned)target, (unsigned)d->sim);
+        }
+        return;
+    }
+    rb_begin_episode(d, mismatch, slot, 0, load, target, epoch, flags);
+}
+
+/* Once a poll: follow the held BEGIN when our sim reaches its load tick, or
+ * refuse it on the bound. Half the episode budget, so the NACK reaches the
+ * initiator before its own watchdog would have ended the episode anyway. */
+static void rb_defer_pump(RNetRbDriver *d)
+{
+    uint32_t waited;
+    if (!d->defer_valid || d->stage != kRbIdle)
+        return;
+    waited = rb_now(d) - d->defer_since_ms;
+    if (d->sim >= d->defer_load) {
+        d->defer_valid = 0;
+        rb_log(d, "RB follow resumed epoch=%u after %u ms — our sim=%u reached "
+                  "load=%u\n",
+               (unsigned)d->defer_epoch, (unsigned)waited, (unsigned)d->sim,
+               (unsigned)d->defer_load);
+        rb_begin_episode(d, d->defer_mismatch, d->defer_slot, 0, d->defer_load,
+                         d->defer_target, d->defer_epoch, d->defer_flags);
+        return;
+    }
+    if (waited > d->seal_timeout_ms / 2u) {
+        d->defer_valid = 0;
+        rb_log(d, "RB follow refused epoch=%u span=%u..%u — no snapshot at load "
+                  "tick: our sim=%u did not reach it within %u ms; NACK at "
+                  "frontier=%u\n",
+               (unsigned)d->defer_epoch, (unsigned)d->defer_load,
+               (unsigned)d->defer_target, (unsigned)d->sim, (unsigned)waited,
+               (unsigned)rnet_rb_resolved_through(d->rb));
+        rb_send_nack(d, d->defer_epoch, d->defer_mismatch, d->defer_load, d->defer_slot);
+    }
 }
 
 /* ── wire ingress ────────────────────────────────────────────────────── */
@@ -2312,6 +2693,9 @@ static int rb_epoch_is_early(const RNetRbDriver *d, uint32_t epoch)
         return 0;
     if (d->stage != kRbIdle && epoch == d->corr.epoch_id)
         return 0;
+    /* A BEGIN held until we reach its load tick: its answers are early too. */
+    if (d->defer_valid && epoch == d->defer_epoch)
+        return 1;
     return (epoch >> RNET_RB_EPOCH_SLOT_BITS) > d->begin_seen_seq[init];
 }
 
@@ -2434,6 +2818,17 @@ static void rb_drain_wire(RNetRbDriver *d)
                     if (!rb_tip_extend(d, c, (int)slot, 0))
                         rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN,
                                          "cannot follow peer tip-extend");
+                } else if (d->defer_valid && epoch == d->defer_epoch) {
+                    /* The episode we are waiting to follow grew before we
+                     * reached it: follow the grown span. Its re-sent rows are
+                     * held with the rest (rb_epoch_is_early). */
+                    if (c > d->defer_target) {
+                        rb_log(d, "RB follow deferred epoch=%u tip-extended "
+                                  "%u→%u while we wait for load=%u\n",
+                               (unsigned)epoch, (unsigned)d->defer_target,
+                               (unsigned)c, (unsigned)d->defer_load);
+                        d->defer_target = c;
+                    }
                 } else {
                     /* We already released that episode (our runway is shorter
                      * than the round trip) or never held it. Refuse, so the
@@ -2458,10 +2853,24 @@ static void rb_drain_wire(RNetRbDriver *d)
             }
             /* Concurrent dual initiation: lower initiator seat wins, the
              * loser yields and follows. The initiator's seat is in the epoch
-             * id, so this holds for any number of seats. */
+             * id, so this holds for any number of seats.
+             *
+             * It is the episode's initiator that is compared, not our own
+             * seat: with more than two seats a FOLLOWER can hold the losing
+             * episode when the winning BEGIN arrives, and it must switch too
+             * -- the loser's initiator is about to yield, so staying would
+             * only NACK the winner and kill both. With two seats a follower's
+             * episode is always the other seat's, the comparison is false, and
+             * the rule is the one it always was. */
             if (d->stage != kRbIdle) {
                 int peer_init = (int)rnet_rb_epoch_initiator(epoch);
-                if (d->initiator && peer_init < rb_local_slot(d)) {
+                int held_init = (int)rnet_rb_epoch_initiator(d->corr.epoch_id);
+                if (peer_init < held_init) {
+                    if (!d->initiator)
+                        rb_log(d, "RB follow switched epoch=%u → epoch=%u — the "
+                                  "lower seat's episode wins, and seat %d will yield "
+                                  "to it too\n",
+                               (unsigned)d->corr.epoch_id, (unsigned)epoch, held_init);
                     d->tiphold_exit_why = "yielded to a peer BEGIN";
                     rb_episode_clear(d);
                 } else {
@@ -2495,7 +2904,39 @@ static void rb_drain_wire(RNetRbDriver *d)
                     break;
                 }
             }
-            rb_begin_episode(d, a, (int)slot, 0, b, c, epoch, flags);
+            /* A BEGIN held for its load tick (defer_valid) is arbitrated like
+             * an open episode: the lower initiator seat wins, and a newer
+             * episode from the same seat means the held one has ended there. */
+            if (d->defer_valid) {
+                uint32_t held_init = rnet_rb_epoch_initiator(d->defer_epoch);
+                uint32_t new_init = rnet_rb_epoch_initiator(epoch);
+                if (epoch == d->defer_epoch)
+                    break;   /* a duplicate of the one we hold */
+                if (new_init < held_init ||
+                    (new_init == held_init &&
+                     (epoch >> RNET_RB_EPOCH_SLOT_BITS) >
+                         (d->defer_epoch >> RNET_RB_EPOCH_SLOT_BITS))) {
+                    rb_log(d, "RB follow refused epoch=%u span=%u..%u — superseded "
+                              "by epoch=%u before we reached its load tick; NACK "
+                              "at frontier=%u\n",
+                           (unsigned)d->defer_epoch, (unsigned)d->defer_load,
+                           (unsigned)d->defer_target, (unsigned)epoch,
+                           (unsigned)rnet_rb_resolved_through(d->rb));
+                    rb_send_nack(d, d->defer_epoch, d->defer_mismatch, d->defer_load,
+                                 d->defer_slot);
+                    d->defer_valid = 0;
+                } else {
+                    rb_log(d, "RB follow refused epoch=%u — busy waiting to follow "
+                              "epoch=%u (its seat is lower); NACK at frontier=%u\n",
+                           (unsigned)epoch, (unsigned)d->defer_epoch,
+                           (unsigned)rnet_rb_resolved_through(d->rb));
+                    rnet_session_send_rb_sync(
+                        s, epoch, a, b, rnet_rb_resolved_through(d->rb),
+                        slot, RNET_RB_SYNC_OP_NACK, 0u);
+                    break;
+                }
+            }
+            rb_follow_or_defer(d, epoch, a, b, c, (int)slot, flags);
             break;
         case RNET_RB_SYNC_OP_NACK:
             if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
@@ -2506,6 +2947,18 @@ static void rb_drain_wire(RNetRbDriver *d)
             }
             break;
         case RNET_RB_SYNC_OP_ABORT:
+            if (d->defer_valid && epoch == d->defer_epoch) {
+                /* The episode we were waiting to follow ended before we
+                 * reached it. We never opened it, so it is a refusal on our
+                 * side of the ledger -- counted, never silent -- and no NACK:
+                 * its initiator has already let it go. */
+                rb_log(d, "RB follow refused epoch=%u span=%u..%u — its initiator "
+                          "aborted it (class %u) before we reached its load tick\n",
+                       (unsigned)epoch, (unsigned)d->defer_load,
+                       (unsigned)d->defer_target, (unsigned)a);
+                d->defer_valid = 0;
+                break;
+            }
             if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
                 /* Say so. Clearing silently made the two peers' logs disagree
                  * about the same session — measured 9 aborts on the initiator
@@ -2524,29 +2977,35 @@ static void rb_drain_wire(RNetRbDriver *d)
                     d->sim + (a == RNET_RB_ABORT_CLASS_REALIGN ? 0u : RB_COOLDOWN_TICKS);
             }
             break;
-        case RNET_RB_SYNC_OP_IDENT:
+        case RNET_RB_SYNC_OP_IDENT: {
+            /* Per seat: every peer's identity is judged, each once. */
+            uint32_t bit = rb_from_bit(d, from);
+            int seat = rb_bit_slot(bit);
+            if (!bit)
+                break;
             /* Retransmits of an identity already judged say nothing new; a
              * refusal is one verdict, not one per copy. */
-            if (d->peer_ident_seen && d->peer_build_fp == a && d->peer_content_fp == b)
+            if ((d->peer_ident_mask & bit) && d->peer_build_fp[seat] == a &&
+                d->peer_content_fp[seat] == b)
                 break;
-            d->peer_build_fp = a;
-            d->peer_content_fp = b;
-            d->peer_ident_seen = 1u;
+            d->peer_build_fp[seat] = a;
+            d->peer_content_fp[seat] = b;
+            d->peer_ident_mask |= bit;
             if ((d->local_build_fp | d->local_content_fp) != 0u) {
                 int build_ok = (a == d->local_build_fp);
                 int content_ok = (b == rb_claimed_content_fp(d));
                 if (content_ok && build_ok) {
                     rb_log(d, "peer identity matches "
-                              "(build=%08x content=%08x)\n",
-                           (unsigned)a, (unsigned)b);
+                              "(seat %d: build=%08x content=%08x)\n",
+                           seat, (unsigned)a, (unsigned)b);
                     break;
                 }
                 if (!build_ok)
-                    rb_log(d, "peer BUILD differs ours=%08x "
+                    rb_log(d, "peer BUILD differs (seat %d) ours=%08x "
                               "peer=%08x — not refused on its own, because a "
                               "build can differ without changing what the guest "
                               "simulates. The boot digest is the arbiter.\n",
-                           (unsigned)d->local_build_fp, (unsigned)a);
+                           seat, (unsigned)d->local_build_fp, (unsigned)a);
                 if (!content_ok) {
                     /* REFUSE. A mod set is not like a build: every mod in it
                      * exists to change what the guest simulates, so two peers
@@ -2555,12 +3014,12 @@ static void rb_drain_wire(RNetRbDriver *d)
                      * Both peers receive the other's identity and refuse
                      * independently, so neither waits on the other. */
                     rb_log(d, "MOD SETS DIFFER ours=%08x "
-                              "peer=%08x — this match cannot be played. Every "
-                              "mod in the set changes what the guest simulates, "
-                              "so the two sides are running different games. "
-                              "Compare the \"game: mod set\" line in each log; "
-                              "the host's selection is the one to match.\n",
-                           (unsigned)rb_claimed_content_fp(d), (unsigned)b);
+                              "peer=%08x (seat %d) — this match cannot be played. "
+                              "Every mod in the set changes what the guest "
+                              "simulates, so the two sides are running different "
+                              "games. Compare the \"game: mod set\" line in each "
+                              "log; the host's selection is the one to match.\n",
+                           (unsigned)rb_claimed_content_fp(d), (unsigned)b, seat);
                     if (d->allow_mod_mismatch) {
                         rb_log(d, "  %s=1 — continuing "
                                   "anyway; expect an immediate desync\n",
@@ -2571,6 +3030,7 @@ static void rb_drain_wire(RNetRbDriver *d)
                 }
             }
             break;
+        }
         case RNET_RB_SYNC_OP_COMMIT:
             if (d->stage == kRbTipHold && epoch == d->corr.epoch_id) {
                 uint32_t bit = rb_from_bit(d, from);
@@ -2617,12 +3077,17 @@ static void rb_drain_wire(RNetRbDriver *d)
         if (!rnet_session_take_rb_seal_rows(s, &epoch, &a, &b, &slot,
                                             &row_begin, rows, &count))
             break;
-        if (d->stage == kRbIdle || epoch != d->corr.epoch_id || count == 0)
+        if (count == 0)
             continue;
         {
             rnet_u16 i;
             for (i = 0; i < count; ++i)
                 rb_row_sanitize(d, (int)slot, &rows[i]);
+        }
+        if (d->stage == kRbIdle || epoch != d->corr.epoch_id) {
+            if (rb_epoch_is_early(d, epoch))
+                rb_early_seal_hold(d, epoch, a, b, (int)slot, row_begin, rows, count);
+            continue;
         }
         rnet_rb_apply_peer_seal_rows(d->rb, epoch, a, b, (int32_t)slot,
                                      row_begin, rows, count);
@@ -2643,8 +3108,13 @@ static void rb_drain_wire(RNetRbDriver *d)
             rnet_rb_set_peer_convergence(d->rb, a);
     }
 
-    while (rnet_session_take_rb_frame_commit(s, &a, &b))
-        rnet_hc_note_peer(&d->hc, a, b);
+    /* Each peer's commits into its own chain. With one peer rb_from_bit is
+     * that peer whatever the header says, exactly as before. */
+    while (rnet_session_take_rb_frame_commit(s, &a, &b)) {
+        uint32_t bit = rb_from_bit(d, rnet_session_rb_last_take_from(s));
+        if (bit)
+            rnet_hc_note_peer(&d->hc[rb_bit_slot(bit)], a, b);
+    }
 }
 
 /* ── episode pump ────────────────────────────────────────────────────── */
@@ -2774,7 +3244,7 @@ static void rb_reconcile_wire(RNetRbDriver *d)
     /* A correction owed from an episode that did not commit comes first: it is
      * the oldest thing wrong with our timeline. */
     if (d->stage == kRbIdle && !rb_cooldown_active(d) && d->sim >= d->owed_retry_after &&
-        d->quiesce == RNET_RB_QUIESCE_NONE) {
+        d->quiesce == RNET_RB_QUIESCE_NONE && !d->defer_valid) {
         uint32_t t, load;
         int oslot;
         if (rb_owed_first(d, &t, &oslot)) {
@@ -2848,6 +3318,12 @@ static void rb_reconcile_wire(RNetRbDriver *d)
                     rb_log(d, "RB correction deferred tick=%u slot=%d — "
                               "cooldown until %u, re-opened after it\n",
                            (unsigned)t, slot, (unsigned)d->cooldown_until_tick);
+                else if (d->defer_valid)
+                    /* Owed (marked above): our own episode would race the
+                     * peer's we are about to follow. Re-opened after it. */
+                    rb_log(d, "RB correction deferred tick=%u slot=%d — "
+                              "following epoch=%u first, re-opened after it\n",
+                           (unsigned)t, slot, (unsigned)d->defer_epoch);
                 else
                     rb_begin_episode(d, t, slot, 1, 0u, 0u, 0u, 0u);
             } else if (t >= d->corr.load_tick &&
@@ -2940,8 +3416,9 @@ static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
         return;
     }
     /* In flight: let it finish. The marker promises "none open here", so it
-     * is only ever sent from idle. */
-    if (d->stage != kRbIdle)
+     * is only ever sent from idle -- and a BEGIN held for its load tick is
+     * open here too. */
+    if (d->stage != kRbIdle || d->defer_valid)
         return;
     if (wire_ok && (d->quiesce_sent_ms == 0u ||
                     (uint32_t)(now - d->quiesce_sent_ms) >= RB_QUIESCE_RESEND_MS))
@@ -2963,13 +3440,15 @@ static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
               "no episode open here and every peer has promised to open none. "
               "Opened here: %u as initiator, %u as follower; corrections not "
               "opened while draining: %u; still owed: %u; peers acknowledged "
-              "%x of %x\n",
+              "%x of %x; follows that waited for their load tick: %u, that took "
+              "it at our tip: %u\n",
            (unsigned)d->sim, (unsigned)(now - d->quiesce_req_ms),
            (unsigned)d->quiesce_req_sim,
            d->quiesce_origin ? d->quiesce_origin : "host request",
            (unsigned)d->ep_initiated, (unsigned)d->ep_followed,
            (unsigned)d->drain_unopened, (unsigned)rb_owed_outstanding(d),
-           (unsigned)(d->peer_quiesce_ack_mask & expect), (unsigned)expect);
+           (unsigned)(d->peer_quiesce_ack_mask & expect), (unsigned)expect,
+           (unsigned)d->n_follow_deferred, (unsigned)d->n_follow_at_tip);
 }
 
 void rnet_rb_driver_request_quiesce(RNetRbDriver *d)
@@ -2995,6 +3474,47 @@ RNetRbQuiesce rnet_rb_driver_quiesce_state(const RNetRbDriver *d)
 }
 
 /* ── live admit ──────────────────────────────────────────────────────── */
+
+/*
+ * The scheduler reads one remote tip from the session's stats, and the stats
+ * report the HIGHEST over every remote seat. With two seats that is the one
+ * peer's tip. With more, a peer that stops sending (a 2 s watchdog wait, a
+ * long replay) hides behind the others: the prediction cap is measured
+ * against a tip that keeps moving, never trips, and the rest run on invented
+ * rows for that seat indefinitely -- measured in rb_driver_test's 4-seat
+ * cell: three peers ran 1,000 ticks ahead of a fourth stuck at 221, and it
+ * never caught up. So with more than one peer, pacing reads the SLOWEST
+ * peer's tip, and the invent decision for a seat reads that seat's own.
+ * With one peer neither function changes anything.
+ */
+static void rb_stats_slowest_tip(RNetRbDriver *d, RNetSession *s, RNetSessionStats *st)
+{
+    uint32_t m = rb_expect_mask(d);
+    rnet_u32 tip, lo = 0u;
+    int i, any = 0;
+    if (rb_popcount(m) < 2)
+        return;
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        if (!(m & (1u << i)) || !rnet_session_remote_tip(s, i, &tip))
+            continue;
+        if (!any || tip < lo)
+            lo = tip;
+        any = 1;
+    }
+    if (!any)
+        return;
+    st->highest_remote_wire = lo;
+    st->remote_lead = (int)lo - (int)st->sim_tick;
+}
+
+static void rb_stats_seat_tip(RNetRbDriver *d, RNetSession *s, int slot, RNetSessionStats *st)
+{
+    rnet_u32 tip;
+    if (rb_popcount(rb_expect_mask(d)) < 2 || !rnet_session_remote_tip(s, slot, &tip))
+        return;
+    st->highest_remote_wire = tip;
+    st->remote_lead = (int)tip - (int)st->sim_tick;
+}
 
 /* INCREMENTAL: hand the host the next replayed tick. */
 static RNetRbAdmit rb_replay_step(RNetRbDriver *d)
@@ -3051,6 +3571,7 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     local = rb_local_slot(d);
 
     rb_drain_wire(d);
+    rb_defer_pump(d);
     /* Before anything else: the gate below stops the frame from happening
      * while this is outstanding, so pumping it from finish_frame deadlocked
      * -- no frame, no pump, no handshake, forever. A precondition has to be
@@ -3064,8 +3585,11 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     rb_reconcile_wire(d);
     rb_pump_episode(d);
     /* A peer that said BYE has left even while the session still reads
-     * RUNNING; a drain must not wait for its acknowledgement. */
-    rb_quiesce_pump(d, rnet_session_peer_disconnected(s, 0) ? 0 : 1);
+     * RUNNING; a drain must not wait for its acknowledgement. With more than
+     * one peer a BYE names only the one that left (the session keeps a single
+     * flag): the rest are still there, and still need our marker. */
+    rb_quiesce_pump(d, (rb_popcount(rb_expect_mask(d)) == 1 &&
+                        rnet_session_peer_disconnected(s, 0)) ? 0 : 1);
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
@@ -3084,6 +3608,7 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
 
     memset(&st, 0, sizeof(st));
     rnet_session_get_stats(s, &st);
+    rb_stats_slowest_tip(d, s, &st);
     rnet_sched_sync_delay_from_session();
 
     /*
@@ -3179,7 +3704,9 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
 
         {
             const char *why = NULL;
-            if (rnet_sched_on_remote_miss(slot, d->sim, wire, &st,
+            RNetSessionStats st_seat = st;
+            rb_stats_seat_tip(d, s, slot, &st_seat);
+            if (rnet_sched_on_remote_miss(slot, d->sim, wire, &st_seat,
                                           d->prediction_cap, &why)) {
                 d->stall_tag = why ? why : "remote_miss";
                 return RNET_RB_ADMIT_STALL;
@@ -3226,46 +3753,76 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
  * in-flight FRAME_COMMITs describing the peer's pre-correction timeline. A
  * transient resolves within a round trip; a genuine fork never can.
  *
- * ADVISORY ONLY. An episode that ABORTS mid-replay leaves our local digests
- * describing a timeline we half-ran while the peer's describe theirs, and
- * nothing re-primes the chain on that path the way a commit does; wiring this
- * to the fork cap and lockstep turned clean runs red. Until the abort path
- * restores or re-primes, it reports and does nothing else.
+ * ADVISORY ONLY. An episode that aborts leaves our local digests describing a
+ * timeline the peer did not run, and wiring this to the fork cap and lockstep
+ * turned clean runs red. Two of those traces are now removed at the source,
+ * so what is left is closer to a verdict (it still only reports):
+ *
+ *   - an episode that aborted AFTER its replay (a peer NACK that arrived
+ *     while we verified) left the live, mispredicted digests of the replayed
+ *     ticks in the chain; every stall in n64lle's 0 ms sweep sat on one. A
+ *     completed replay now writes its own digests into the chain and sends
+ *     them to the peers (rb_replay_finish);
+ *   - a mismatch at or after a correction we still OWE is our timeline being
+ *     known-wrong until the retry replays it, not an unexplained fork, so it
+ *     is not reported while the correction is owed. If the correction is
+ *     LOST, the owed mark goes with a line saying so, and a mismatch that
+ *     then persists is reported.
+ *
+ * Per peer: each chain stalls on its own, and a report names the seat when
+ * there is more than one.
  */
 static void rb_check_chain_fork(RNetRbDriver *d)
 {
     uint32_t tick = 0u, local = 0u, peer = 0u;
-    uint32_t now, settle;
+    uint32_t now, settle, expect, owed_t = 0u;
+    int owed_slot = -1, owed, i;
 
     if (d->stage != kRbIdle || !d->rb)
         return;
-    if (!rnet_hc_peek_mismatch(&d->hc, &tick, &local, &peer)) {
-        d->chain_pending_tick = 0u; /* cleared on its own: it was in flight */
-        return;
-    }
+    expect = rb_expect_mask(d);
+    owed = rb_owed_first(d, &owed_t, &owed_slot);
     now = rb_now(d);
-    if (d->chain_pending_tick != tick) {
-        d->chain_pending_tick = tick;
-        d->chain_pending_ms = now;
-        return;
-    }
     /* Two trips plus slack: one for the peer's correction to reach us, one for
      * anything it had already sent to drain. */
     settle = (d->rtt_ema_ms * 2u) + 250u;
     if (settle < 300u)
         settle = 300u;
-    if ((uint32_t)(now - d->chain_pending_ms) < settle)
-        return;
-    if (d->chain_fork_tick == tick)
-        return; /* already reported; the watermark is stuck here */
-    d->chain_fork_tick = tick;
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        if (!(expect & (1u << i)))
+            continue;
+        if (!rnet_hc_peek_mismatch(&d->hc[i], &tick, &local, &peer)) {
+            d->chain_pending_tick[i] = 0u; /* cleared on its own: it was in flight */
+            continue;
+        }
+        if (owed && owed_t <= tick) {
+            d->chain_pending_tick[i] = 0u; /* explained: a correction is owed */
+            continue;
+        }
+        if (d->chain_pending_tick[i] != tick) {
+            d->chain_pending_tick[i] = tick;
+            d->chain_pending_ms[i] = now;
+            continue;
+        }
+        if ((uint32_t)(now - d->chain_pending_ms[i]) < settle)
+            continue;
+        if (d->chain_fork_tick[i] == tick)
+            continue; /* already reported; the watermark is stuck here */
+        d->chain_fork_tick[i] = tick;
 
-    rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x "
-              "— unresolved for %ums (settle %ums). The confirmed watermark "
-              "cannot advance past this tick. ADVISORY: an aborted episode "
-              "leaves the same trace as a real fork, so this is not acted on.\n",
-           (unsigned)tick, (unsigned)local, (unsigned)peer,
-           (unsigned)(now - d->chain_pending_ms), (unsigned)settle);
+        if (rb_popcount(expect) > 1)
+            rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x (seat %d) "
+                      "— unresolved for %ums (settle %ums). The confirmed watermark "
+                      "cannot advance past this tick. ADVISORY: not acted on.\n",
+                   (unsigned)tick, (unsigned)local, (unsigned)peer, i,
+                   (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
+        else
+            rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x "
+                      "— unresolved for %ums (settle %ums). The confirmed watermark "
+                      "cannot advance past this tick. ADVISORY: not acted on.\n",
+                   (unsigned)tick, (unsigned)local, (unsigned)peer,
+                   (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
+    }
 }
 
 void rnet_rb_driver_finish_frame(RNetRbDriver *d)
@@ -3280,10 +3837,13 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
     d->pending_admit = RNET_RB_ADMIT_STALL;
 
     if (admitted == RNET_RB_ADMIT_REPLAY) {
-        /* INCREMENTAL: the host ran replayed tick replay_next. No FRAME_COMMIT
-         * for a replayed tick, exactly as the inline loop sends none. */
+        /* INCREMENTAL: the host ran replayed tick replay_next. Its digest is
+         * kept, and every replayed tick's goes into the chain (and out as a
+         * FRAME_COMMIT) together when the replay completes -- exactly as the
+         * inline loop does (rb_replay_note, rb_replay_finish). */
         if (d->stage != kRbReplaying)
             return;
+        rb_replay_note(d, d->replay_next);
         d->resim_ticks++;
         d->replay_next++;
         if (d->replay_next > d->corr.target_tick) {
@@ -3306,7 +3866,7 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
         rb_log_raw(d, "rbe: forced boot fork — publishing %08x for tick 0\n",
                    (unsigned)master);
     }
-    rnet_hc_note_local(&d->hc, d->sim, master);
+    rb_hc_note_local(d, d->sim, master);
     if (s)
         rnet_session_send_rb_frame_commit(s, d->sim, master);
 
@@ -3317,11 +3877,11 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
     rb_send_identity(d);
 
     /* A stuck watermark whose next tick aged out of the ring is not a fork. */
-    (void)rnet_hc_heal_stale_gap(&d->hc);
+    rb_hc_heal(d);
     /* ...but one that is still stuck after healing may well be. */
     rb_check_chain_fork(d);
     if (d->rb)
-        rnet_rb_set_peer_convergence(d->rb, rnet_hc_resolved_through(&d->hc));
+        rnet_rb_set_peer_convergence(d->rb, rb_hc_resolved(d));
 }
 
 /* ── diagnostics ─────────────────────────────────────────────────────── */

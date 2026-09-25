@@ -145,8 +145,11 @@ struct RNetSession
     /* ICE TURN auto-fallback timers (monotonic ms). */
     rnet_u64 ice_attempt_ms;
     rnet_u64 ice_completed_ms;
-    /* Peer RB_FRAME_COMMIT queue (host drains via take_*). */
-#define RNET_RB_FC_QUEUE 64
+    /* Peer RB_FRAME_COMMIT queue (host drains via take_*). Sized for more than
+     * one peer: every peer sends one per tick, and an INCREMENTAL host does not
+     * drain while it replays, so four seats fill 64 entries in about twenty
+     * ticks. Each entry keeps its sender -- a hash chain per peer needs it. */
+#define RNET_RB_FC_QUEUE 256
     /* PSX-Link group scoping: when >= 0, rollback EPISODE/STATE packets
      * (SYNC, BASELINE, POST, STATE_*) are accepted only from this slot —
      * episode coordination is per-console-group in link sessions. FRAME_COMMIT
@@ -156,12 +159,16 @@ struct RNetSession
     int rb_peer_slot;
     rnet_u32 rb_fc_tick[RNET_RB_FC_QUEUE];
     rnet_u32 rb_fc_hash[RNET_RB_FC_QUEUE];
+    rnet_u8 rb_fc_from[RNET_RB_FC_QUEUE];
     int rb_fc_q_head; /* next write */
     int rb_fc_q_tail; /* next read */
     int rb_fc_q_count;
 
-    /* Peer RB episode control queues (latest-wins / small FIFO). */
-#define RNET_RB_CTRL_QUEUE 8
+    /* Peer RB episode control queues (small FIFOs). 32, not 8: with more than
+     * two seats every peer's IDENT, COMMIT, QUIESCE and BEGIN land in the same
+     * queue between two drains, and a hub relays them in bursts. A full queue
+     * refuses (and logs) rather than overwriting. */
+#define RNET_RB_CTRL_QUEUE 32
     struct {
         rnet_u32 epoch_id, mismatch_tick, load_tick, target_tick;
         rnet_u8 corrected_slot, initiator, flags;
@@ -200,12 +207,16 @@ struct RNetSession
      * seconds later as a watchdog abort that named the wrong cause. */
     rnet_u32 rb_ctrl_dropped;
 
-    /* Mod-set handshake. Latest-only by design: see the header. */
+    /* Mod-set handshake. Latest-only by design: see the header. The ACK is
+     * latest-only PER SEAT: with more than two seats every guest answers the
+     * host, and a single slot let the second answer overwrite the first --
+     * the host then waited out its bound for a guest that had already
+     * confirmed, and refused the match. */
     char modset_text[RNET_MODSET_TEXT_MAX];
     rnet_u8 modset_pending;
-    char modset_ack_reason[RNET_MODSET_REASON_MAX];
-    rnet_u8 modset_ack_status;
-    rnet_u8 modset_ack_pending;
+    char modset_ack_reason[RNET_MAX_SLOTS][RNET_MODSET_REASON_MAX];
+    rnet_u8 modset_ack_status[RNET_MAX_SLOTS];
+    rnet_u32 modset_ack_pending; /* bit i = seat i's answer is waiting */
     rnet_u32 rb_resolved_q[RNET_RB_CTRL_QUEUE];
     int rb_resolved_head, rb_resolved_tail, rb_resolved_count;
 
@@ -653,6 +664,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             {
                 s->rb_fc_tick[s->rb_fc_q_head] = pkt->rb_through_tick;
                 s->rb_fc_hash[s->rb_fc_q_head] = pkt->rb_state_hash;
+                s->rb_fc_from[s->rb_fc_q_head] = pkt->local_slot;
                 s->rb_fc_q_head = (s->rb_fc_q_head + 1) % RNET_RB_FC_QUEUE;
                 s->rb_fc_q_count++;
             }
@@ -663,6 +675,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
                 s->rb_fc_q_count--;
                 s->rb_fc_tick[s->rb_fc_q_head] = pkt->rb_through_tick;
                 s->rb_fc_hash[s->rb_fc_q_head] = pkt->rb_state_hash;
+                s->rb_fc_from[s->rb_fc_q_head] = pkt->local_slot;
                 s->rb_fc_q_head = (s->rb_fc_q_head + 1) % RNET_RB_FC_QUEUE;
                 s->rb_fc_q_count++;
             }
@@ -776,11 +789,15 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     case RNET_PKT_MODSET_ACK:
         if (pkt->local_slot != s->wire_slot)
         {
-            memcpy(s->modset_ack_reason, pkt->modset_reason,
-                   sizeof(s->modset_ack_reason));
-            s->modset_ack_reason[sizeof(s->modset_ack_reason) - 1] = '\0';
-            s->modset_ack_status = pkt->modset_status;
-            s->modset_ack_pending = 1u;
+            if (pkt->local_slot < RNET_MAX_SLOTS)
+            {
+                rnet_u8 from = pkt->local_slot;
+                memcpy(s->modset_ack_reason[from], pkt->modset_reason,
+                       sizeof(s->modset_ack_reason[from]));
+                s->modset_ack_reason[from][sizeof(s->modset_ack_reason[from]) - 1] = '\0';
+                s->modset_ack_status[from] = pkt->modset_status;
+                s->modset_ack_pending |= 1u << from;
+            }
         }
         break;
     case RNET_PKT_RB_RESOLVED:
@@ -2990,6 +3007,21 @@ int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
     return 0;
 }
 
+int rnet_session_remote_tip(const RNetSession *s, int slot, rnet_u32 *tip)
+{
+    if (s == NULL || slot < 0 || slot >= (int)s->cfg.slot_count ||
+        slot == (int)s->cfg.local_slot || tip == NULL)
+    {
+        return 0;
+    }
+    if (!rnet_config_slot_occupied(&s->cfg, (rnet_u8)slot))
+    {
+        return 0;
+    }
+    *tip = rnet_ring_highest_valid(&s->remote_rings[slot]);
+    return 1;
+}
+
 void rnet_session_set_rb_peer_slot(RNetSession *s, int slot)
 {
     if (s == NULL)
@@ -3014,6 +3046,7 @@ int rnet_session_take_rb_frame_commit(RNetSession *s, rnet_u32 *through_tick,
     {
         *state_hash = s->rb_fc_hash[s->rb_fc_q_tail];
     }
+    s->rb_last_from = s->rb_fc_from[s->rb_fc_q_tail];
     s->rb_fc_q_tail = (s->rb_fc_q_tail + 1) % RNET_RB_FC_QUEUE;
     s->rb_fc_q_count--;
     return 1;
@@ -3458,23 +3491,34 @@ int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
 int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
                                  rnet_u32 cap)
 {
+    int from;
     if ((s == NULL) || (s->modset_ack_pending == 0u))
     {
         return 0;
     }
-    s->modset_ack_pending = 0u;
+    /* Lowest seat first; each seat's answer is taken once. The sender is
+     * rnet_session_rb_last_take_from(), as for the rb_* takes. */
+    for (from = 0; from < RNET_MAX_SLOTS; ++from)
+    {
+        if (s->modset_ack_pending & (1u << from))
+        {
+            break;
+        }
+    }
+    s->modset_ack_pending &= ~(1u << from);
+    s->rb_last_from = from;
     if (status != NULL)
     {
-        *status = s->modset_ack_status;
+        *status = s->modset_ack_status[from];
     }
     if ((reason != NULL) && (cap > 0u))
     {
-        rnet_u32 n = (rnet_u32)strlen(s->modset_ack_reason);
+        rnet_u32 n = (rnet_u32)strlen(s->modset_ack_reason[from]);
         if (n >= cap)
         {
             n = cap - 1u;
         }
-        memcpy(reason, s->modset_ack_reason, n);
+        memcpy(reason, s->modset_ack_reason[from], n);
         reason[n] = '\0';
     }
     return 1;

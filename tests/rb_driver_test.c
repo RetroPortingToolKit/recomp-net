@@ -10,7 +10,9 @@
  * loopback, its own driver, and a toy deterministic engine. Two processes,
  * not one, because the admission scheduler is process-global -- and because
  * the doctrine is "two processes, never one" for anything that decides whether
- * peers agree. The toy engine folds every seat's row into an accumulator, so
+ * peers agree. The N-seat scenarios fork three or four, seat 0 relaying for
+ * the rest (rnet_session_start_lan_hub), and grade the ledger per initiator /
+ * follower pair by epoch. The toy engine folds every seat's row into an accumulator, so
  * a replay that used a wrong row changes every later digest. Each child
  * records the digest it ended up with for every tick; the parent compares the
  * two timelines independently of the hash chain the driver itself uses.
@@ -101,6 +103,11 @@ typedef struct Child {
     uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
     uint32_t replay_admits;
     uint32_t n_refusal_lines;   /* "RB match refused" */
+    uint32_t n_deferred, n_at_tip, n_chain_stall;
+    /* Epochs, for the per-pair ledger: opened here, followed, refused. */
+#define MAX_EPOCHS 512
+    uint32_t ep_init[MAX_EPOCHS], ep_follow[MAX_EPOCHS], ep_refused[MAX_EPOCHS];
+    uint32_t n_ep_init_ids, n_ep_follow_ids, n_ep_refused_ids;
 } Child;
 
 static Child g_c;
@@ -267,12 +274,33 @@ static uint32_t h_now(void *ctx)
     return mono_ms();
 }
 
+static uint32_t line_epoch(const char *line)
+{
+    const char *e = strstr(line, "epoch=");
+    return e ? (uint32_t)strtoul(e + 6, NULL, 10) : 0xffffffffu;
+}
+
 static void h_log(void *ctx, const char *line)
 {
     (void)ctx;
-    if (strstr(line, "RESIM episode") && strstr(line, "initiator")) g_c.n_ep_init++;
-    if (strstr(line, "RESIM episode") && strstr(line, "follower")) g_c.n_ep_follow++;
-    if (strstr(line, "RB follow refused")) g_c.n_refused++;
+    if (strstr(line, "RESIM episode") && strstr(line, "initiator")) {
+        g_c.n_ep_init++;
+        if (g_c.n_ep_init_ids < MAX_EPOCHS)
+            g_c.ep_init[g_c.n_ep_init_ids++] = line_epoch(line);
+    }
+    if (strstr(line, "RESIM episode") && strstr(line, "follower")) {
+        g_c.n_ep_follow++;
+        if (g_c.n_ep_follow_ids < MAX_EPOCHS)
+            g_c.ep_follow[g_c.n_ep_follow_ids++] = line_epoch(line);
+    }
+    if (strstr(line, "RB follow refused")) {
+        g_c.n_refused++;
+        if (g_c.n_ep_refused_ids < MAX_EPOCHS)
+            g_c.ep_refused[g_c.n_ep_refused_ids++] = line_epoch(line);
+    }
+    if (strstr(line, "RB follow deferred epoch") && strstr(line, "span=")) g_c.n_deferred++;
+    if (strstr(line, "RB follow at our live tip")) g_c.n_at_tip++;
+    if (strstr(line, "RB chain stall")) g_c.n_chain_stall++;
     if (strstr(line, "RB abort")) g_c.n_abort++;
     if (strstr(line, "FORK") && !strstr(line, "FORCE FORK")) g_c.n_fork++;
     if (strstr(line, "timed out waiting")) g_c.n_timeout++;
@@ -396,6 +424,7 @@ typedef struct Report {
     uint32_t n_ep_init, n_ep_follow, n_refused, n_abort, n_fork, n_timeout,
              n_extend, n_unapplied, n_lobby, n_forced, replay_admits;
     uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
+    uint32_t n_deferred, n_at_tip, n_chain_stall;
     int quiesce_state;
     uint64_t resim_ticks;
     uint32_t episodes_driver;
@@ -407,12 +436,16 @@ typedef struct Report {
     uint32_t sim_after_hold;
     uint32_t live_admits_after;
     char refusal[32];
+    uint32_t ep_init[MAX_EPOCHS], ep_follow[MAX_EPOCHS], ep_refused[MAX_EPOCHS];
+    uint32_t n_ep_init_ids, n_ep_follow_ids, n_ep_refused_ids;
     uint32_t timeline[TOY_TICKS];
 } Report;
 
+#define MAX_SEATS 4
+
 typedef struct Scenario {
     const char *name;
-    int mode_a, mode_b;
+    int mode_a, mode_b;       /* seat 0's replay shape; every other seat's */
     const char *latency_ms;   /* per peer, one way; "" = none */
     const char *jitter_ms;
     int force_mispredict;     /* initiator only; 0 = off */
@@ -426,6 +459,26 @@ typedef struct Scenario {
     int force_boot_fork;
     int force_mod_mismatch;
     const char *refusal;
+    /* Seats (0 = 2). With 3 or 4, seat 0 relays for the rest. */
+    int seats;
+    /* The LAST seat stops polling for this many ms once, at tick 60 (after
+     * the boot-digest gate, which re-aligns every seat at tick 1), and so runs
+     * that far behind: the follower that has not reached the load tick. */
+    unsigned lag_ms;
+    /* Every seat publishes / confirms a mod set: the handshake runs. */
+    int modset;
+    /* 1: the follower-behind case must have been exercised (a deferral or a
+     * follow at our tip), and nothing refused. */
+    int expect_no_refusal;
+    /* RBE_RB_TIMESYNC=0 on every seat: the pacing controller would otherwise
+     * pull the lagging seat level again (it slows the peer that mispredicts,
+     * here the injecting one), and the lag the scenario is about would last a
+     * few ticks. */
+    int timesync_off;
+    /* The LAST seat paces this many ms slower per frame than the others, so
+     * it falls behind until the others' prediction cap holds them: the
+     * follower that is still short of the load tick, every episode. */
+    unsigned slow_ms;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -464,7 +517,20 @@ static int stop_requested(int fd)
     return read(fd, &c, 1) == 1;
 }
 
-static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned port_peer,
+static int modset_ok(const char *want, char *reason, uint32_t cap)
+{
+    (void)want;
+    if (reason && cap)
+        reason[0] = '\0';
+    return 0;
+}
+
+static int seats_of(const Scenario *sc)
+{
+    return sc->seats >= 2 ? sc->seats : 2;
+}
+
+static void run_child(const Scenario *sc, int slot, unsigned port_base,
                       uint32_t session_id, int fd, int ready_fd, int stop_fd)
 {
     RNetConfig rc;
@@ -473,21 +539,26 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     RNetRbDriver *d = NULL;
     RNetRbDriverConfig cfg;
     RNetRbHost host;
-    int local = slot, slots = 2, delay = 8;   /* the SNES harness's D */
-    char bind[64], peer[64], logname[128];
+    int local = slot, slots = seats_of(sc), delay = 8;   /* the SNES harness's D */
+    char bind[64], peer[64], logname[128], seed[16];
     uint32_t start_ms, next_tick_ms;
     Report *r = (Report *)calloc(1, sizeof(Report));
+    int started;
 
     memset(&g_c, 0, sizeof(g_c));
     g_c.slot = slot;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
-    snprintf(logname, sizeof(logname), "rb_driver_test_%s_%s.log", sc->name,
-             slot == 0 ? "initiator" : "follower");
+    if (slots == 2)
+        snprintf(logname, sizeof(logname), "rb_driver_test_%s_%s.log", sc->name,
+                 slot == 0 ? "initiator" : "follower");
+    else
+        snprintf(logname, sizeof(logname), "rb_driver_test_%s_seat%d.log", sc->name, slot);
     g_c.log = fopen(logname, "w");
 
     setenv("RNET_SIM_LATENCY_MS", sc->latency_ms, 1);
     setenv("RNET_SIM_JITTER_MS", sc->jitter_ms, 1);
-    setenv("RNET_SIM_SEED", slot == 0 ? "11" : "23", 1);
+    snprintf(seed, sizeof(seed), "%d", 11 + slot * 12);
+    setenv("RNET_SIM_SEED", seed, 1);
     /* Pinned per peer, not inherited: a knob exported for one side must never
      * reach the other (the SNES harness learned that twice). */
     if (slot == 0 && sc->force_mispredict > 0) {
@@ -497,11 +568,12 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     } else {
         setenv("RNET_RB_FORCE_MISPREDICT", "0", 1);
     }
+    setenv("RBE_RB_TIMESYNC", sc->timesync_off ? "0" : "1", 1);
     setenv("RNET_RB_FORCE_BOOT_FORK", (slot == 0 && sc->force_boot_fork) ? "1" : "0", 1);
     setenv("RNET_RB_FORCE_MOD_MISMATCH", (slot == 0 && sc->force_mod_mismatch) ? "1" : "0", 1);
 
     rnet_config_init_defaults(&rc);
-    rc.slot_count = 2;
+    rc.slot_count = (rnet_u8)slots;
     rc.local_slot = (rnet_u8)slot;
     rc.input_delay = (rnet_u8)delay;
     rc.session_id = session_id;
@@ -509,9 +581,19 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     hv.sample_local = sample_local;
     hv.publish = publish_unused;
     s = rnet_session_create(&rc, &hv);
-    snprintf(bind, sizeof(bind), "127.0.0.1:%u", port_self);
-    snprintf(peer, sizeof(peer), "127.0.0.1:%u", port_peer);
-    if (!s || rnet_session_start_lan(s, bind, peer) != 0)
+    snprintf(bind, sizeof(bind), "127.0.0.1:%u", port_base + (unsigned)slot);
+    if (!s)
+        goto report;
+    if (slots == 2) {
+        snprintf(peer, sizeof(peer), "127.0.0.1:%u", port_base + (unsigned)(1 - slot));
+        started = rnet_session_start_lan(s, bind, peer) == 0;
+    } else if (slot == 0) {
+        started = rnet_session_start_lan_hub(s, bind) == 0;   /* seat 0 relays */
+    } else {
+        snprintf(peer, sizeof(peer), "127.0.0.1:%u", port_base);
+        started = rnet_session_start_lan(s, bind, peer) == 0;
+    }
+    if (!started)
         goto report;
 
     start_ms = mono_ms();
@@ -539,8 +621,10 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     /* Identity only where a scenario is about it: the ordinary scenarios stay
      * exactly what they were. Same build, same content -- any difference the
      * peers see is the injected one. */
-    if (sc->refusal)
+    if (sc->refusal || slots > 2)
         rnet_rb_driver_set_identity(d, 0x0b0b0b0bu, 0x0c0c0c0cu);
+    if (sc->modset)
+        rnet_rb_driver_set_modset(d, "mods none\n", modset_ok, NULL);
     if (!rnet_rb_driver_start(d, &cfg, &host))
         goto report;
 
@@ -548,20 +632,22 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
      * (a stall presents the held frame and waits for the next one), except
      * that an INCREMENTAL replay tick is followed at once by the next poll --
      * that is the shape a host with an expensive tick runs, pumping between
-     * ticks. The injector counts remote rows (one per tick), so an interval
-     * means the same number of ticks here as in the SNES harness.
+     * ticks. The injector counts remote rows (one per seat per tick).
      *
-     * Stopping is the driver's own coordinated stop: once both peers have
-     * played their ticks the parent says so, each asks its driver to quiesce
-     * (or, with quiesce_one_side, only the initiator does and the follower
+     * Stopping is the driver's own coordinated stop: once every peer has
+     * played its ticks the parent says so, each asks its driver to quiesce
+     * (or, with quiesce_one_side, only the initiator does and the others
      * must follow the marker), and each keeps running -- live and replay
      * alike -- until the driver reports DRAINED. An uncoordinated stop left
      * the peer that finished last opening an episode after the other had
-     * exited; the ledger below is exact because this stop is. */
+     * exited; the ledger below is exact because this stop is.
+     *
+     * lag_ms: the last seat stops polling once, at tick 60, pumping its
+     * session so it stays linked, and resumes that many ms behind. */
     start_ms = mono_ms();
     next_tick_ms = start_ms;
     {
-        int ready_sent = 0, asked = 0;
+        int ready_sent = 0, asked = 0, lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
         while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
@@ -583,13 +669,23 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
                     break;
                 }
             }
+            if (sc->lag_ms && slot == slots - 1 && !lagged &&
+                rnet_rb_driver_sim_tick(d) >= 60u) {
+                uint32_t t0 = mono_ms();
+                lagged = 1;
+                while ((uint32_t)(mono_ms() - t0) < sc->lag_ms) {
+                    rnet_session_pump(s);
+                    sleep_ms(1);
+                }
+                next_tick_ms = mono_ms();
+            }
             if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
                 (void)write_all(ready_fd, "R", 1);
                 ready_sent = 1;
             }
             if (ready_sent && !asked && stop_requested(stop_fd)) {
                 asked = 1;
-                if (!(sc->quiesce_one_side && slot == 1))
+                if (!(sc->quiesce_one_side && slot != 0))
                     rnet_rb_driver_request_quiesce(d);
             }
             q = rnet_rb_driver_quiesce_state(d);
@@ -606,7 +702,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
                 if (a == RNET_RB_ADMIT_REPLAY)
                     continue;
             }
-            next_tick_ms += 16u;
+            next_tick_ms += 16u + (slot == slots - 1 ? sc->slow_ms : 0u);
             if ((int32_t)(next_tick_ms - mono_ms()) > 0)
                 sleep_ms(next_tick_ms - mono_ms());
             else
@@ -614,6 +710,15 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
         }
         if (!ready_sent)
             (void)write_all(ready_fd, "R", 1);
+        /* The relay leaves last: a guest's final marker to another guest
+         * goes through seat 0, so seat 0 keeps pumping for a moment. */
+        if (slots > 2 && slot == 0) {
+            uint32_t t0 = mono_ms();
+            while ((uint32_t)(mono_ms() - t0) < 700u) {
+                rnet_session_pump(s);
+                sleep_ms(2);
+            }
+        }
     }
 
 report:
@@ -643,6 +748,15 @@ report:
     r->n_lobby = g_c.n_lobby;
     r->n_forced = g_c.n_forced;
     r->replay_admits = g_c.replay_admits;
+    r->n_deferred = g_c.n_deferred;
+    r->n_at_tip = g_c.n_at_tip;
+    r->n_chain_stall = g_c.n_chain_stall;
+    memcpy(r->ep_init, g_c.ep_init, sizeof(r->ep_init));
+    memcpy(r->ep_follow, g_c.ep_follow, sizeof(r->ep_follow));
+    memcpy(r->ep_refused, g_c.ep_refused, sizeof(r->ep_refused));
+    r->n_ep_init_ids = g_c.n_ep_init_ids;
+    r->n_ep_follow_ids = g_c.n_ep_follow_ids;
+    r->n_ep_refused_ids = g_c.n_ep_refused_ids;
     memcpy(r->timeline, g_c.timeline, sizeof(r->timeline));
     (void)write_all(fd, r, sizeof(*r));
     if (s)
@@ -656,85 +770,103 @@ report:
     _exit(0);
 }
 
+static uint32_t count_epoch(const uint32_t *ids, uint32_t n, uint32_t e)
+{
+    uint32_t i, k = 0;
+    for (i = 0; i < n; ++i)
+        if (ids[i] == e)
+            k++;
+    return k;
+}
+
 static void run_scenario(const Scenario *sc, unsigned port_base)
 {
-    int pa[2], pb[2], ready[2], stop_a[2], stop_b[2];
+    int nseats = seats_of(sc);
+    int pipes[MAX_SEATS][2], stops[MAX_SEATS][2], ready[2];
+    pid_t pids[MAX_SEATS];
+    Report *rr[MAX_SEATS];
+    int got[MAX_SEATS];
     char c;
-    pid_t a, b;
-    Report *ra = (Report *)calloc(1, sizeof(Report));
-    Report *rb = (Report *)calloc(1, sizeof(Report));
     uint32_t session_id = 0x52424456u ^ (uint32_t)getpid() ^ port_base;
     uint32_t upto, t, first_bad = 0;
-    int got_a, got_b;
+    uint32_t sum_init = 0, sum_follow = 0, sum_refused = 0, sum_fork = 0, sum_lobby = 0;
+    uint32_t sum_timeout = 0, sum_deferred = 0, sum_at_tip = 0, sum_stall = 0;
     int64_t ledger;
-    char msg[256];
+    char msg[320];
+    int k, j;
 
-    if (pipe(pa) != 0 || pipe(pb) != 0 || pipe(ready) != 0 || pipe(stop_a) != 0 ||
-        pipe(stop_b) != 0) {
+    if (pipe(ready) != 0) {
         expect_true(0, "pipe");
         return;
     }
+    for (k = 0; k < nseats; ++k) {
+        if (pipe(pipes[k]) != 0 || pipe(stops[k]) != 0) {
+            expect_true(0, "pipe");
+            return;
+        }
+        rr[k] = (Report *)calloc(1, sizeof(Report));
+    }
     fflush(stdout);
     fflush(stderr);
-    a = fork();
-    if (a == 0) {
-        close(pa[0]);
-        run_child(sc, 0, port_base, port_base + 1u, session_id, pa[1], ready[1], stop_a[0]);
+    for (k = 0; k < nseats; ++k) {
+        pids[k] = fork();
+        if (pids[k] == 0) {
+            close(pipes[k][0]);
+            run_child(sc, k, port_base, session_id, pipes[k][1], ready[1], stops[k][0]);
+        }
     }
-    b = fork();
-    if (b == 0) {
-        close(pb[0]);
-        run_child(sc, 1, port_base + 1u, port_base, session_id, pb[1], ready[1], stop_b[0]);
-    }
-    close(pa[1]);
-    close(pb[1]);
+    for (k = 0; k < nseats; ++k)
+        close(pipes[k][1]);
     close(ready[1]);
-    /* Both have played their ticks (or given up): stop them together. */
-    (void)read_all(ready[0], &c, 1);
-    (void)read_all(ready[0], &c, 1);
-    (void)write_all(stop_a[1], "S", 1);
-    (void)write_all(stop_b[1], "S", 1);
-    got_a = read_all(pa[0], ra, sizeof(*ra));
-    got_b = read_all(pb[0], rb, sizeof(*rb));
-    waitpid(a, NULL, 0);
-    waitpid(b, NULL, 0);
-    close(pa[0]);
-    close(pb[0]);
+    /* Every seat has played its ticks (or given up): stop them together. */
+    for (k = 0; k < nseats; ++k)
+        (void)read_all(ready[0], &c, 1);
+    for (k = 0; k < nseats; ++k)
+        (void)write_all(stops[k][1], "S", 1);
+    for (k = 0; k < nseats; ++k)
+        got[k] = read_all(pipes[k][0], rr[k], sizeof(Report));
+    for (k = 0; k < nseats; ++k) {
+        waitpid(pids[k], NULL, 0);
+        close(pipes[k][0]);
+        close(stops[k][0]);
+        close(stops[k][1]);
+    }
     close(ready[0]);
-    close(stop_a[0]);
-    close(stop_a[1]);
-    close(stop_b[0]);
-    close(stop_b[1]);
 
-    printf("%-22s init=%u+%u follow=%u+%u refused=%u abort=%u+%u timeout=%u fork=%u "
-           "extend=%u unapplied=%u forced=%u replay_admits=%u+%u resim=%llu+%llu "
-           "sim=%u/%u confirmed=%u/%u quiesce=%d/%d unopened=%u tiphold_end=%u\n",
-           sc->name, ra->n_ep_init, rb->n_ep_init, ra->n_ep_follow, rb->n_ep_follow,
-           ra->n_refused + rb->n_refused, ra->n_abort, rb->n_abort,
-           ra->n_timeout + rb->n_timeout, ra->n_fork + rb->n_fork,
-           ra->n_extend + rb->n_extend, ra->n_unapplied + rb->n_unapplied,
-           ra->n_forced, ra->replay_admits, rb->replay_admits,
-           (unsigned long long)ra->resim_ticks, (unsigned long long)rb->resim_ticks,
-           ra->sim, rb->sim, ra->confirmed, rb->confirmed, ra->quiesce_state,
-           rb->quiesce_state, ra->n_drain_unopened + rb->n_drain_unopened,
-           ra->n_tiphold_end + rb->n_tiphold_end);
+    for (k = 0; k < nseats; ++k) {
+        const Report *r = rr[k];
+        printf("%-22s seat%d init=%u follow=%u refused=%u abort=%u timeout=%u fork=%u "
+               "extend=%u unapplied=%u forced=%u replay_admits=%u resim=%llu sim=%u "
+               "confirmed=%u quiesce=%d unopened=%u tiphold_end=%u deferred=%u "
+               "at_tip=%u stalls=%u\n",
+               sc->name, k, r->n_ep_init, r->n_ep_follow, r->n_refused, r->n_abort,
+               r->n_timeout, r->n_fork, r->n_extend, r->n_unapplied, r->n_forced,
+               r->replay_admits, (unsigned long long)r->resim_ticks, r->sim, r->confirmed,
+               r->quiesce_state, r->n_drain_unopened, r->n_tiphold_end, r->n_deferred,
+               r->n_at_tip, r->n_chain_stall);
+        sum_init += r->n_ep_init;
+        sum_follow += r->n_ep_follow;
+        sum_refused += r->n_refused;
+        sum_fork += r->n_fork;
+        sum_lobby += r->n_lobby;
+        sum_timeout += r->n_timeout;
+        sum_deferred += r->n_deferred;
+        sum_at_tip += r->n_at_tip;
+        sum_stall += r->n_chain_stall;
+        snprintf(msg, sizeof(msg), "%s: seat %d reported", sc->name, k);
+        expect_true(got[k], msg);
+        snprintf(msg, sizeof(msg), "%s: seat %d reached RUNNING", sc->name, k);
+        expect_true(r->running, msg);
+    }
 
-    snprintf(msg, sizeof(msg), "%s: both children reported", sc->name);
-    expect_true(got_a && got_b, msg);
-    snprintf(msg, sizeof(msg), "%s: both sessions reached RUNNING", sc->name);
-    expect_true(ra->running && rb->running, msg);
     if (sc->refusal) {
-        const Report *rr[2];
-        int k;
-        rr[0] = ra;
-        rr[1] = rb;
         printf("%-22s refusal=%s/%s after=%u/%u ms sim@refusal=%u/%u "
                "sim+1s=%u/%u live_after=%u/%u lobby=%u/%u\n",
-               sc->name, ra->refusal, rb->refusal, ra->refused_after_ms,
-               rb->refused_after_ms, ra->sim_at_refusal, rb->sim_at_refusal,
-               ra->sim_after_hold, rb->sim_after_hold, ra->live_admits_after,
-               rb->live_admits_after, ra->n_lobby, rb->n_lobby);
-        for (k = 0; k < 2; ++k) {
+               sc->name, rr[0]->refusal, rr[1]->refusal, rr[0]->refused_after_ms,
+               rr[1]->refused_after_ms, rr[0]->sim_at_refusal, rr[1]->sim_at_refusal,
+               rr[0]->sim_after_hold, rr[1]->sim_after_hold, rr[0]->live_admits_after,
+               rr[1]->live_admits_after, rr[0]->n_lobby, rr[1]->n_lobby);
+        for (k = 0; k < nseats; ++k) {
             const Report *r = rr[k];
             const char *who = k ? "follower" : "initiator";
             snprintf(msg, sizeof(msg), "%s: %s asked for the lobby exactly once (%u)",
@@ -762,68 +894,101 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
             snprintf(msg, sizeof(msg), "%s: %s opened no episode", sc->name, who);
             expect_true(r->n_ep_init + r->n_ep_follow == 0u, msg);
         }
-        free(ra);
-        free(rb);
-        return;
+        goto done;
     }
-    snprintf(msg, sizeof(msg), "%s: both peers ran the match", sc->name);
-    expect_true(ra->sim >= sc->ticks && rb->sim >= sc->ticks / 2u, msg);
-    snprintf(msg, sizeof(msg), "%s: episodes ran (nothing exercised otherwise)", sc->name);
-    expect_true(ra->n_ep_init + rb->n_ep_init > 0u &&
-                    ra->n_ep_follow + rb->n_ep_follow > 0u,
-                msg);
-    snprintf(msg, sizeof(msg), "%s: 0 forks", sc->name);
-    expect_true(ra->n_fork + rb->n_fork == 0u, msg);
-    snprintf(msg, sizeof(msg), "%s: no match refused to start", sc->name);
-    expect_true(ra->n_lobby + rb->n_lobby == 0u, msg);
-    snprintf(msg, sizeof(msg), "%s: both peers drained (state %d/%d, %u/%u quiesced lines)",
-             sc->name, ra->quiesce_state, rb->quiesce_state, ra->n_quiesced, rb->n_quiesced);
-    expect_true(ra->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
-                    rb->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
-                    ra->n_quiesced == 1u && rb->n_quiesced == 1u,
-                msg);
-    /* The exact ledger, by role and in both directions: every episode one
-     * side opens is followed or refused by the other. No scenario here drops
-     * a datagram, and the drain leaves nothing in flight, so there is no
-     * third category -- the residual is 0, not "at most the timeouts". */
-    ledger = (int64_t)(ra->n_ep_init + rb->n_ep_init) -
-             (int64_t)(ra->n_ep_follow + rb->n_ep_follow) -
-             (int64_t)(ra->n_refused + rb->n_refused);
-    snprintf(msg, sizeof(msg), "%s: episode ledger is exact (residual %lld, timeouts %u)",
-             sc->name, (long long)ledger, ra->n_timeout + rb->n_timeout);
-    expect_true(ledger == 0, msg);
-    if (sc->mode_a || sc->mode_b) {
-        snprintf(msg, sizeof(msg), "%s: the incremental peer replayed tick by tick", sc->name);
-        expect_true((sc->mode_a ? ra->replay_admits : 0u) +
-                        (sc->mode_b ? rb->replay_admits : 0u) > 0u,
+    for (k = 0; k < nseats; ++k) {
+        snprintf(msg, sizeof(msg), "%s: seat %d ran the match (sim %u)", sc->name, k, rr[k]->sim);
+        expect_true(rr[k]->sim >= (k == 0 ? sc->ticks : sc->ticks / 2u), msg);
+        snprintf(msg, sizeof(msg), "%s: seat %d drained (state %d, %u quiesced lines)",
+                 sc->name, k, rr[k]->quiesce_state, rr[k]->n_quiesced);
+        expect_true(rr[k]->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
+                        rr[k]->n_quiesced == 1u,
                     msg);
+    }
+    snprintf(msg, sizeof(msg), "%s: episodes ran (nothing exercised otherwise)", sc->name);
+    expect_true(sum_init > 0u && sum_follow > 0u, msg);
+    snprintf(msg, sizeof(msg), "%s: 0 forks", sc->name);
+    expect_true(sum_fork == 0u, msg);
+    snprintf(msg, sizeof(msg), "%s: no match refused to start", sc->name);
+    expect_true(sum_lobby == 0u, msg);
+    /* The exact ledger, by role: every episode one seat opens is followed or
+     * refused by EVERY other seat, exactly once. No scenario here drops a
+     * datagram, and the drain leaves nothing in flight, so there is no third
+     * category -- the residual is 0, not "at most the timeouts". Graded per
+     * initiator/follower pair by epoch; the sum is printed too. */
+    ledger = (int64_t)sum_init * (nseats - 1) - (int64_t)sum_follow - (int64_t)sum_refused;
+    snprintf(msg, sizeof(msg), "%s: episode ledger is exact (residual %lld, timeouts %u)",
+             sc->name, (long long)ledger, sum_timeout);
+    expect_true(ledger == 0, msg);
+    for (k = 0; k < nseats; ++k) {
+        for (j = 0; j < nseats; ++j) {
+            uint32_t i, bad = 0, n = 0;
+            if (j == k)
+                continue;
+            for (i = 0; i < rr[k]->n_ep_init_ids; ++i) {
+                uint32_t e = rr[k]->ep_init[i];
+                uint32_t ans = count_epoch(rr[j]->ep_follow, rr[j]->n_ep_follow_ids, e) +
+                               count_epoch(rr[j]->ep_refused, rr[j]->n_ep_refused_ids, e);
+                n++;
+                if (ans != 1u)
+                    bad++;
+            }
+            snprintf(msg, sizeof(msg), "%s: pair %d->%d answered every episode exactly "
+                     "once (%u of %u wrong)", sc->name, k, j, bad, n);
+            expect_true(bad == 0u, msg);
+        }
+    }
+    if (sc->expect_no_refusal) {
+        snprintf(msg, sizeof(msg), "%s: a follower behind the load tick followed it "
+                 "(deferred %u, at our tip %u, refused %u)", sc->name, sum_deferred,
+                 sum_at_tip, sum_refused);
+        expect_true(sum_deferred + sum_at_tip > 0u && sum_refused == 0u, msg);
+    }
+    /* No advisory stall on a link that loses nothing: an aborted episode no
+     * longer leaves a stale digest behind, and nothing else should stall. */
+    snprintf(msg, sizeof(msg), "%s: no chain stall (%u)", sc->name, sum_stall);
+    expect_true(sum_stall == 0u, msg);
+    if (sc->mode_a || sc->mode_b) {
+        uint32_t ra = 0;
+        for (k = 0; k < nseats; ++k)
+            if (k == 0 ? sc->mode_a : sc->mode_b)
+                ra += rr[k]->replay_admits;
+        snprintf(msg, sizeof(msg), "%s: the incremental peer replayed tick by tick", sc->name);
+        expect_true(ra > 0u, msg);
     }
     if (!sc->mode_a) {
         snprintf(msg, sizeof(msg), "%s: an inline peer never hands back a replay tick",
                  sc->name);
-        expect_true(ra->replay_admits == 0u, msg);
+        expect_true(rr[0]->replay_admits == 0u, msg);
     }
 
-    /* The two final timelines agree through what both sides confirmed. This
-     * is the engine's own state, not the driver's hash chain. */
-    upto = ra->confirmed < rb->confirmed ? ra->confirmed : rb->confirmed;
+    /* Every final timeline agrees with seat 0's through what every side
+     * confirmed. This is the engine's own state, not the driver's hash chain. */
+    upto = rr[0]->confirmed;
+    for (k = 1; k < nseats; ++k)
+        if (rr[k]->confirmed < upto)
+            upto = rr[k]->confirmed;
     if (upto >= TOY_TICKS) upto = TOY_TICKS - 1u;
     snprintf(msg, sizeof(msg), "%s: the confirmed frontier advanced (%u)", sc->name, upto);
     expect_true(upto >= sc->ticks / 3u, msg);
-    for (t = 1; t <= upto; ++t) {
-        if (ra->timeline[t] != rb->timeline[t]) {
-            first_bad = t;
-            break;
+    for (k = 1; k < nseats; ++k) {
+        first_bad = 0;
+        for (t = 1; t <= upto; ++t) {
+            if (rr[0]->timeline[t] != rr[k]->timeline[t]) {
+                first_bad = t;
+                break;
+            }
         }
+        snprintf(msg, sizeof(msg), "%s: seat %d's timeline agrees with seat 0's through "
+                 "tick %u (first diff %u)", sc->name, k, upto, first_bad);
+        expect_true(first_bad == 0u, msg);
     }
-    snprintf(msg, sizeof(msg), "%s: final timelines agree through tick %u (first diff %u)",
-             sc->name, upto, first_bad);
-    expect_true(first_bad == 0u, msg);
-    free(ra);
-    free(rb);
+done:
+    for (k = 0; k < nseats; ++k)
+        free(rr[k]);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     /* The SNES sweep's gating latencies and its injector interval (45), at a
      * 60 Hz frontend cadence, so a pass here means what a pass there means.
@@ -841,13 +1006,33 @@ int main(void)
           1, 0, "boot_digest_mismatch" },
         { "refuse-mod-mismatch", 0, 1,       "30",  "8",   0,     420u,  0,
           0, 1, "mod_set_mismatch" },
+        /* The follower runs 3-4 ticks behind on a 0 ms link, so the
+         * initiator's load tick is often one it has not simulated yet: it must
+         * follow (deferred, or at its tip), never refuse -- and the chain must
+         * not stall on the episode. */
+        { "follower-behind-0ms", 1, 1,       "0",   "0",   15,    420u,  0,
+          0, 0, NULL, 2, 60u, 0, 1, 1, 2u },
+        { "follower-behind-inline", 0, 0,    "0",   "0",   15,    420u,  0,
+          0, 0, NULL, 2, 60u, 0, 1, 1, 2u },
+        /* More than two seats, seat 0 relaying: the per-peer chain, the
+         * per-seat mod-set and identity handshakes, per-pair ledger. */
+        { "3seat-loopback",      1, 1,       "0",   "0",   45,    420u,  0,
+          0, 0, NULL, 3, 0u, 1, 0 },
+        { "3seat-behind",        1, 1,       "0",   "0",   30,    420u,  0,
+          0, 0, NULL, 3, 60u, 1, 1, 1, 2u },
+        { "4seat-rtt200",        1, 1,       "100", "25",  45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0 },
+        { "4seat-mixed-rtt60",   0, 1,       "30",  "8",   45,    420u,  1,
+          0, 0, NULL, 4, 0u, 1, 0 },
     };
     unsigned port_base = 30000u + ((unsigned)getpid() % 5000u) * 4u;
     size_t i;
 
     in_process_tests();
+    /* An argument runs only the scenarios whose name contains it. */
     for (i = 0; i < sizeof(scenarios) / sizeof(scenarios[0]); ++i)
-        run_scenario(&scenarios[i], port_base + (unsigned)i * 2u * 997u % 20000u);
+        if (argc < 2 || strstr(scenarios[i].name, argv[1]))
+            run_scenario(&scenarios[i], port_base + (unsigned)i * 2u * 997u % 20000u);
 
     if (g_failures == 0) {
         printf("rb_driver_test: ok\n");
