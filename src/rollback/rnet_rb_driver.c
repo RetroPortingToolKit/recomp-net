@@ -848,6 +848,20 @@ static uint8_t rb_vt_get_input_row(void *ctx, int32_t slot, uint32_t tick,
 
     if (!out || slot < 0 || slot >= rb_slot_count(d))
         return 0;
+    /* An empty seat of a sparse room has no owner: every peer simulates the
+     * zero sample RNetSession synthesizes for it (peek_remote_input). Seal
+     * exactly that, never the history -- the history may hold an invented
+     * (predicted) row for it, and nobody will ever send SEAL_ROWS to replace
+     * it (the episode would wait out its watchdog and lose the correction). */
+    if ((int)slot != rb_local_slot(d) && d->cfg.occupied_mask &&
+        !(d->cfg.occupied_mask & (1u << (uint32_t)slot))) {
+        memset(&sample, 0, sizeof(sample));
+        sample.tick = rnet_sched_wire_for_sim(tick);
+        sample.valid = 1;
+        rb_row_from_sample(d, (int)slot, tick, &sample, out);
+        rb_row_sanitize(d, (int)slot, out);
+        return 1;
+    }
     if (rnet_ih_get(&d->ih, (int)slot, tick, out)) {
         rb_row_sanitize(d, (int)slot, out);
         return 1;
@@ -1598,6 +1612,9 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
     rcfg.local_slot = (uint32_t)rb_local_slot(d);
     rcfg.delay = (uint32_t)rb_input_delay(d);
     rcfg.slot_count = (uint32_t)slots;
+    /* Seal completion waits on the same seats the episode FSM does
+     * (rb_expect_mask): never on an empty seat of a sparse room. */
+    rcfg.occupied_mask = d->cfg.occupied_mask;
     rcfg.tip_runway = (uint32_t)rb_env_int(d, "TIP_RUNWAY",
                                            RNET_RB_TIP_RUNWAY_DEFAULT, 0, 32);
     /* Keep the light-tip ceiling at the runway: a coalesced episode's depth

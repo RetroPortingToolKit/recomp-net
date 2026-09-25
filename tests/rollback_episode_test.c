@@ -31,6 +31,10 @@ typedef struct TestHost
      * row). */
     uint32_t seats;
     uint32_t asked_outside_seats;
+    /* Seats whose rows the host answers wire-confirmed whatever
+     * remote_history says: a sparse room's empty seats, for which every peer
+     * synthesizes the same row and nobody sends SEAL_ROWS. */
+    uint32_t confirmed_seats;
 } TestHost;
 
 static int host_save_state(void *ctx, uint32_t tick)
@@ -89,7 +93,121 @@ static uint8_t host_get_input_row(void *ctx, int32_t slot, uint32_t tick, RNetRb
     /* Seat 0 is local in every session below: its row is always authority. */
     out->is_predicted = (slot != 0 && h->remote_history == 0u) ? 1u : 0u;
     out->is_valid = (slot != 0 && h->remote_history == 3u) ? 0u : 1u;
+    if (h->confirmed_seats & (1u << (uint32_t)slot))
+    {
+        out->buttons = 0u;
+        out->stick_x = 0;
+        out->is_predicted = 0u;
+        out->is_valid = 1u;
+    }
     return 1u;
+}
+
+/* A sparse room: seats 0 and 2 of 4 are occupied, 1 and 3 are empty. Seat 2
+ * sends SEAL_ROWS; nobody sends them for 1 or 3. Seal completion must wait on
+ * seat 2 alone -- waiting on an empty seat never completes, the episode times
+ * out, and its correction is lost (measured: rb_driver_test's sparse
+ * scenario forked 3 runs in 8 before RNetRbConfig.occupied_mask). */
+static void test_sparse_room(const RNetRollbackVTable *vt, TestHost *host)
+{
+    RNetRbConfig cfg;
+    RNetRbSession *s;
+    RNetRbCorrection corr;
+    RNetRbFrame rows[2];
+    RNetRbFrame got;
+    uint32_t i;
+
+    host->seats = 4u;
+    host->remote_history = 0u;        /* remote history is only predictions */
+    host->confirmed_seats = 0xAu;     /* seats 1 and 3: the synthesized row */
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.local_slot = 0u;
+    cfg.delay = 3u;
+    cfg.slot_count = 4u;
+    memset(&corr, 0, sizeof(corr));
+    corr.epoch_id = 21u;
+    corr.target_tick = 1u;
+    memset(rows, 0, sizeof(rows));
+    for (i = 0u; i < 2u; ++i)
+    {
+        rows[i].tick = i;
+        rows[i].buttons = 0x202u;
+        rows[i].is_valid = 1u;
+    }
+
+    /* Dense (legacy occupied_mask = 0): every seat is a peer. Seats 1 and 3
+     * pre-seal from confirmed history; seat 2 must still send its rows. */
+    s = rnet_rb_create(&cfg, vt);
+    expect_true(s != NULL, "dense 4-seat session creates");
+    expect_true(rnet_rb_expected_peer_mask(s) == 0xEu, "dense: expects seats 1,2,3");
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, 0u, 1u, 2);
+    expect_true(!rnet_rb_all_peer_seal_rows_complete(s), "dense: waits on seat 2");
+    rnet_rb_destroy(s);
+
+    /* Dense, and the host has NOTHING confirmed for seat 3: the dense room
+     * keeps waiting on it after seat 2 answers (the sparse bug's shape). */
+    host->confirmed_seats = 0x2u;
+    s = rnet_rb_create(&cfg, vt);
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, 0u, 1u, 2);
+    expect_true(rnet_rb_apply_peer_seal_rows(s, 21u, 0u, 1u, 2, 0u, rows, 2u),
+                "dense: seat 2's rows apply");
+    expect_true(!rnet_rb_all_peer_seal_rows_complete(s),
+                "dense: still waits on seat 3, which nobody seals");
+    rnet_rb_destroy(s);
+    host->confirmed_seats = 0xAu;
+
+    /* Sparse: only seat 2 is expected. */
+    cfg.occupied_mask = 0x5u;
+    s = rnet_rb_create(&cfg, vt);
+    expect_true(s != NULL, "sparse session creates");
+    expect_true(rnet_rb_expected_peer_mask(s) == 0x4u, "sparse: expects seat 2 only");
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, 0u, 1u, 2);
+    expect_true(!rnet_rb_all_peer_seal_rows_complete(s),
+                "sparse: still waits on the occupied seat");
+    expect_true(rnet_rb_apply_peer_seal_rows(s, 21u, 0u, 1u, 2, 0u, rows, 2u),
+                "sparse: seat 2's rows apply");
+    expect_true(rnet_rb_all_peer_seal_rows_complete(s),
+                "sparse: complete once every OCCUPIED seat has sealed");
+    for (i = 0u; i < 2u; ++i)
+    {
+        expect_true(rnet_rb_get_sealed_frame(s, 3, i, &got) && got.buttons == 0u &&
+                        !got.is_predicted,
+                    "sparse: an empty seat replays the synthesized row");
+        expect_true(rnet_rb_get_sealed_frame(s, 2, i, &got) && got.buttons == 0x202u,
+                    "sparse: the occupied seat replays its owner's row");
+    }
+    rnet_rb_destroy(s);
+
+    /* Sparse, and the host breaks the contract (no confirmed row for the
+     * empty seats): completion still does not wait on a seat nobody sits in,
+     * and the core never invents the missing row -- the replay finds it
+     * missing and says so, instead of a seal watchdog timing out silently. */
+    host->confirmed_seats = 0u;
+    s = rnet_rb_create(&cfg, vt);
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, 0u, 1u, 2);
+    expect_true(rnet_rb_apply_peer_seal_rows(s, 21u, 0u, 1u, 2, 0u, rows, 2u),
+                "sparse/no-row: seat 2's rows apply");
+    expect_true(rnet_rb_all_peer_seal_rows_complete(s),
+                "sparse/no-row: completion does not wait on an empty seat");
+    expect_true(!rnet_rb_get_sealed_frame(s, 3, 0u, &got),
+                "sparse/no-row: the core never invents an empty seat's row");
+    rnet_rb_destroy(s);
+    host->confirmed_seats = 0xAu;
+
+    /* An observer (local_slot == slot_count) waits on every occupied seat. */
+    cfg.local_slot = 4u;
+    s = rnet_rb_create(&cfg, vt);
+    expect_true(s != NULL && rnet_rb_expected_peer_mask(s) == 0x5u,
+                "sparse observer expects seats 0 and 2");
+    rnet_rb_destroy(s);
+
+    host->seats = 2u;
+    host->confirmed_seats = 0u;
 }
 
 static void test_seal_bounds(RNetRbConfig cfg, const RNetRollbackVTable *vt)
@@ -639,6 +757,7 @@ int main(void)
 
     test_seal_bounds(cfg, &vt);
     test_history_authority(&cfg, &vt, &host);
+    test_sparse_room(&vt, &host);
 
     if (g_failures == 0)
     {

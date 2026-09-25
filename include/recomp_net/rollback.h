@@ -174,9 +174,9 @@ typedef struct RNetRbConfig
     uint32_t delay;            /* committed input delay D */
     uint32_t seal_max_span;    /* <= RNET_RB_SEAL_MAX_SPAN; 0 = default */
     /* Active seats in this match (1..RNET_RB_MAX_SLOTS). Peer-seal completion
-     * only waits on slots in [0, slot_count) excluding local_slot -- so an
-     * observer, whose local_slot is outside that range, waits on all of them.
-     * 0 => 2. */
+     * only waits on OCCUPIED slots in [0, slot_count) excluding local_slot
+     * (see occupied_mask) -- so an observer, whose local_slot is outside that
+     * range, waits on all of them. 0 => 2. */
     uint32_t slot_count;
     /* TipHold quiet window after POST match (0 = finalize immediately;
      * RNET_RB_TIP_RUNWAY_DEFAULT recommended for digital hosts). Also the
@@ -193,6 +193,16 @@ typedef struct RNetRbConfig
      * library default of 16 silently loses the light-tip fast path and pays
      * a second RTT it didn't need to. Clamped like tip_runway (max 32). */
     uint32_t light_tip_max_depth;
+    /* Bit i = seat i is occupied by a real peer (same meaning as
+     * RNetConfig.occupied_mask). 0 = every seat in [0, slot_count) (legacy).
+     * A sparse room (e.g. seats 0+2 of 4) must clear the empty bits: nobody
+     * sends SEAL_ROWS for an empty seat, so peer-seal completion that waits on
+     * one never completes. An empty seat's rows are sealed from the host's
+     * get_input_row like a wire-confirmed remote row -- the host must answer
+     * with the deterministic value every peer synthesizes for that seat
+     * (RNetSession: a zero sample). Appended last so a zero-initialised
+     * config keeps the old behaviour. */
+    uint32_t occupied_mask;
 } RNetRbConfig;
 
 /* Lifecycle. */
@@ -320,6 +330,9 @@ uint8_t rnet_rb_apply_peer_seal_rows(RNetRbSession *s, uint32_t epoch_id, uint32
                                      const RNetRbFrame *rows, uint32_t row_count);
 uint8_t rnet_rb_peer_seal_rows_complete(const RNetRbSession *s, int32_t slot);
 uint8_t rnet_rb_all_peer_seal_rows_complete(const RNetRbSession *s);
+/* Seats whose seal rows this session waits on: every occupied seat in
+ * [0, slot_count) except local_slot (bit i = seat i). */
+uint32_t rnet_rb_expected_peer_mask(const RNetRbSession *s);
 uint8_t rnet_rb_export_seal_rows_chunk(const RNetRbSession *s, int32_t slot, uint32_t row_begin,
                                        uint32_t max_rows, RNetRbFrame *out_frames,
                                        uint32_t *out_row_count);
