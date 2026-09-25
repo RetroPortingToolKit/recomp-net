@@ -47,10 +47,13 @@
  *
  * Seats: 1..RNET_RB_MAX_SLOTS. Epoch ids carry the initiator's seat in their
  * low RNET_RB_EPOCH_SLOT_BITS bits, so dual initiation is arbitrated by seat
- * (lower wins) without a wire change, and BASELINE / POST / COMMIT agreement
- * is tracked per peer (rnet_session_rb_last_take_from). With two seats every
- * behaviour is the one snesrecomp shipped. More than two peers is BUILT BUT
- * UNEXERCISED: no multi-peer harness exists yet (see docs/rollback.md).
+ * (lower wins) without a wire change, and BASELINE / POST / COMMIT, the
+ * FRAME_COMMIT hash chain, the boot digest, identity and the mod-set answer
+ * are all tracked per peer (rnet_session_rb_last_take_from). With two seats
+ * every behaviour is the one snesrecomp shipped. Three and four seats have
+ * run: rb_driver_test (forked peers over the session's LAN hub) and n64lle's
+ * tools/rb_loopback.sh (RB_LOOPBACK_SEATS); see docs/rollback.md, "More than
+ * two peers", for what that took and what it has not covered.
  *
  * The admission scheduler is process-global (rnet_sched_bind), so one driver
  * may be started per process at a time.

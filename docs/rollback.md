@@ -67,8 +67,14 @@ send path truncates a larger chunk, so a host that chunks wider posts a partial
 span and waits forever for the rest. `row_begin` is an OFFSET into the sealed
 span and the `mismatch` field carries the seal base (the LOAD tick) -- sending
 ticks in either posts nothing. `rnet_session_rb_last_take_from` names the
-sender of the rb_* message just taken, which an episode with more than one
-peer needs to count answers per peer.
+sender of the rb_* message just taken (FRAME_COMMIT and the mod-set ACK
+included), which an episode with more than one peer needs to count answers
+per peer.
+
+`RB_FRAME_COMMIT` is sent after every live tick and, since 2026-09-25, for
+every tick of a completed replay (the replayed digest replaces the live one;
+see "Episode driver"). The session keeps each commit's sender; the driver
+keeps one chain per peer.
 
 Hosts map their existing wire onto these when aligning transports (BattleShip's
 soak-hardened `SYNETPEER_*` format stays authoritative for live matches); new
@@ -206,6 +212,53 @@ state, so a correction that never lands is a measurable divergence):
   committed -- every POST timeout in snesrecomp's 200/300 ms sweep cells.
   POST and BASELINE for a peer epoch newer than any BEGIN seen from that seat
   are held per seat and taken when the BEGIN opens the episode.
+  SEAL_ROWS chunks are held the same way (2026-09-25), and an answer held for
+  another epoch that can still open survives a follow of a different one.
+- **A follower short of the load tick follows it** (2026-09-25). It used to
+  refuse ("no snapshot at load tick"); see "The follower behind the load
+  tick" below. At `sim == load` the live state IS the snapshot keyed `load`
+  and is taken on the spot ("RB follow at our live tip"); short of it, the
+  BEGIN is held ("RB follow deferred ... span=") and followed when sim gets
+  there ("RB follow resumed ... after N ms"), bounded by half the episode
+  budget (then "RB follow refused ... did not reach it within N ms" and a
+  NACK, before the initiator's own watchdog). While one is held this peer
+  opens no episode of its own (the correction is owed and re-opened after),
+  and a second BEGIN is arbitrated like one for an open episode.
+- **A completed replay rewrites the chain.** Each replayed tick's digest is
+  kept and, when the replay completes, written into the hash chain and sent
+  as a FRAME_COMMIT. A commit re-primes the chain anyway; an episode that
+  ended any other way after its replay left the live, mispredicted digests
+  behind, and the chain stalled on a tick the replay had already fixed. A
+  replay undone by a tip restore leaves no trace (nothing is written until it
+  completes). The advisory "RB chain stall" is also not reported at or after
+  a correction this peer still owes: that mismatch is explained until the
+  retry replays it.
+- **POST and BEGIN are re-sent until answered** (2026-09-25). Each used to go
+  out once, and one lost datagram held the peer that needed it for the whole
+  2 s episode budget ("timed out waiting for peer POST"). A commit needs N-1
+  POSTs at each of N peers, so the chance one is lost grows with the seats:
+  about 4 % of episodes at 2 % loss with two, about 22 % with four. POST is
+  re-sent through Verifying and TipHold, the initiator's BEGIN (with the
+  current target) through Sealing and Verifying until every peer has answered
+  the epoch, each once per round trip and at least 50 ms apart. A peer
+  answers each BEGIN once (a ring of epochs seen); a repeat of one it refused
+  repeats the NACK, since that is what was lost; one overtaken on the link by
+  a newer BEGIN from the same seat is refused. The drain line counts both
+  ("POSTs re-sent", "BEGINs re-sent"). Measured on n64lle, same day, before
+  (5492a31) and after (bb8096a): the two-seat sweep's loss cells (2 %, 5 %,
+  2 % + 200 ms) went from 3, 6 and 1 watchdogs to 0, 0 and 0, and four seats
+  at 2 % from 12 and 9 to 2 and 2 (below). snesrecomp's sweep (Gundam, built
+  against this branch; snesrecomp `feat/netplay-integration` 00d1566, its own
+  `tools/rb_sweep.sh`): 13/13 gating PASS and 0 forks on both 5492a31 and
+  bb8096a; its loss cells' aborts went from 3, 8 and 1 to 0, 0 and 0.
+- **A newer BEGIN from the episode's initiator releases the follower**
+  ("RB follow released"): an initiator runs one episode at a time, so it has
+  left the one we hold. A lost COMMIT used to keep the follower in tip-hold
+  and NACK the next episode.
+- **A correction that can no longer be replayed says so** ("RB correction
+  LOST"): once its replay would exceed the 64-row seal mask, or when it ages
+  out of the input history. The second used to happen silently, and the
+  drain line of a peer that had forked reported "still owed: 0".
 
 ### Integrating a host (n64lle, psxrecomp, the next engine)
 
@@ -304,36 +357,109 @@ Tip-hold now logs every exit with how long it actually held:
 every peer committed, tip-extend, aborted, peer aborted, yielded, watchdog
 expired). The runway is a ceiling, not a duration.
 
-### Measured on n64lle, not yet fixed here (2026-09-25)
+### The follower behind the load tick, and the chain after it (fixed 2026-09-25)
 
-n64lle's two-process sweep (n64lle `docs/NETPLAY.md` §5, the incremental
-shape, Pokemon Stadium) forked nowhere, but shows two behaviours this driver
-owns:
+Measured on n64lle's two-process sweep (n64lle `docs/NETPLAY.md` §5, the
+incremental shape, Pokemon Stadium) and filed here as not yet fixed: a
+follower that had not yet simulated the load tick REFUSED the episode ("RB
+follow refused ... no snapshot at load tick") -- 2 of 57 episodes at 0 ms in
+one run, 24 of 56 in a rerun of the same cell -- and after that abort the
+initiator's chain stalled ("RB chain stall", advisory) on the very tick of the
+NACKed episode.
 
-- **A follower that has not yet simulated the load tick refuses the episode**
-  ("RB follow refused ... no snapshot at load tick", the ring's newest being
-  load-1). It has nothing to correct -- it will simulate that tick on the true
-  rows -- but the NACK aborts the initiator's episode. At 0 ms it varies run
-  to run with how far the peers' tick clocks sit apart: 2 of 57 episodes in
-  one run, 24 of 56 in a rerun of the same cell on the same build; 0-3 at
-  60 ms RTT, 0 at 200 and 300 ms.
-- **After that abort the chain stalls on a digest the replay already
-  replaced.** The initiator's replay completed (it paid the correction, as the
-  rule above says) before the NACK arrived, but the hash chain still holds the
-  live, mispredicted digest for that tick; nothing re-notes it on the abort
-  path, so "RB chain stall" (ADVISORY) fires and the confirmed watermark waits
-  for the tick to age out. Every such stall in the sweep sat on a tick of a
-  NACKed episode.
+**Root cause (MISSING, not WRONG).** Nothing wrote a bad snapshot: the
+snapshot keyed `load` did not exist yet on the follower, because its producer
+-- the follower's own live admit of tick `load` -- had not run. Every refusal
+line's ring window put the newest snapshot at `load-1` to `load-4` (e.g.
+"span=810..810 ... ring oldest=767" at depth 40): the follower was one to four
+fields behind the initiator, which detects an injected mispredict at `t+1`
+and loads `t`. Which peer leads is a matter of whose fields ran slower, so the
+rate swung run to run with machine load. The follower had nothing to correct
+-- it would simulate that tick on the true rows anyway -- but its NACK aborted
+an episode the initiator had already replayed. The stall was a second MISSING
+effect: the replay corrected the tick, but only a commit re-primed the chain,
+so the chain kept the live, mispredicted digest that no replay path wrote over.
+
+**Fix** (both in the driver, so every engine inherits it; see the rules
+above): the follower takes the load snapshot at its live tip when `sim ==
+load`, holds the BEGIN until it gets there when `sim < load`, and a completed
+replay writes its digests into the chain and sends them. Considered and not
+built: the initiator refusing to open until the slowest peer's confirmed
+frontier passes the load tick. It learns that frontier only from FRAME_COMMITs,
+half a round trip after the fact, so it would delay every episode by at least
+what the follower-side hold costs plus that trip, and with more seats wait for
+the slowest peer every time; the follower knows its own tick exactly.
+
+**Measured** (n64lle `feat/rollback-nseat`, `tools/rb_loopback.sh`, 0 ms, 45 s,
+D=8 P=12, injector every 45 remote rows, homeserver, other sessions' runs
+beside it). Before, same machine and day, three runs of the unchanged build:
+5 of 32, 8 of 29 and 0 of 55 episodes refused, with 7, 10 and 0 chain-stall
+lines. After, five runs: **0 refused of 236** (56, 54, 55, 36, 35 episodes;
+ledger residual 0 and 0 forks in each), **0 chain stalls**. The follower was
+at or short of the load tick in 12 of those episodes (1, 3, 0, 7, 1 per run --
+most in the two runs on a loaded machine, live fields 16-20 ms at the median);
+7 of the 12 waited for it, 22 to 114 ms (median 55 ms), and all 12 followed.
+Again with the re-sends below (bb8096a), five runs: 0 refused of 271, 0
+chain stalls; the follower was at or short of the load tick 30 times, 16 of
+them waited (12 to 92 ms), all followed. And on 93e7d5a (the IDENT pacing),
+five more: 0 refused of 276, 0 stalls, 74 at or short of the load tick, 9
+waited (33-34 ms), all followed. n64lle's 14-cell
+sweep on it: 14/14, 0 forks, 0 NACKs in every cell. `rb_driver_test`'s
+follower-behind cells (the lagging seat stalls 50 ms every 10 ticks) hold it:
+on e06b75f they refuse 7 and 7 episodes and stall 6 and 7 times; here 0 and 0.
 
 ### More than two peers
 
-Built, not exercised. Epochs carry the initiator's seat, dual initiation reads
-the winner from the epoch, and BASELINE / POST / COMMIT are tracked per peer
-(`cfg.occupied_mask` names the seats that answer). Still two-peer in shape:
-the mod-set handshake settles on the first ack (the session keeps only the
-latest), the hash chain keeps one peer ring (every peer's FRAME_COMMIT lands in
-it), and the boot-digest gate reads that ring. No multi-peer harness exists;
-do not claim N-player rollback until one does.
+**Run, 2026-09-25**, on two harnesses: `rb_driver_test` (three and four forked
+toy-engine peers) and n64lle's `tools/rb_loopback.sh` with `RB_LOOPBACK_SEATS`
+(three and four Pokemon Stadium processes). Transport: the session's LAN hub
+(`rnet_session_start_lan_hub`) -- seat 0 relays, every other seat dials it.
+The first run of each found what "built, not exercised" had hidden:
+
+| found | was | now |
+|---|---|---|
+| hash chain | one peer ring; every peer's FRAME_COMMIT landed in it, so a tick was "confirmed" against whichever peer spoke last | one chain per peer (the session records each commit's sender); a tick is confirmed when every peer's chain has it; stalls name the seat |
+| boot-digest gate | read tick 0 from that shared ring: the first peer to land decided | waits for and compares every peer's tick 0 |
+| mod-set handshake | the session kept one ACK for all seats, and the host settled on the first | one ACK per seat; the host settles when every peer has confirmed; a guest answers every copy |
+| identity | one peer slot, and the sender stopped once any peer's was in | per seat; sent until every peer's is in |
+| invent cap and pacing | the scheduler read the session's highest remote tip -- the MAX over seats -- so a peer that stopped sending hid behind the others: three toy peers ran 1,000 ticks ahead of a fourth stuck at 221, which never caught up | pacing reads the slowest peer's tip, the invent decision each seat's own (`rnet_session_remote_tip`) |
+| dual initiation | the rule compared our own seat, right only when we are an initiator; a follower of the losing episode NACKed the winner and both died | compares the held episode's initiator, so a follower switches too (two seats: unchanged) |
+| early answers | opening a follow discarded answers held for any other epoch; a follower that briefly followed the losing episode threw away the winner's POST and timed out | kept while their episode can still open |
+| rb traffic filter | chosen by seat count | by the expected set (a four-seat room with one other occupant has one peer) |
+| coordinated stop | one peer's BYE stopped our markers to everyone | only with a single peer |
+| control queues | 8 per kind, FRAME_COMMIT 64 | 32, and 256 (four peers' commits fill 64 in ~20 ticks of an incremental replay) |
+
+Loss scales with the seats (see "POST and BEGIN are re-sent"): before the
+re-sends, four seats at 2 % loss froze on 9 and 11 POST watchdogs in 45 s and
+`rb_driver_test`'s 4-seat 2 % cell forked (a lost BEGIN, then a correction
+that could never reopen).
+
+**Measured** (n64lle, Pokemon Stadium attract scene, recomp-net bb8096a -- the
+IDENT pacing of 93e7d5a came after these runs and was not re-run here -- 45 s,
+D=8 P=12, seat 1 injecting every 45 remote rows -- every 15 ticks with four
+seats -- two runs per cell, homeserver, other sessions' runs beside it):
+
+| cell | episodes | answers owed / followed / refused | watchdogs | forks | drained | deferred / at tip |
+|---|---|---|---|---|---|---|
+| 3 seats, 0 ms | 106, 106 | 212/212/0, 212/212/0 | 0, 0 | 0 | all | 4 / 28, 6 / 11 |
+| 3 seats, 200 ms | 66, 65 | 132/132/0, 130/130/0 | 0, 0 | 0 | all | 0 / 0 |
+| 4 seats, 0 ms | 146, 148 | 438/438/0, 444/444/0 | 0, 0 | 0 | all | 5 / 28, 4 / 20 |
+| 4 seats, 200 ms | 79, 78 | 237/237/0, 234/234/0 | 0, 0 | 0 | all | 0 / 0 |
+| 4 seats, 2 % loss | 122, 126 | 366/366/0, 378/378/0 | 2, 2 | 0 | all | 9 / 23, 12 / 28 |
+
+Residual 0 in every run, graded per initiator/follower pair by epoch. The
+same 4-seat 2 % cell before the re-sends (recomp-net 5492a31): 30 and 67
+episodes, 12 and 9 watchdogs, one residual covered by a watchdog, 17
+corrections LOST in one run (to a port the scene never reads, so nothing
+forked). Per-peer counts are in n64lle `docs/NETPLAY.md` §5.
+
+**Not covered.** One injecting seat: organic episodes from several seats at
+once (true dual and triple initiation under a real game) have run only in
+`rb_driver_test`. The relay is seat 0's own process, so a relay that is slow
+or leaves takes the room with it; no relay-less mesh exists. Guest-to-guest
+traffic crosses the relay's poll, which adds up to one of its fields of
+latency. A seat leaving mid-match is untested with more than two. Loopback,
+not a network; nobody has played it.
 
 ## Portable input contract
 
