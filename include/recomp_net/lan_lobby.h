@@ -35,6 +35,14 @@ typedef struct RNetLanLobby {
     /* V3+: host-authoritative match caps (guest must mirror at launch). */
     int rollback;          /* 0 = delay-sync; 1 = invent/rollback */
     int input_prediction;  /* invent runway P; meaningful when rollback=1 */
+    /* V4+: the session id of the match this room last started (0 = none /
+     * a host that predates it). The HOST allocates a fresh one per start --
+     * there is no server to -- and it rides START (lan_direct) and the
+     * registry file, so both peers launch with the same id and a rematch
+     * never reuses the last match's (a stale HELLO/BYE from match N must not
+     * be taken for match N+1's). Trailing on both wires: older readers
+     * ignore it, and read as 0 from an older writer. */
+    rnet_u32 session_id;
 } RNetLanLobby;
 
 enum {

@@ -97,3 +97,24 @@ preferred..preferred+31 and rewrites the endpoint. `rnet_udp_port_available` /
 outside the launcher.
 
 The registry does not carry input or replace `rnet_session_start_lan()`.
+
+### Direct IP waiting room and the rematch
+
+`recomp_net/lan_direct.h` is the cross-machine seat claim (`RNETDJ1` datagrams
+on the host's game port). A launch closes both ends' sockets -- the game
+session takes the port -- so a rematch after a soft return re-seats the guest
+from scratch: the host re-opens with the joiner seat freed, and the guest asks
+again with `rnet_lan_direct_guest_join_begin` + `rnet_lan_direct_guest_join_poll`,
+the non-blocking form of `rnet_lan_direct_guest_join` (which is built on it).
+`join_poll` re-sends `JOIN_REQ` every 400 ms while nobody answers, so a guest
+that is back before its host keeps asking; the caller owns the deadline.
+
+- `START` and the registry file carry `RNetLanLobby.session_id`, the fresh
+  per-match id the HOST allocates (no server does on LAN; a rematch must not
+  reuse the last match's id). Both are trailing optional fields: an older
+  reader ignores them, and an older writer reads as 0.
+- The host answers a `JOIN_REQ` from the already-seated guest's address with
+  `JOIN_OK` again (its first answer was lost) instead of `full`, and honours
+  `LEAVE` only from the seated guest's address, as `SWAPREQ` / `CHATREQ` do.
+
+`tests/lan_rematch_test.c` walks the lifecycle on loopback.
