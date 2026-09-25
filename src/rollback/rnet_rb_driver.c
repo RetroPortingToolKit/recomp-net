@@ -157,12 +157,13 @@ struct RNetRbDriver {
 
     /* Corrections owed. Reconcile promotes the true row the moment it decides
      * to rewind, so the tick is never looked at again -- if the episode that
-     * decision opened does not COMMIT (NACK, abort, timeout, a yield to the
-     * peer's BEGIN, a cooldown refusal, a stage that could not take it), the
-     * tick stays simulated on the wrong input for the rest of the match. So
-     * every rewind decision is recorded here until an episode that replays
-     * the tick commits, and reconcile re-opens one for the oldest while it is
-     * still in snapshot reach. Keyed tick % RNET_INPUT_HIST_DEPTH, tagged. */
+     * decision opened never REPLAYS it (NACK, abort before the load, timeout,
+     * a yield to the peer's BEGIN, a cooldown refusal, a stage that could not
+     * take it), the tick stays simulated on the wrong input for the rest of
+     * the match. So every rewind decision is recorded here until a replay
+     * covering the tick completes, and reconcile re-opens one for the oldest
+     * while it is still in snapshot reach. Keyed tick % RNET_INPUT_HIST_DEPTH,
+     * tagged. */
     uint32_t owed_tick[RNET_INPUT_HIST_DEPTH];
     int8_t   owed_slot[RNET_INPUT_HIST_DEPTH];   /* -1 = none owed */
     uint32_t owed_retry_after;   /* sim tick before which no retry is tried */
@@ -1564,6 +1565,11 @@ static void rb_replay_missing_abort(RNetRbDriver *d)
 static void rb_replay_finish(RNetRbDriver *d)
 {
     d->rewound = 0;
+    /* What was owed is paid the moment the span has been re-run on sealed --
+     * i.e. authoritative -- rows, whether or not the episode then commits.
+     * Waiting for the commit re-opened episodes for ticks already fixed: a
+     * tip-extend the peer declined after we had replayed it, for one. */
+    rb_owed_clear_span(d, d->corr.load_tick, d->corr.target_tick);
     rb_resim_end(d);
     /* Anything keyed past the target belongs to the timeline we just
      * discarded; a later episode must never load one of those. */
@@ -1682,8 +1688,6 @@ static void rb_commit_episode(RNetRbDriver *d)
      * FRAME_COMMITs that preceded the correction so the watermark restarts
      * from a tick both peers actually ran. */
     rnet_hc_prime_after(&d->hc, d->corr.target_tick);
-    /* Every correction inside the replayed span has now been applied. */
-    rb_owed_clear_span(d, d->corr.load_tick, d->corr.target_tick);
     rnet_sched_note_episode_boundary();
     /* Counted, not inferred: on SNES tip-hold was graded "present" for weeks
      * while the transition into it failed on every episode, and nothing in
