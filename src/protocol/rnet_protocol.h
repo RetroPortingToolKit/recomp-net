@@ -4,6 +4,7 @@
 #include "recomp_net/config.h"
 #include "recomp_net/input.h"
 #include "recomp_net/types.h"
+#include "recomp_net/rollback.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -93,7 +94,8 @@ typedef struct RNetRbWireFrame
 } RNetRbWireFrame;
 
 #define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 7u
-#define RNET_RB_SEAL_ROWS_CHUNK_MAX 24u
+/* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
+ * chunks its own seal rows has to know the bound the send path enforces. */
 
 rnet_u32 rnet_proto_checksum(const rnet_u8 *data, size_t len);
 

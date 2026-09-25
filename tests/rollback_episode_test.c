@@ -21,7 +21,16 @@ typedef struct TestHost
     uint32_t digest_at[256];
     uint8_t loaded_tick_valid;
     uint32_t loaded_tick;
-    uint8_t remote_history; /* 0: predicted, 1: confirmed, 2: missing, 3: invalid */
+    /* What the host's history holds for a REMOTE seat. A real host has the
+     * wire-confirmed rows up to its admitted tip and only predictions (or
+     * nothing) past it; a stub that answers "confirmed" for every seat at
+     * every tick is the one history in which the peer's SEAL_ROWS are never
+     * needed. 0: predicted, 1: wire-confirmed, 2: missing, 3: invalid. */
+    uint8_t remote_history;
+    /* Seats the stub will answer for at all (a seat outside the match has no
+     * row). */
+    uint32_t seats;
+    uint32_t asked_outside_seats;
 } TestHost;
 
 static int host_save_state(void *ctx, uint32_t tick)
@@ -64,6 +73,11 @@ static uint8_t host_get_input_row(void *ctx, int32_t slot, uint32_t tick, RNetRb
 {
     TestHost *h = (TestHost *)ctx;
     memset(out, 0, sizeof(*out));
+    if (slot < 0 || (uint32_t)slot >= h->seats)
+    {
+        h->asked_outside_seats++;
+        return 0u;
+    }
     if (slot != 0 && h->remote_history == 2u)
     {
         return 0u;
@@ -72,6 +86,7 @@ static uint8_t host_get_input_row(void *ctx, int32_t slot, uint32_t tick, RNetRb
     out->buttons = (uint16_t)(0x100u + (uint16_t)slot);
     out->stick_x = (int8_t)(10 + slot);
     out->stick_y = 0;
+    /* Seat 0 is local in every session below: its row is always authority. */
     out->is_predicted = (slot != 0 && h->remote_history == 0u) ? 1u : 0u;
     out->is_valid = (slot != 0 && h->remote_history == 3u) ? 0u : 1u;
     return 1u;
@@ -213,6 +228,7 @@ int main(void)
     RNetRbEvent ev;
 
     memset(&host, 0, sizeof(host));
+    host.seats = 2u;
     memset(&cfg, 0, sizeof(cfg));
     cfg.local_slot = 0u;
     cfg.delay = 3u;
@@ -256,6 +272,8 @@ int main(void)
     expect_true(rnet_rb_get_sealed_frame(s, 0, 52u, &got), "local sealed row valid");
     expect_true(got.buttons == 0x100u, "local row buttons from history");
     expect_true(!rnet_rb_all_peer_seal_rows_complete(s), "peer rows not complete yet");
+    expect_true(host.asked_outside_seats == 0u,
+                "sealing never asks the host for a seat outside the match");
 
     /* Export local chunk for slot 0. */
     expect_true(rnet_rb_export_seal_rows_chunk(s, 0, 0u, 8u, rows, &count), "export local chunk");
@@ -323,6 +341,38 @@ int main(void)
     rnet_rb_session_reset(s);
     expect_true(rnet_rb_get_phase(s) == nRNetRbPhaseLive, "reset to live");
     expect_true(!rnet_rb_inputs_sealed(s), "reset clears seal");
+
+    /* --- Pre-seal from wire-confirmed history (ca18d96) ---
+     * A remote row the host holds as wire-CONFIRMED is the owner's own
+     * transmitted pad, byte-identical to what the owner seals, so it counts
+     * without waiting for SEAL_ROWS. That is what lets a follower -- whose
+     * history already holds the initiator's confirmed rows -- complete its
+     * seal with no message at all. A PREDICTED row never counts: sealing a
+     * prediction as authority forks the peers when it was wrong. */
+    host.remote_history = 1u;
+    memset(&corr, 0, sizeof(corr));
+    corr.epoch_id = 11u;
+    corr.mismatch_tick = 60u;
+    corr.load_tick = 60u;
+    corr.target_tick = 63u;
+    corr.slot = 1;
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, corr.load_tick, corr.target_tick, corr.slot);
+    expect_true(rnet_rb_all_peer_seal_rows_complete(s),
+                "confirmed remote history pre-seals the remote seat");
+    expect_true(rnet_rb_seat_row_authoritative(s, 1, 61u),
+                "a pre-sealed confirmed row is authoritative");
+    expect_true(rnet_rb_get_sealed_frame(s, 1, 61u, &got) && got.buttons == 0x101u,
+                "pre-sealed row carries the confirmed pad");
+    rnet_rb_session_reset(s);
+    host.remote_history = 0u;
+    rnet_rb_begin_episode(s, &corr);
+    rnet_rb_seal_inputs(s, corr.load_tick, corr.target_tick, corr.slot);
+    expect_true(!rnet_rb_all_peer_seal_rows_complete(s),
+                "predicted remote history does NOT pre-seal");
+    expect_true(!rnet_rb_seat_row_authoritative(s, 1, 61u),
+                "a predicted row is not authoritative");
+    rnet_rb_session_reset(s);
 
     /* --- Tip-extend + light-tip --- */
     cfg.tip_runway = RNET_RB_TIP_RUNWAY_DEFAULT;

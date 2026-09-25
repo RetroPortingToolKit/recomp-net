@@ -73,6 +73,28 @@ int main(void)
     CHECK(rnet_ih_get(&h, 1, 13, &got) && !got.is_predicted && got.stick_x == -18,
           "promoted");
 
+    /* An active-high pad (SNES, N64) names its own neutral; without it the
+     * no-prior-row fallback is the PSX active-low 0xFFFF, which on those pads
+     * reads as every button held. */
+    {
+        RNetInputHist hi;
+        RNetRbFrame n, inv;
+        rnet_ih_reset(&hi, 4);
+        memset(&n, 0, sizeof(n));
+        n.buttons = 0x0000u;
+        n.stick_x = 0;
+        CHECK(rnet_ih_set_neutral(&hi, 3, &n), "set neutral seat 3");
+        CHECK(rnet_ih_invent_hold_last(&hi, 3, 5, &inv) && inv.buttons == 0x0000u &&
+                  inv.is_predicted,
+              "invent with no prior row uses the seat's neutral");
+        CHECK(rnet_ih_invent_idle(&hi, 3, 6, &inv) && inv.buttons == 0x0000u,
+              "idle invent uses the seat's neutral");
+        CHECK(rnet_ih_invent_hold_last(&hi, 2, 5, &inv) && inv.buttons == 0xFFFFu,
+              "a seat that never set one keeps the 0xFFFF default");
+        CHECK(!rnet_ih_set_neutral(&hi, RNET_INPUT_HIST_MAX_SLOTS, &n),
+              "set_neutral refuses a seat past the table");
+    }
+
     rnet_input_contract_params_init_defaults(&params);
     rnet_ih_frame_to_contract(&got, &pub);
     pub.is_predicted = 1;

@@ -12,6 +12,23 @@ void rnet_ih_reset(RNetInputHist *h, int slot_count)
     if (slot_count > RNET_INPUT_HIST_MAX_SLOTS)
         slot_count = RNET_INPUT_HIST_MAX_SLOTS;
     h->slot_count = slot_count;
+    {
+        int i;
+        for (i = 0; i < RNET_INPUT_HIST_MAX_SLOTS; ++i)
+            h->neutral[i].buttons = 0xFFFFu;
+    }
+}
+
+int rnet_ih_set_neutral(RNetInputHist *h, int slot, const RNetRbFrame *neutral)
+{
+    if (!h || !neutral || slot < 0 || slot >= RNET_INPUT_HIST_MAX_SLOTS)
+        return 0;
+    memset(&h->neutral[slot], 0, sizeof(h->neutral[slot]));
+    h->neutral[slot].buttons = neutral->buttons;
+    h->neutral[slot].stick_x = neutral->stick_x;
+    h->neutral[slot].stick_y = neutral->stick_y;
+    h->neutral[slot].analog = neutral->analog ? 1u : 0u;
+    return 1;
 }
 
 void rnet_ih_frame_to_contract(const RNetRbFrame *frame, RNetInputContractFrame *out)
@@ -66,8 +83,10 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
 
     memset(&invented, 0, sizeof(invented));
     invented.tick = tick;
-    invented.buttons = 0xFFFFu;
-    invented.analog = 0u;
+    invented.buttons = h->neutral[slot].buttons;
+    invented.stick_x = h->neutral[slot].stick_x;
+    invented.stick_y = h->neutral[slot].stick_y;
+    invented.analog = h->neutral[slot].analog;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
 
@@ -100,8 +119,10 @@ int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *
 
     memset(&invented, 0, sizeof(invented));
     invented.tick = tick;
-    invented.buttons = 0xFFFFu;
-    invented.analog = 0u;
+    invented.buttons = h->neutral[slot].buttons;
+    invented.stick_x = h->neutral[slot].stick_x;
+    invented.stick_y = h->neutral[slot].stick_y;
+    invented.analog = h->neutral[slot].analog;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
 

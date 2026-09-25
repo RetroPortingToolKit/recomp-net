@@ -231,7 +231,10 @@ void rnet_session_set_input_send_suppress(RNetSession *s, int suppress);
  */
 int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
                                       rnet_u32 state_hash);
-/* 1 if a peer FRAME_COMMIT is pending; copies and clears it. */
+/* 1 if a peer FRAME_COMMIT is pending; copies and clears it (FIFO). The
+ * sender is rnet_session_rb_last_take_from(): with more than two seats a
+ * hash chain is kept per peer, and one ring shared by every peer's commits
+ * would confirm a tick against whichever peer spoke last. */
 /* PSX-Link group scoping: accept rollback episode/state packets only from
  * `slot` (-1 = all, default). Input-plane packets are never filtered. */
 void rnet_session_set_rb_peer_slot(RNetSession *s, int slot);
@@ -261,6 +264,13 @@ int rnet_session_peek_input(const RNetSession *s, int slot, rnet_u32 wire_tick,
                             RNetInputSample *out);
 int rnet_session_peek_remote_input(const RNetSession *s, int slot, rnet_u32 wire_tick,
                                    RNetInputSample *out);
+/* One remote seat's input tip: the highest wire tick its ring holds. 1 and
+ * *tip set for an occupied remote seat, 0 otherwise. RNetSessionStats'
+ * highest_remote_wire is the HIGHEST over every remote seat, which is the
+ * one tip there is with two seats -- but with more, a seat that stopped
+ * sending hides behind the others, and a prediction cap measured against it
+ * never trips (the rollback driver uses this per seat). */
+int rnet_session_remote_tip(const RNetSession *s, int slot, rnet_u32 *tip);
 /* §56 pipeline diagnostics: ms since the remote row for wire_tick arrived
  * (first-wins latch). 0xffffffff if unknown / not yet arrived. Consumption
  * slack at admit = this value; ~0 means rows arrive just-in-time (no cushion
@@ -278,7 +288,8 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
 
 /*
  * Rollback episode wire (opcodes 20–23, 25). MotK drains via take_* after pump.
- * Seal-row take copies up to RNET_RB_SEAL_ROWS_CHUNK_MAX frames.
+ * Seal-row take copies up to RNET_RB_SEAL_ROWS_CHUNK_MAX frames (rollback.h);
+ * send truncates a larger chunk to that bound.
  *
  * RB_SYNC op codes (the wire byte historically called "initiator"):
  *   NACK  — follower refuses/cannot follow. target_tick carries the
@@ -301,13 +312,25 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
 #define RNET_RB_SYNC_OP_BEGIN 1u
 #define RNET_RB_SYNC_OP_ABORT 2u
 #define RNET_RB_SYNC_OP_COMMIT 3u
-/* Peer identity, sent once at session start. mismatch_tick carries a build
+/* Peer identity, sent at session start. mismatch_tick carries a build
  * fingerprint and load_tick a content/mod fingerprint; both are opaque to this
- * library and compared only for equality. Purely diagnostic: it explains WHY
- * two peers disagree, while the state digests remain what detects THAT they
- * do. Additive on purpose -- a peer that predates it ignores an unknown op,
- * and a host that never sends one simply gets no explanation. */
+ * library and compared only for equality. target_tick carries the seats whose
+ * identity the sender already holds (bit i = seat i, its own included; 0 from
+ * a peer that predates the field), so a receiver missing from it answers
+ * again. The episode driver refuses a match on a content difference and
+ * leaves a build difference to the boot digest (rb_driver.h). Re-sent at most
+ * every 100 ms for the first 90 ticks. Additive on purpose -- a peer that
+ * predates it ignores an unknown op, and a host that never sends one simply
+ * gets no explanation. */
 #define RNET_RB_SYNC_OP_IDENT 4u
+/* Coordinated stop (rb_driver.h, rnet_rb_driver_request_quiesce): "I will
+ * open no further episode, and I have none open". mismatch_tick is 1 when the
+ * sender already holds the receiver's own QUIESCE (so the receiver need not
+ * wait for it), load_tick the sender's sim tick; epoch_id is 0. Re-sent while
+ * the sender drains, because it is one datagram on a link that may drop it.
+ * Additive like IDENT: a peer that predates it ignores an unknown op, and the
+ * sender's drain then ends on its bound rather than hanging. */
+#define RNET_RB_SYNC_OP_QUIESCE 5u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */
@@ -363,9 +386,24 @@ int rnet_session_send_modset(RNetSession *s, const char *text);
 int rnet_session_take_modset(RNetSession *s, char *out, rnet_u32 cap);
 int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
                                  const char *reason);
-/* 1 and fills status/reason when an ack has arrived since the last take. */
+/* 1 and fills status/reason when an ack has arrived since the last take.
+ * Latest-only PER SEAT, lowest seat first: with more than two seats every
+ * guest answers, and one slot for all of them let a second answer overwrite
+ * the first. rnet_session_rb_last_take_from() names the seat that answered. */
 int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
                                  rnet_u32 cap);
+
+/* Sender slot (packet header) of the rb_* message most recently returned by
+ * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post /
+ * take_rb_frame_commit / take_modset_ack, or -1 before any. Call it right after the take it describes. With two seats there
+ * is one peer and this is redundant; with more, an episode needs a BASELINE
+ * and a POST from EVERY peer, and without the sender the first reply to
+ * arrive would answer for all of them. */
+int rnet_session_rb_last_take_from(const RNetSession *s);
+/* Episode-control datagrams refused because their receive queue was full
+ * (each refusal is also logged). Non-zero means the host let rb_* messages
+ * pile up between drains -- a long inline replay is the usual cause. */
+rnet_u32 rnet_session_rb_ctrl_dropped(const RNetSession *s);
 
 int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through);
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through);

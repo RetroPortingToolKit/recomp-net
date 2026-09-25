@@ -21,7 +21,12 @@ RNetSession          (FSM + admission)
 | `RUNNING` | Slot 0 emitted `START` (or remote `START` received); sim advances |
 
 Slot **0** is the sim authority: it sends `START` once every slot has
-signaled ready.
+signaled ready, and again to any seat whose `READY` still arrives after it
+started -- a seat sends `READY` only until it has seen `START`, so that seat's
+`START` was lost. `START` used to go out exactly once; on a lossy link one
+dropped copy left that seat in `READY` for good while the rest of the room ran
+and waited on its input (`rb_driver_test` 4seat-loss2, 2 of 10 full runs,
+2026-09-25; a forced single-`START` drop reproduces it every time).
 
 ## Delay-sync admission
 
