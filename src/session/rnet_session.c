@@ -1072,8 +1072,14 @@ static void state_drive_sender(RNetSession *s)
         return;
     }
 
-    /* On ACK timeout, rewind send cursor to peer_ack for retransmission. */
-    if (s->state_last_ack_ms != 0 && now - s->state_last_ack_ms >= ack_timeout_ms)
+    /* On ACK timeout, rewind send cursor to peer_ack for retransmission.
+     * The timer runs from the last ACK that made progress or, before any
+     * has, from the transfer's start. It used to run only from a progress
+     * ACK, so a first burst whose chunks overtook BEGIN (reordering) or
+     * lost chunk 0 left peer_ack at 0 with nothing ever resent: the receiver
+     * sat in receive with 0/N and the sender logged "0 acked" until the app
+     * gave up. Reproduced with the link simulator at 35 ms +/- 15 ms. */
+    if (now - (s->state_last_ack_ms != 0 ? s->state_last_ack_ms : s->state_xfer_start_ms) >= ack_timeout_ms)
     {
         s->state_send_cursor = s->state_peer_ack;
         s->state_last_ack_ms = now; /* avoid spinning every pump */
