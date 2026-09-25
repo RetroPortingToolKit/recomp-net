@@ -19,6 +19,7 @@ extern "C" {
  * Wire format is a small text datagram (RNETDJ1). Not encrypted. */
 
 enum {
+    RNET_LAN_DIRECT_PENDING = 1, /* join_poll: no answer yet, keep polling */
     RNET_LAN_DIRECT_OK = 0,
     RNET_LAN_DIRECT_ERR_IO = -1,
     RNET_LAN_DIRECT_ERR_FULL = -2,
@@ -112,7 +113,8 @@ int rnet_lan_direct_host_send_swap_result(RNetLanDirectHost *host, int accept);
 /* ---- guest --------------------------------------------------------------- */
 
 /* Blocking join to host_hostport. timeout_ms <= 0 → 2000.
- * On OK, *out_room is filled and *out_guest owns a socket for START/KICK. */
+ * On OK, *out_room is filled and *out_guest owns a socket for START/KICK.
+ * join_begin + join_poll until it answers, waiting on the socket between. */
 int rnet_lan_direct_guest_join(const char *host_hostport,
                                const char *expected_game,
                                const char *expected_version,
@@ -120,6 +122,31 @@ int rnet_lan_direct_guest_join(const char *host_hostport,
                                const char *guest_bind_hostport, int timeout_ms,
                                RNetLanLobby *out_room,
                                RNetLanDirectGuest **out_guest);
+
+/* The same join without blocking, for a caller that has a frame to keep
+ * drawing -- a guest re-seating itself after a soft return, when the host may
+ * not be listening yet.
+ *
+ * join_begin opens and binds the socket and sends the first JOIN_REQ; on OK
+ * *out_guest is a handle that is NOT seated yet. join_poll reads the answer
+ * and re-sends JOIN_REQ every 400 ms while there is none:
+ *   RNET_LAN_DIRECT_OK       seated; *out_room filled (as the blocking join)
+ *   RNET_LAN_DIRECT_PENDING  no answer yet -- poll again
+ *   < 0                      refused (JOIN_NAK: FULL / PASSWORD / IDENTITY /
+ *                            STARTED) or I/O; the answer sticks
+ * There is no deadline inside: the caller owns how long to keep asking, and
+ * closes the handle (rnet_lan_direct_guest_close) when it gives up or is
+ * refused. Until seated, guest_pump reports nothing and the handle sends no
+ * chat, pings or LEAVE the host would act on. */
+int rnet_lan_direct_guest_join_begin(const char *host_hostport,
+                                     const char *expected_game,
+                                     const char *expected_version,
+                                     const char *password,
+                                     const char *player_name,
+                                     const char *guest_bind_hostport,
+                                     RNetLanDirectGuest **out_guest);
+int rnet_lan_direct_guest_join_poll(RNetLanDirectGuest *guest,
+                                    RNetLanLobby *out_room);
 
 void rnet_lan_direct_guest_close(RNetLanDirectGuest **guest);
 

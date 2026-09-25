@@ -34,6 +34,15 @@ struct RNetLanDirectGuest {
     struct RNetLanChatQueue chat;
     int swap_res_pending; /* the host answered a swap request */
     int swap_res_accept;
+    /* Between join_begin and the JOIN_OK: not seated, and nothing but the
+     * answer to JOIN_REQ is read (join_poll owns the socket until then). */
+    int joining;
+    int join_failed;          /* the JOIN_NAK's rc, once one arrived */
+    rnet_u64 join_sent_ms;
+    char join_req[RNET_DJ_MAX_PKT];
+    char expected_game[RNET_LAN_LOBBY_GAME_MAX];
+    char expected_version[RNET_LAN_LOBBY_VERSION_MAX];
+    char player_name[RNET_LAN_LOBBY_PLAYER_MAX];
 };
 
 static void chat_queue_push(struct RNetLanChatQueue *q, const char *player_id,
@@ -337,6 +346,7 @@ static int build_start(char *buf, size_t cap, const RNetLanLobby *room)
     char delay_line[16];
     char rollback_line[8];
     char pred_line[16];
+    char session_line[16];
     size_t o = 0;
     int delay = 2;
     int rollback = 0;
@@ -352,11 +362,16 @@ static int build_start(char *buf, size_t cap, const RNetLanLobby *room)
     snprintf(delay_line, sizeof(delay_line), "%d", delay);
     snprintf(rollback_line, sizeof(rollback_line), "%d", rollback);
     snprintf(pred_line, sizeof(pred_line), "%d", pred);
+    /* V4: the match's session id, which the HOST allocates per start (see
+     * RNetLanLobby.session_id). Trailing, so an older guest ignores it. */
+    snprintf(session_line, sizeof(session_line), "%u",
+             room ? (unsigned)room->session_id : 0u);
     if (!append_line(buf, cap, &o, RNET_DJ_MAGIC) ||
         !append_line(buf, cap, &o, "START") ||
         !append_line(buf, cap, &o, delay_line) ||
         !append_line(buf, cap, &o, rollback_line) ||
-        !append_line(buf, cap, &o, pred_line))
+        !append_line(buf, cap, &o, pred_line) ||
+        !append_line(buf, cap, &o, session_line))
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return RNET_LAN_DIRECT_OK;
 }
@@ -562,6 +577,17 @@ int rnet_lan_direct_host_pump(RNetLanDirectHost *host, RNetLanLobby *room,
             if (!player || !player[0])
                 player = "Player";
 
+            /* The seated guest asking again means our JOIN_OK was lost (it
+             * retransmits until one lands): answer it again rather than
+             * refusing it its own seat as "full". */
+            if (host->guest_known && room->joiner_name[0] &&
+                src.sin_addr.s_addr == host->guest.sin_addr.s_addr &&
+                src.sin_port == host->guest.sin_port &&
+                strcmp(password, room->password) == 0 && !room->started) {
+                if (build_join_ok(reply, sizeof(reply), room) == 0)
+                    (void)send_text(host->sock, &src, reply);
+                continue;
+            }
             if (strcmp(game, room->game) != 0 ||
                 strcmp(version, room->game_version) != 0)
                 nak = "identity";
@@ -618,7 +644,15 @@ int rnet_lan_direct_host_pump(RNetLanDirectHost *host, RNetLanLobby *room,
             if (build_chat(reply, sizeof(reply), player_id, from, text) == 0)
                 (void)send_text(host->sock, &host->guest, reply);
         } else if (strcmp(op, "LEAVE") == 0) {
-            if (host->guest_known && room->joiner_name[0]) {
+            /* Only the seated guest can give its seat up -- the same rule as
+             * SWAPREQ and CHATREQ. An unseated sender (a guest whose re-join
+             * was refused, a stray datagram) must not empty the seat of the
+             * guest who holds it. */
+            if (!host->guest_known ||
+                src.sin_addr.s_addr != host->guest.sin_addr.s_addr ||
+                src.sin_port != host->guest.sin_port)
+                continue;
+            if (room->joiner_name[0]) {
                 room->joiner_name[0] = '\0';
                 room->started = 0;
                 host->guest_known = 0;
@@ -677,13 +711,54 @@ int rnet_lan_direct_host_notify_close(RNetLanDirectHost *host)
     return RNET_LAN_DIRECT_OK;
 }
 
-int rnet_lan_direct_guest_join(const char *host_hostport,
-                               const char *expected_game,
-                               const char *expected_version,
-                               const char *password, const char *player_name,
-                               const char *guest_bind_hostport, int timeout_ms,
-                               RNetLanLobby *out_room,
-                               RNetLanDirectGuest **out_guest)
+/* JOIN_REQ is retransmitted this often while no answer has come: UDP can drop
+ * the first probe, and on a rematch the host may not be listening yet. */
+#define RNET_DJ_JOIN_RESEND_MS 400
+
+static void guest_fill_room_from_join_ok(const RNetLanDirectGuest *g,
+                                         char *cursor, RNetLanLobby *out_room)
+{
+    const char *endpoint = next_line(&cursor);
+    const char *host_name = next_line(&cursor);
+    const char *joiner = next_line(&cursor);
+    const char *slot = next_line(&cursor);
+    const char *name = next_line(&cursor);
+    const char *game = next_line(&cursor);
+    const char *version = next_line(&cursor);
+    const char *delay_line = next_line(&cursor);
+    const char *rollback_line = next_line(&cursor);
+    const char *pred_line = next_line(&cursor);
+    memset(out_room, 0, sizeof(*out_room));
+    snprintf(out_room->endpoint, sizeof(out_room->endpoint), "%s",
+             endpoint && endpoint[0] ? endpoint : g->host_hostport);
+    snprintf(out_room->host_name, sizeof(out_room->host_name), "%s",
+             host_name ? host_name : "Host");
+    snprintf(out_room->joiner_name, sizeof(out_room->joiner_name), "%s",
+             joiner && joiner[0] ? joiner
+                                 : (g->player_name[0] ? g->player_name
+                                                      : "Player"));
+    out_room->host_slot = (slot && strcmp(slot, "1") == 0) ? 1 : 0;
+    snprintf(out_room->name, sizeof(out_room->name), "%s",
+             name && name[0] ? name : "LAN Lobby");
+    snprintf(out_room->game, sizeof(out_room->game), "%s",
+             game && game[0] ? game : g->expected_game);
+    snprintf(out_room->game_version, sizeof(out_room->game_version), "%s",
+             version && version[0] ? version : g->expected_version);
+    out_room->started = 0;
+    out_room->password[0] = '\0';
+    out_room->input_delay = parse_direct_input_delay_line(delay_line, 2);
+    /* Optional V3 lines — older hosts omit them. */
+    out_room->rollback = parse_direct_bool_line(rollback_line, 0);
+    out_room->input_prediction = parse_direct_prediction_line(pred_line, 4);
+}
+
+int rnet_lan_direct_guest_join_begin(const char *host_hostport,
+                                     const char *expected_game,
+                                     const char *expected_version,
+                                     const char *password,
+                                     const char *player_name,
+                                     const char *guest_bind_hostport,
+                                     RNetLanDirectGuest **out_guest)
 {
     RNetLanDirectGuest *g;
     char host[128];
@@ -691,18 +766,12 @@ int rnet_lan_direct_guest_join(const char *host_hostport,
     rnet_u16 port = 0;
     rnet_u16 bind_port = 0;
     struct sockaddr_in bind_addr;
-    char req[RNET_DJ_MAX_PKT];
-    char buf[RNET_DJ_MAX_PKT + 1];
-    rnet_u64 deadline;
     int rc;
 
-    if (!out_guest || !out_room || !host_hostport || !host_hostport[0] ||
+    if (!out_guest || !host_hostport || !host_hostport[0] ||
         !expected_game || !expected_game[0])
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     *out_guest = NULL;
-    memset(out_room, 0, sizeof(*out_room));
-    if (timeout_ms <= 0)
-        timeout_ms = 2000;
 
     rnet_os_startup();
     if (rnet_os_parse_hostport(host_hostport, host, sizeof(host), &port) != 0 ||
@@ -717,6 +786,11 @@ int rnet_lan_direct_guest_join(const char *host_hostport,
         return RNET_LAN_DIRECT_ERR_IO;
     }
     snprintf(g->host_hostport, sizeof(g->host_hostport), "%s", host_hostport);
+    snprintf(g->expected_game, sizeof(g->expected_game), "%s", expected_game);
+    snprintf(g->expected_version, sizeof(g->expected_version), "%s",
+             expected_version ? expected_version : "");
+    snprintf(g->player_name, sizeof(g->player_name), "%s",
+             player_name ? player_name : "");
 
     g->sock = rnet_os_socket_create_dgram();
     if (!rnet_os_socket_valid(g->sock)) {
@@ -748,39 +822,49 @@ int rnet_lan_direct_guest_join(const char *host_hostport,
         return RNET_LAN_DIRECT_ERR_IO;
     }
 
-    rc = build_join_req(req, sizeof(req), expected_game, expected_version,
-                        password, player_name);
+    rc = build_join_req(g->join_req, sizeof(g->join_req), expected_game,
+                        expected_version, password, player_name);
     if (rc != RNET_LAN_DIRECT_OK) {
         rnet_lan_direct_guest_close(&g);
         return rc;
     }
+    g->joining = 1;
+    g->join_sent_ms = rnet_os_monotonic_ms();
+    (void)send_text(g->sock, &g->host, g->join_req);
+    *out_guest = g;
+    return RNET_LAN_DIRECT_OK;
+}
 
-    deadline = rnet_os_monotonic_ms() + (rnet_u64)timeout_ms;
-    /* Retransmit a few times — UDP can drop the first probe. */
+int rnet_lan_direct_guest_join_poll(RNetLanDirectGuest *guest,
+                                    RNetLanLobby *out_room)
+{
+    char buf[RNET_DJ_MAX_PKT + 1];
+    rnet_u64 now;
+
+    if (!guest || !out_room)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (!guest->joining)
+        return RNET_LAN_DIRECT_OK; /* seated already */
+    if (guest->join_failed)
+        return guest->join_failed;
+    if (!rnet_os_socket_valid(guest->sock))
+        return RNET_LAN_DIRECT_ERR_IO;
+
     for (;;) {
-        rnet_u64 now = rnet_os_monotonic_ms();
-        int wait_ms;
-        int n;
-        int would_block = 0;
         struct sockaddr_in src;
+        int would_block = 0;
+        int n;
         char *cursor;
         const char *magic;
         const char *op;
 
-        if (now >= deadline) {
-            rnet_lan_direct_guest_close(&g);
-            return RNET_LAN_DIRECT_ERR_TIMEOUT;
-        }
-        (void)send_text(g->sock, &g->host, req);
-        wait_ms = (int)(deadline - now);
-        if (wait_ms > 400)
-            wait_ms = 400;
-        if (rnet_os_poll_recv(g->sock, wait_ms) <= 0)
-            continue;
-
-        n = rnet_os_recvfrom(g->sock, buf, sizeof(buf) - 1, &src, &would_block);
+        n = rnet_os_recvfrom(guest->sock, buf, sizeof(buf) - 1, &src,
+                             &would_block);
+        /* Nothing (or an ICMP port-unreachable surfacing as an error on a
+         * connectionless socket, which is what a host that is not listening
+         * YET looks like): not an answer, keep asking. */
         if (n <= 0)
-            continue;
+            break;
         buf[n] = '\0';
         cursor = buf;
         magic = next_line(&cursor);
@@ -788,55 +872,73 @@ int rnet_lan_direct_guest_join(const char *host_hostport,
         if (!magic || strcmp(magic, RNET_DJ_MAGIC) != 0 || !op)
             continue;
         if (strcmp(op, "JOIN_NAK") == 0) {
-            const char *code = next_line(&cursor);
-            rc = nak_code_to_rc(code);
-            rnet_lan_direct_guest_close(&g);
-            return rc;
+            guest->join_failed = nak_code_to_rc(next_line(&cursor));
+            return guest->join_failed;
         }
         if (strcmp(op, "JOIN_OK") != 0)
-            continue;
-
-        {
-            const char *endpoint = next_line(&cursor);
-            const char *host_name = next_line(&cursor);
-            const char *joiner = next_line(&cursor);
-            const char *slot = next_line(&cursor);
-            const char *name = next_line(&cursor);
-            const char *game = next_line(&cursor);
-            const char *version = next_line(&cursor);
-            const char *delay_line = next_line(&cursor);
-            const char *rollback_line = next_line(&cursor);
-            const char *pred_line = next_line(&cursor);
-            snprintf(out_room->endpoint, sizeof(out_room->endpoint), "%s",
-                     endpoint && endpoint[0] ? endpoint : host_hostport);
-            snprintf(out_room->host_name, sizeof(out_room->host_name), "%s",
-                     host_name ? host_name : "Host");
-            snprintf(out_room->joiner_name, sizeof(out_room->joiner_name), "%s",
-                     joiner && joiner[0] ? joiner
-                                         : (player_name && player_name[0]
-                                                ? player_name
-                                                : "Player"));
-            out_room->host_slot = (slot && strcmp(slot, "1") == 0) ? 1 : 0;
-            snprintf(out_room->name, sizeof(out_room->name), "%s",
-                     name && name[0] ? name : "LAN Lobby");
-            snprintf(out_room->game, sizeof(out_room->game), "%s",
-                     game && game[0] ? game : expected_game);
-            snprintf(out_room->game_version, sizeof(out_room->game_version),
-                     "%s",
-                     version && version[0] ? version : expected_version);
-            out_room->started = 0;
-            out_room->password[0] = '\0';
-            out_room->input_delay =
-                parse_direct_input_delay_line(delay_line, 2);
-            /* Optional V3 lines — older hosts omit them. */
-            out_room->rollback = parse_direct_bool_line(rollback_line, 0);
-            out_room->input_prediction =
-                parse_direct_prediction_line(pred_line, 4);
-        }
-        g->host = src; /* reply path may differ from typed dest after NAT */
-        *out_guest = g;
+            continue; /* nothing else is addressed to an unseated guest */
+        guest_fill_room_from_join_ok(guest, cursor, out_room);
+        guest->host = src; /* reply path may differ from typed dest after NAT */
+        guest->joining = 0;
         return RNET_LAN_DIRECT_OK;
     }
+
+    now = rnet_os_monotonic_ms();
+    if (now - guest->join_sent_ms >= RNET_DJ_JOIN_RESEND_MS) {
+        guest->join_sent_ms = now;
+        (void)send_text(guest->sock, &guest->host, guest->join_req);
+    }
+    return RNET_LAN_DIRECT_PENDING;
+}
+
+int rnet_lan_direct_guest_join(const char *host_hostport,
+                               const char *expected_game,
+                               const char *expected_version,
+                               const char *password, const char *player_name,
+                               const char *guest_bind_hostport, int timeout_ms,
+                               RNetLanLobby *out_room,
+                               RNetLanDirectGuest **out_guest)
+{
+    RNetLanDirectGuest *g = NULL;
+    rnet_u64 deadline;
+    int rc;
+
+    if (!out_guest || !out_room)
+        return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    *out_guest = NULL;
+    memset(out_room, 0, sizeof(*out_room));
+    if (timeout_ms <= 0)
+        timeout_ms = 2000;
+
+    rc = rnet_lan_direct_guest_join_begin(host_hostport, expected_game,
+                                          expected_version, password,
+                                          player_name, guest_bind_hostport, &g);
+    if (rc != RNET_LAN_DIRECT_OK)
+        return rc;
+    deadline = rnet_os_monotonic_ms() + (rnet_u64)timeout_ms;
+    for (;;) {
+        rnet_u64 now;
+        int wait_ms;
+        rc = rnet_lan_direct_guest_join_poll(g, out_room);
+        if (rc != RNET_LAN_DIRECT_PENDING)
+            break;
+        now = rnet_os_monotonic_ms();
+        if (now >= deadline) {
+            rc = RNET_LAN_DIRECT_ERR_TIMEOUT;
+            break;
+        }
+        wait_ms = (int)(deadline - now);
+        if (wait_ms > RNET_DJ_JOIN_RESEND_MS)
+            wait_ms = RNET_DJ_JOIN_RESEND_MS;
+        (void)rnet_os_poll_recv(g->sock, wait_ms);
+    }
+    if (rc != RNET_LAN_DIRECT_OK) {
+        rnet_lan_direct_guest_close(&g);
+        memset(out_room, 0, sizeof(*out_room));
+        return rc;
+    }
+    *out_guest = g;
+    return RNET_LAN_DIRECT_OK;
 }
 
 void rnet_lan_direct_guest_close(RNetLanDirectGuest **guest)
@@ -851,7 +953,7 @@ void rnet_lan_direct_guest_close(RNetLanDirectGuest **guest)
 int rnet_lan_direct_guest_ping(RNetLanDirectGuest *guest)
 {
     char buf[RNET_DJ_MAX_PKT];
-    if (!guest || !rnet_os_socket_valid(guest->sock))
+    if (!guest || !rnet_os_socket_valid(guest->sock) || guest->joining)
         return RNET_LAN_DIRECT_ERR_IO;
     if (build_ping(buf, sizeof(buf), rnet_os_monotonic_ms()) != 0)
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
@@ -871,6 +973,8 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
 
     if (!guest || !rnet_os_socket_valid(guest->sock))
         return RNET_LAN_DIRECT_ERR_IO;
+    if (guest->joining)
+        return 0; /* not seated yet: rnet_lan_direct_guest_join_poll reads */
 
     n = rnet_os_recvfrom(guest->sock, buf, sizeof(buf) - 1, &src, &would_block);
     if (n < 0)
@@ -942,8 +1046,13 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
         const char *delay_line = next_line(&cursor);
         const char *rollback_line = next_line(&cursor);
         const char *pred_line = next_line(&cursor);
+        const char *session_line = next_line(&cursor);
         if (room) {
             room->started = 1;
+            /* 0 from a host that predates V4 (no line): the caller decides. */
+            room->session_id = session_line && session_line[0]
+                                   ? (rnet_u32)strtoul(session_line, NULL, 10)
+                                   : 0u;
             room->input_delay = parse_direct_input_delay_line(delay_line, 2);
             room->rollback = parse_direct_bool_line(rollback_line, room->rollback);
             room->input_prediction =
@@ -1035,6 +1144,8 @@ int rnet_lan_direct_guest_send_swap_request(RNetLanDirectGuest *guest)
     char buf[RNET_DJ_MAX_PKT];
     if (!guest)
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (guest->joining)
+        return RNET_LAN_DIRECT_ERR_IO; /* no seat to trade yet */
     if (build_swap_req(buf, sizeof(buf)) != 0)
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return send_text(guest->sock, &guest->host, buf);
@@ -1057,6 +1168,8 @@ int rnet_lan_direct_guest_send_chat(RNetLanDirectGuest *guest,
     char line[RNET_LAN_CHAT_TEXT_LEN];
     if (!guest)
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
+    if (guest->joining)
+        return RNET_LAN_DIRECT_ERR_IO; /* not in the room yet */
     chat_sanitize(text, line, sizeof(line));
     if (!line[0])
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
@@ -1081,6 +1194,8 @@ int rnet_lan_direct_guest_leave(RNetLanDirectGuest *guest)
     char buf[RNET_DJ_MAX_PKT];
     if (!guest || !rnet_os_socket_valid(guest->sock))
         return RNET_LAN_DIRECT_ERR_IO;
+    if (guest->joining)
+        return RNET_LAN_DIRECT_OK; /* never seated: nothing to give up */
     if (build_simple(buf, sizeof(buf), "LEAVE") != 0)
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return send_text(guest->sock, &guest->host, buf);

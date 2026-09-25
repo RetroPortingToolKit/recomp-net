@@ -248,6 +248,11 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(lan_chat_test PRIVATE Threads::Threads)
   add_test(NAME lan_chat_test COMMAND lan_chat_test)
 
+  add_executable(lan_rematch_test tests/lan_rematch_test.c)
+  target_link_libraries(lan_rematch_test PRIVATE recomp_net)
+  target_include_directories(lan_rematch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME lan_rematch_test COMMAND lan_rematch_test)
+
   add_executable(lan_lobby_test tests/lan_lobby_test.c)
   target_link_libraries(lan_lobby_test PRIVATE recomp_net)
   add_test(NAME lan_lobby_test COMMAND lan_lobby_test)
