@@ -96,6 +96,12 @@ int rnet_ws_accept_key(const char *client_key, char out_b64[32])
     return 0;
 }
 
+#if defined(MSG_NOSIGNAL)
+#define RNET_WS_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define RNET_WS_SEND_FLAGS 0
+#endif
+
 static int send_all(int fd, const void *buf, size_t len)
 {
     const char *p = (const char *)buf;
@@ -104,7 +110,7 @@ static int send_all(int fd, const void *buf, size_t len)
 #if defined(_WIN32)
         int n = send(fd, p + sent, (int)(len - sent), 0);
 #else
-        ssize_t n = send(fd, p + sent, len - sent, 0);
+        ssize_t n = send(fd, p + sent, len - sent, RNET_WS_SEND_FLAGS);
 #endif
         if (n < 0) {
             if (socket_interrupted()) {
@@ -120,30 +126,31 @@ static int send_all(int fd, const void *buf, size_t len)
     return 0;
 }
 
-int rnet_ws_write_text(int fd, const char *text, int client_mask)
+int rnet_ws_frame_text(const char *text, int client_mask, uint8_t *out, size_t out_cap)
 {
     size_t len;
-    uint8_t hdr[14];
     size_t hlen = 0;
-    uint8_t mask[4];
-    uint8_t *payload = NULL;
-    int rc;
+    size_t i;
+    uint8_t mask[4] = {0, 0, 0, 0};
 
-    if (!text) {
+    if (!text || !out) {
         return -1;
     }
     len = strlen(text);
-    hdr[0] = 0x81; /* FIN + text */
-    if (len < 126) {
-        hdr[1] = (uint8_t)((client_mask ? 0x80 : 0) | len);
-        hlen = 2;
-    } else if (len < 65536) {
-        hdr[1] = (uint8_t)((client_mask ? 0x80 : 0) | 126);
-        hdr[2] = (uint8_t)((len >> 8) & 0xff);
-        hdr[3] = (uint8_t)(len & 0xff);
-        hlen = 4;
-    } else {
+    if (len >= 65536) {
         return -1;
+    }
+    hlen = (len < 126 ? 2u : 4u) + (client_mask ? 4u : 0u);
+    if (out_cap < hlen + len || hlen + len > 0x7fffffffu) {
+        return -1;
+    }
+    out[0] = 0x81; /* FIN + text */
+    if (len < 126) {
+        out[1] = (uint8_t)((client_mask ? 0x80 : 0) | len);
+    } else {
+        out[1] = (uint8_t)((client_mask ? 0x80 : 0) | 126);
+        out[2] = (uint8_t)((len >> 8) & 0xff);
+        out[3] = (uint8_t)(len & 0xff);
     }
     if (client_mask) {
         uint32_t r = (uint32_t)rand();
@@ -151,107 +158,163 @@ int rnet_ws_write_text(int fd, const char *text, int client_mask)
         mask[1] = (uint8_t)(r >> 8);
         mask[2] = (uint8_t)(r >> 16);
         mask[3] = (uint8_t)(r >> 24);
-        memcpy(hdr + hlen, mask, 4);
-        hlen += 4;
-        payload = (uint8_t *)malloc(len);
-        if (!payload) {
-            return -1;
-        }
-        for (size_t i = 0; i < len; ++i) {
-            payload[i] = (uint8_t)text[i] ^ mask[i & 3];
-        }
+        memcpy(out + hlen - 4, mask, 4);
     }
-    if (send_all(fd, hdr, hlen) != 0) {
-        free(payload);
+    for (i = 0; i < len; ++i) {
+        out[hlen + i] = (uint8_t)text[i] ^ mask[i & 3];
+    }
+    return (int)(hlen + len);
+}
+
+int rnet_ws_write_text(int fd, const char *text, int client_mask)
+{
+    uint8_t stack[2048];
+    uint8_t *frame = stack;
+    size_t need;
+    int n, rc;
+
+    if (!text) {
         return -1;
     }
-    rc = send_all(fd, client_mask ? (const void *)payload : (const void *)text, len);
-    free(payload);
+    need = strlen(text) + 8;
+    if (need > sizeof(stack)) {
+        frame = (uint8_t *)malloc(need);
+        if (!frame) {
+            return -1;
+        }
+    }
+    n = rnet_ws_frame_text(text, client_mask, frame, need);
+    rc = n < 0 ? -1 : send_all(fd, frame, (size_t)n);
+    if (frame != stack) {
+        free(frame);
+    }
     return rc;
 }
 
-int rnet_ws_read_text(int fd, char *buf, size_t cap, int *closed)
-{
-    uint8_t h0, h1;
-    uint8_t hdr[2];
-    size_t plen = 0;
-    uint8_t mask[4];
-    int masked;
-    size_t i;
-#if defined(_WIN32)
-    int n;
-#else
-    ssize_t n;
-#endif
+/* ── RNetWsTx: frame-atomic outbound buffer ─────────────────────────── */
 
-    if (closed) {
-        *closed = 0;
+static size_t tx_cap(const RNetWsTx *tx)
+{
+    return tx->cap ? tx->cap : RNET_WS_TX_CAP_DEFAULT;
+}
+
+size_t rnet_ws_tx_pending(const RNetWsTx *tx)
+{
+    return tx ? tx->len - tx->off : 0u;
+}
+
+void rnet_ws_tx_free(RNetWsTx *tx)
+{
+    size_t cap;
+    if (!tx) {
+        return;
     }
-    n = recv(fd, (char *)hdr, 2, 0);
-    if (n == 0) {
-        if (closed) {
-            *closed = 1;
-        }
+    cap = tx->cap;
+    free(tx->buf);
+    memset(tx, 0, sizeof(*tx));
+    tx->cap = cap;
+}
+
+int rnet_ws_tx_queue_text(RNetWsTx *tx, const char *text, int client_mask)
+{
+    size_t len, frame_max, pending;
+    int n;
+
+    if (!tx || !text) {
         return -1;
     }
+    len = strlen(text);
+    if (len >= 65536) {
+        return -1;
+    }
+    frame_max = len + 8u;
+    pending = tx->len - tx->off;
+    if (pending + frame_max > tx_cap(tx)) {
+        return -2;
+    }
+    /* Drop the frames that have gone whole before growing (keep the one
+     * that is part-sent, so frame boundaries stay walkable from buf[0]). */
+    if (tx->frame_at > 0) {
+        memmove(tx->buf, tx->buf + tx->frame_at, tx->len - tx->frame_at);
+        tx->len -= tx->frame_at;
+        tx->off -= tx->frame_at;
+        tx->frame_at = 0;
+    }
+    if (tx->len + frame_max > tx->alloc) {
+        size_t want = tx->alloc ? tx->alloc : 4096u;
+        uint8_t *nb;
+        while (want < tx->len + frame_max) {
+            want *= 2u;
+        }
+        nb = (uint8_t *)realloc(tx->buf, want);
+        if (!nb) {
+            return -3;
+        }
+        tx->buf = nb;
+        tx->alloc = want;
+    }
+    n = rnet_ws_frame_text(text, client_mask, tx->buf + tx->len, tx->alloc - tx->len);
     if (n < 0) {
-        if (socket_would_block()) {
-            return 0;
-        }
         return -1;
     }
-    if (n < 2) {
-        return 0;
+    tx->len += (size_t)n;
+    tx->frames_queued++;
+    if (tx->len - tx->off > tx->high_water) {
+        tx->high_water = tx->len - tx->off;
     }
-    h0 = hdr[0];
-    h1 = hdr[1];
-    if ((h0 & 0x0f) == 0x8) {
-        if (closed) {
-            *closed = 1;
-        }
-        return -1;
-    }
-    if ((h0 & 0x0f) == 0x9) { /* ping -> pong */
-        /* ignore payload for keepalive simplicity */
-        return 0;
-    }
-    if ((h0 & 0x0f) != 0x1) {
-        return -1;
-    }
-    masked = (h1 & 0x80) != 0;
-    plen = (size_t)(h1 & 0x7f);
+    return 0;
+}
+
+/* Length of the whole frame starting at buf[at] (our own encoding). */
+static size_t frame_len_at(const uint8_t *buf, size_t at)
+{
+    size_t plen = buf[at + 1] & 0x7fu;
+    size_t h = 2;
     if (plen == 126) {
-        uint8_t ext[2];
-        if (recv(fd, (char *)ext, 2, MSG_WAITALL) != 2) {
-            return -1;
-        }
-        plen = ((size_t)ext[0] << 8) | ext[1];
-    } else if (plen == 127) {
+        plen = ((size_t)buf[at + 2] << 8) | buf[at + 3];
+        h = 4;
+    }
+    if (buf[at + 1] & 0x80u) {
+        h += 4;
+    }
+    return h + plen;
+}
+
+long rnet_ws_tx_flush(RNetWsTx *tx, int fd)
+{
+    if (!tx) {
         return -1;
     }
-    if (masked) {
-        if (recv(fd, (char *)mask, 4, MSG_WAITALL) != 4) {
-            return -1;
-        }
-    }
-    if (plen + 1 > cap) {
-        return -1;
-    }
-    if (plen > 0) {
-        size_t got = 0;
-        while (got < plen) {
-            n = recv(fd, buf + got, plen - got, 0);
-            if (n <= 0) {
-                return -1;
+    while (tx->off < tx->len) {
+#if defined(_WIN32)
+        int n = send(fd, (const char *)tx->buf + tx->off, (int)(tx->len - tx->off), 0);
+#else
+        ssize_t n = send(fd, tx->buf + tx->off, tx->len - tx->off, RNET_WS_SEND_FLAGS);
+#endif
+        if (n < 0) {
+            if (socket_interrupted()) {
+                continue;
             }
-            got += (size_t)n;
+            if (socket_would_block()) {
+                tx->would_blocks++;
+                if (tx->off != tx->frame_at) {
+                    tx->split_frames++;
+                }
+                return (long)(tx->len - tx->off);
+            }
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
+        }
+        tx->off += (size_t)n;
+        while (tx->frame_at < tx->off &&
+               tx->frame_at + frame_len_at(tx->buf, tx->frame_at) <= tx->off) {
+            tx->frame_at += frame_len_at(tx->buf, tx->frame_at);
         }
     }
-    if (masked) {
-        for (i = 0; i < plen; ++i) {
-            buf[i] = (char)((uint8_t)buf[i] ^ mask[i & 3]);
-        }
-    }
-    buf[plen] = '\0';
-    return (int)plen;
+    tx->len = 0;
+    tx->off = 0;
+    tx->frame_at = 0;
+    return 0;
 }
