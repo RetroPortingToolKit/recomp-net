@@ -269,6 +269,12 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d);
  * unanswered, so the two ledgers balance by construction. Live keeps running
  * throughout: the host keeps calling poll_admit / finish_frame until DRAINED.
  *
+ * Keep calling poll_admit while draining EVEN IF the session is no longer
+ * running: a peer that finished first leaves, its BYE stops our session, and
+ * its last marker may still be queued. poll_admit reads it and finishes (or
+ * times out) the drain from there; a host that stops calling on a dead session
+ * never reaches DRAINED.
+ *
  * Bounded: TIMED_OUT after RNET_RB_QUIESCE_TIMEOUT_MS with a line naming what
  * was still outstanding (a peer that vanished, or predates the marker).
  * Idempotent. Harnesses send it on a signal (snesrecomp: SIGUSR1); the host
