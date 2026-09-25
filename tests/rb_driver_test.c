@@ -45,6 +45,7 @@ int main(void)
 #else
 
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -431,8 +432,14 @@ static int read_all(int fd, void *buf, size_t n)
     return 1;
 }
 
+static int stop_requested(int fd)
+{
+    char c;
+    return read(fd, &c, 1) == 1;
+}
+
 static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned port_peer,
-                      uint32_t session_id, int fd)
+                      uint32_t session_id, int fd, int ready_fd, int stop_fd)
 {
     RNetConfig rc;
     RNetHostVTable hv;
@@ -440,7 +447,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     RNetRbDriver *d = NULL;
     RNetRbDriverConfig cfg;
     RNetRbHost host;
-    int local = slot, slots = 2, delay = 3;
+    int local = slot, slots = 2, delay = 8;   /* the SNES harness's D */
     char bind[64], peer[64], logname[128];
     uint32_t start_ms, next_tick_ms;
     Report *r = (Report *)calloc(1, sizeof(Report));
@@ -504,45 +511,65 @@ static void run_child(const Scenario *sc, int slot, unsigned port_self, unsigned
     if (!rnet_rb_driver_start(d, &cfg, &host))
         goto report;
 
-    /* Paced like a frontend: a live tick every 4 ms; a replayed tick as soon
-     * as the host gets it; a stall retries after pumping. */
+    /* Paced like a frontend: one poll per 60 Hz frame, whatever it returns
+     * (a stall presents the held frame and waits for the next one), except
+     * that an INCREMENTAL replay tick is followed at once by the next poll --
+     * that is the shape a host with an expensive tick runs, pumping between
+     * ticks. The injector counts polls, so this cadence is also what makes an
+     * interval mean what it means in the SNES harness. */
+    /* Run until this peer has played its ticks AND the parent says both have
+     * -- then stop together. An uncoordinated stop left the peer that
+     * finished last opening an episode after the other had exited, which the
+     * ledger rightly reports as unanswered. */
     start_ms = mono_ms();
     next_tick_ms = start_ms;
-    while (rnet_rb_driver_sim_tick(d) < sc->ticks &&
-           (uint32_t)(mono_ms() - start_ms) < 20000u) {
+    {
+        int ready_sent = 0;
+        fcntl(stop_fd, F_SETFL, O_NONBLOCK);
+    while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
         RNetRbAdmit a;
         rnet_session_pump(s);
         if (g_c.n_lobby)
             break;
-        if ((int32_t)(mono_ms() - next_tick_ms) < 0 &&
-            !rnet_rb_driver_in_resim(d)) {
-            sleep_ms(1);
-            continue;
+        if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
+            (void)write_all(ready_fd, "R", 1);
+            ready_sent = 1;
         }
+        if (ready_sent && stop_requested(stop_fd))
+            break;
         a = rnet_rb_driver_poll_admit(d);
-        if (a == RNET_RB_ADMIT_STALL) {
-            sleep_ms(1);
-            continue;
+        if (a != RNET_RB_ADMIT_STALL) {
+            if (a == RNET_RB_ADMIT_REPLAY)
+                g_c.replay_admits++;
+            toy_step();   /* the same per-tick function for live and replay */
+            rnet_rb_driver_finish_frame(d);
+            if (a == RNET_RB_ADMIT_REPLAY)
+                continue;
         }
-        if (a == RNET_RB_ADMIT_REPLAY)
-            g_c.replay_admits++;
-        toy_step();   /* the same per-tick function for live and replay */
-        rnet_rb_driver_finish_frame(d);
-        if (a == RNET_RB_ADMIT_LIVE)
-            next_tick_ms += 4u;
+        next_tick_ms += 16u;
+        if ((int32_t)(next_tick_ms - mono_ms()) > 0)
+            sleep_ms(next_tick_ms - mono_ms());
+        else
+            next_tick_ms = mono_ms();
     }
-    /* Keep answering for a moment so the peer's last episode can finish. */
+        if (!ready_sent)
+            (void)write_all(ready_fd, "R", 1);
+    }
+    /* Quiesce: no new live tick runs (so nothing new can be predicted), but
+     * episodes keep being served -- followed, replayed, verified -- until the
+     * last late row has landed and every episode it opens has been answered.
+     * A replayed tick still runs: it re-runs the past, it adds no future. */
     start_ms = mono_ms();
-    while ((uint32_t)(mono_ms() - start_ms) < 400u) {
+    while ((uint32_t)(mono_ms() - start_ms) < 1500u) {
         RNetRbAdmit a;
         rnet_session_pump(s);
         a = rnet_rb_driver_poll_admit(d);
-        if (a != RNET_RB_ADMIT_STALL) {
+        if (a == RNET_RB_ADMIT_REPLAY) {
             toy_step();
             rnet_rb_driver_finish_frame(d);
+            continue;
         }
-        if (a != RNET_RB_ADMIT_REPLAY)
-            sleep_ms(4);
+        sleep_ms(16);
     }
 
 report:
@@ -578,7 +605,8 @@ report:
 
 static void run_scenario(const Scenario *sc, unsigned port_base)
 {
-    int pa[2], pb[2];
+    int pa[2], pb[2], ready[2], stop_a[2], stop_b[2];
+    char c;
     pid_t a, b;
     Report *ra = (Report *)calloc(1, sizeof(Report));
     Report *rb = (Report *)calloc(1, sizeof(Report));
@@ -588,7 +616,8 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     int64_t ledger;
     char msg[256];
 
-    if (pipe(pa) != 0 || pipe(pb) != 0) {
+    if (pipe(pa) != 0 || pipe(pb) != 0 || pipe(ready) != 0 || pipe(stop_a) != 0 ||
+        pipe(stop_b) != 0) {
         expect_true(0, "pipe");
         return;
     }
@@ -597,21 +626,32 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     a = fork();
     if (a == 0) {
         close(pa[0]);
-        run_child(sc, 0, port_base, port_base + 1u, session_id, pa[1]);
+        run_child(sc, 0, port_base, port_base + 1u, session_id, pa[1], ready[1], stop_a[0]);
     }
     b = fork();
     if (b == 0) {
         close(pb[0]);
-        run_child(sc, 1, port_base + 1u, port_base, session_id, pb[1]);
+        run_child(sc, 1, port_base + 1u, port_base, session_id, pb[1], ready[1], stop_b[0]);
     }
     close(pa[1]);
     close(pb[1]);
+    close(ready[1]);
+    /* Both have played their ticks (or given up): stop them together. */
+    (void)read_all(ready[0], &c, 1);
+    (void)read_all(ready[0], &c, 1);
+    (void)write_all(stop_a[1], "S", 1);
+    (void)write_all(stop_b[1], "S", 1);
     got_a = read_all(pa[0], ra, sizeof(*ra));
     got_b = read_all(pb[0], rb, sizeof(*rb));
     waitpid(a, NULL, 0);
     waitpid(b, NULL, 0);
     close(pa[0]);
     close(pb[0]);
+    close(ready[0]);
+    close(stop_a[0]);
+    close(stop_a[1]);
+    close(stop_b[0]);
+    close(stop_b[1]);
 
     printf("%-22s init=%u+%u follow=%u+%u refused=%u abort=%u+%u timeout=%u fork=%u "
            "extend=%u unapplied=%u forced=%u replay_admits=%u+%u resim=%llu+%llu "
@@ -680,11 +720,14 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
 
 int main(void)
 {
+    /* The SNES sweep's gating latencies and its injector interval (45), at a
+     * 60 Hz frontend cadence, so a pass here means what a pass there means.
+     * RNET_SIM_LATENCY_MS is one-way per peer: RTT is double. */
     static const Scenario scenarios[] = {
-        /* name                mode A, B   latency jitter force  ticks */
-        { "inline-loopback",   0, 0,       "0",   "0",   11,    700u },
-        { "mixed-60ms",        0, 1,       "30",  "6",   13,    700u },
-        { "incremental-100ms", 1, 1,       "50",  "10",  17,    700u },
+        /* name                  mode A, B   latency jitter force  ticks */
+        { "inline-loopback",     0, 0,       "0",   "0",   45,    420u },
+        { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u },
+        { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u },
     };
     unsigned port_base = 30000u + ((unsigned)getpid() % 5000u) * 4u;
     size_t i;

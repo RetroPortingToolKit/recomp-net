@@ -155,6 +155,25 @@ struct RNetRbDriver {
     /* Degrade mode: stop predicting remote input until this tick. */
     uint32_t lockstep_until;
 
+    /* Corrections owed. Reconcile promotes the true row the moment it decides
+     * to rewind, so the tick is never looked at again -- if the episode that
+     * decision opened does not COMMIT (NACK, abort, timeout, a yield to the
+     * peer's BEGIN, a cooldown refusal, a stage that could not take it), the
+     * tick stays simulated on the wrong input for the rest of the match. So
+     * every rewind decision is recorded here until an episode that replays
+     * the tick commits, and reconcile re-opens one for the oldest while it is
+     * still in snapshot reach. Keyed tick % RNET_INPUT_HIST_DEPTH, tagged. */
+    uint32_t owed_tick[RNET_INPUT_HIST_DEPTH];
+    int8_t   owed_slot[RNET_INPUT_HIST_DEPTH];   /* -1 = none owed */
+    uint32_t owed_retry_after;   /* sim tick before which no retry is tried */
+
+    /* Live-tip restore. Loading the baseline rewinds the engine; an abort
+     * after that (baseline fork, missing row) used to leave it on the load
+     * tick's state while sim stayed at the old tip. The tip is saved first
+     * and put back on any such abort. */
+    int      rewound;
+    uint32_t tip_tick;
+
     /* Set by rb_load_sealed_rows when a row is missing, so the abort can name
      * the seat and tick instead of saying only that "a" row was absent. */
     int      missing_slot;
@@ -356,6 +375,49 @@ static int rb_rows_equal(const RNetRbFrame *a, const RNetRbFrame *b)
 {
     return a->buttons == b->buttons && a->stick_x == b->stick_x &&
            a->stick_y == b->stick_y;
+}
+
+/* ── corrections owed ────────────────────────────────────────────────── */
+
+static void rb_owed_reset(RNetRbDriver *d)
+{
+    memset(d->owed_tick, 0, sizeof(d->owed_tick));
+    memset(d->owed_slot, -1, sizeof(d->owed_slot));
+    d->owed_retry_after = 0u;
+}
+
+static void rb_owed_mark(RNetRbDriver *d, uint32_t tick, int slot)
+{
+    uint32_t i = tick % RNET_INPUT_HIST_DEPTH;
+    d->owed_tick[i] = tick;
+    d->owed_slot[i] = (int8_t)slot;
+}
+
+static void rb_owed_clear_span(RNetRbDriver *d, uint32_t load, uint32_t target)
+{
+    uint32_t t;
+    if (target < load || target - load >= RNET_INPUT_HIST_DEPTH)
+        return;
+    for (t = load; t <= target; ++t) {
+        uint32_t i = t % RNET_INPUT_HIST_DEPTH;
+        if (d->owed_slot[i] >= 0 && d->owed_tick[i] == t)
+            d->owed_slot[i] = -1;
+    }
+}
+
+/* Oldest owed tick still inside the history window, if any. */
+static int rb_owed_first(const RNetRbDriver *d, uint32_t *tick, int *slot)
+{
+    uint32_t t = d->sim > RNET_INPUT_HIST_DEPTH ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    for (; t < d->sim; ++t) {
+        uint32_t i = t % RNET_INPUT_HIST_DEPTH;
+        if (d->owed_slot[i] >= 0 && d->owed_tick[i] == t) {
+            *tick = t;
+            *slot = d->owed_slot[i];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /* ── snapshots ───────────────────────────────────────────────────────── */
@@ -1006,8 +1068,10 @@ static void rb_bind_sched(RNetRbDriver *d)
 RNetRbDriver *rnet_rb_driver_create(void)
 {
     RNetRbDriver *d = (RNetRbDriver *)calloc(1u, sizeof(*d));
-    if (d)
+    if (d) {
         d->force_invent_slot = -1;
+        rb_owed_reset(d);
+    }
     return d;
 }
 
@@ -1105,6 +1169,7 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
     /* The only fields whose cleared value is not zero. */
     d->force_invent_slot = -1;
     d->missing_slot = -1;
+    rb_owed_reset(d);
 
     if (!cfg || !host) {
         fprintf(stderr, "rnet_rb: driver start with no %s — refused\n",
@@ -1352,6 +1417,34 @@ static void rb_episode_clear(RNetRbDriver *d)
         rnet_rb_session_reset(d->rb);
 }
 
+/* Put the engine back on the live tip after an abort that followed the
+ * baseline load. Without this the engine sat on the load tick's state while
+ * sim stayed at the old tip, and every later tick was simulated from the
+ * wrong starting point -- a desync the abort itself manufactured, even when
+ * the abort's own verdict (a forced fork, a missing row) was harmless. */
+static void rb_restore_tip(RNetRbDriver *d)
+{
+    if (!d->rewound)
+        return;
+    d->rewound = 0;
+    rb_resim_end(d);
+    if (d->host.snap_load(d->host.ctx, d->tip_tick))
+        rb_log(d, "RB tip restored after the episode ended mid-replay "
+                  "(tick %u) — the baseline load is undone\n",
+               (unsigned)d->tip_tick);
+    else
+        rb_log(d, "RB tip NOT restored — no snapshot at tick %u. The engine "
+                  "is on the load tick's state while sim=%u, and this peer "
+                  "has diverged\n",
+               (unsigned)d->tip_tick, (unsigned)d->sim);
+}
+
+/* The aborting side always takes RB_COOLDOWN_TICKS, whatever the class; only
+ * the peer RECEIVING the ABORT mirrors the class (REALIGN -> 0). snesrecomp's
+ * comments and its parity audit describe a peer-NACK abort as REALIGN "whose
+ * cooldown is zero, so it re-opens at once" -- true of the receiver, not of
+ * the initiator that aborted. Behaviour kept as shipped; the claim corrected
+ * here (and at the NACK handler). */
 static void rb_episode_abort(RNetRbDriver *d, uint8_t abort_class, const char *why)
 {
     RNetSession *s = rb_session(d);
@@ -1364,6 +1457,7 @@ static void rb_episode_abort(RNetRbDriver *d, uint8_t abort_class, const char *w
                                   d->sim, 0u,
                                   (rnet_u8)(d->corr.slot < 0 ? 0 : d->corr.slot),
                                   RNET_RB_SYNC_OP_ABORT, 0u);
+    rb_restore_tip(d);
     rb_episode_clear(d);
     d->cooldown_until_tick = d->sim + RB_COOLDOWN_TICKS;
 }
@@ -1469,6 +1563,7 @@ static void rb_replay_missing_abort(RNetRbDriver *d)
  * on the corrected timeline. */
 static void rb_replay_finish(RNetRbDriver *d)
 {
+    d->rewound = 0;
     rb_resim_end(d);
     /* Anything keyed past the target belongs to the timeline we just
      * discarded; a later episode must never load one of those. */
@@ -1495,10 +1590,20 @@ static int rb_run_replay(RNetRbDriver *d)
 {
     uint32_t t;
 
+    /* The live tip, so an abort after the load can put the engine back where
+     * sim says it is (rb_restore_tip). Keyed like every snapshot: the state
+     * BEFORE tick sim runs, which is the state now. */
+    d->tip_tick = d->sim;
+    if (!d->host.snap_save(d->host.ctx, d->tip_tick)) {
+        rb_episode_abort(d, RNET_RB_ABORT_CLASS_NO_SNAP,
+                         "could not save the live tip before the baseline load");
+        return 0;
+    }
     if (!d->host.snap_load(d->host.ctx, d->corr.load_tick)) {
         rb_episode_abort(d, RNET_RB_ABORT_CLASS_NO_SNAP, "no snapshot at load tick");
         return 0;
     }
+    d->rewound = 1;
     rb_send_baseline(d);
     /* rb_send_baseline compares digests and may abort the episode outright on
      * a fork, which clears corr and resets the session. Carrying on into the
@@ -1577,6 +1682,8 @@ static void rb_commit_episode(RNetRbDriver *d)
      * FRAME_COMMITs that preceded the correction so the watermark restarts
      * from a tick both peers actually ran. */
     rnet_hc_prime_after(&d->hc, d->corr.target_tick);
+    /* Every correction inside the replayed span has now been applied. */
+    rb_owed_clear_span(d, d->corr.load_tick, d->corr.target_tick);
     rnet_sched_note_episode_boundary();
     if (rnet_rb_enter_tip_hold(d->rb)) {
         d->peer_commit_mask = 0;
@@ -1784,6 +1891,29 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
                    (unsigned)rb_snap_oldest_or0(d));
             rb_send_nack(d, peer_epoch, mismatch_tick, load, slot);
             return 0;
+        }
+        /* We still owe a correction BEFORE the load tick: our state at load is
+         * not the one the peer holds, so following can only end in a baseline
+         * fork -- the fork cap, lockstep and an abort, for a divergence we
+         * already know about. Refuse and let our own re-open cover it; the
+         * NACK carries a frontier below the owed tick. */
+        {
+            uint32_t owed_t;
+            int owed_slot;
+            if (rb_owed_first(d, &owed_t, &owed_slot) && owed_t < load) {
+                rb_log(d, "RB follow refused epoch=%u span=%u..%u — we owe a "
+                          "correction at tick=%u slot=%d before it; NACK at "
+                          "frontier=%u\n",
+                       (unsigned)peer_epoch, (unsigned)load, (unsigned)target,
+                       (unsigned)owed_t, owed_slot,
+                       (unsigned)(owed_t ? owed_t - 1u : 0u));
+                if (s)
+                    rnet_session_send_rb_sync(s, peer_epoch, mismatch_tick, load,
+                                              owed_t ? owed_t - 1u : 0u,
+                                              (rnet_u8)(slot < 0 ? 0 : slot),
+                                              RNET_RB_SYNC_OP_NACK, 0u);
+                return 0;
+            }
         }
         /* The published-input fallback in rb_vt_get_input_row covers the
          * ordinary case where the initiator is a few ticks ahead of us, but it
@@ -2093,7 +2223,9 @@ static void rb_drain_wire(RNetRbDriver *d)
                      *
                      * NACK is exactly the right reply and the initiator
                      * already handles it: demote to our frontier and abort
-                     * REALIGN, whose cooldown is zero, so it re-opens at once.
+                     * REALIGN (we mirror REALIGN as no cooldown; the
+                     * initiator itself still takes RB_COOLDOWN_TICKS -- see
+                     * rb_episode_abort).
                      * If we won the race our own BEGIN is already in flight;
                      * should this NACK land after the peer has yielded to it,
                      * the epoch no longer matches theirs and it is ignored.
@@ -2354,6 +2486,36 @@ static void rb_reconcile_wire(RNetRbDriver *d)
 
     if (!s)
         return;
+
+    /* A correction owed from an episode that did not commit comes first: it is
+     * the oldest thing wrong with our timeline. */
+    if (d->stage == kRbIdle && !rb_cooldown_active(d) && d->sim >= d->owed_retry_after) {
+        uint32_t t, load;
+        int oslot;
+        if (rb_owed_first(d, &t, &oslot)) {
+            if (!rb_snap_floor(d, t, &load)) {
+                /* Past every snapshot: nothing can re-run this tick any more.
+                 * Said as what it is -- the peers now differ, and every later
+                 * baseline will show it. */
+                rb_log(d, "RB correction LOST tick=%u slot=%d — no snapshot "
+                          "reaches it any more (ring oldest=%u). This peer ran "
+                          "that tick on input its owner never sent; the two "
+                          "sides have diverged.\n",
+                       (unsigned)t, oslot, (unsigned)rb_snap_oldest_or0(d));
+                rb_owed_clear_span(d, t, t);
+                return;
+            }
+            rb_log(d, "RB correction retried tick=%u slot=%d — the episode "
+                      "that should have applied it did not commit\n",
+                   (unsigned)t, oslot);
+            if (rb_begin_episode(d, t, oslot, 1, 0u, 0u, 0u, 0u))
+                return;
+            /* Refused (and said why). Back off rather than retry every poll. */
+            d->owed_retry_after = d->sim + RB_COOLDOWN_TICKS;
+            return;
+        }
+    }
+
     for (slot = 0; slot < slots; ++slot) {
         uint32_t t;
         if (slot == local)
@@ -2392,8 +2554,17 @@ static void rb_reconcile_wire(RNetRbDriver *d)
             }
 
             rnet_sched_note_mispredict(d->sim > t ? d->sim - t : 0u);
+            /* Owed until an episode that replays t commits. */
+            rb_owed_mark(d, t, slot);
             if (d->stage == kRbIdle) {
-                rb_begin_episode(d, t, slot, 1, 0u, 0u, 0u, 0u);
+                if (rb_cooldown_active(d))
+                    /* Used to be refused in silence -- and with the row
+                     * already promoted, lost for good. Now it waits. */
+                    rb_log(d, "RB correction deferred tick=%u slot=%d — "
+                              "cooldown until %u, re-opened after it\n",
+                           (unsigned)t, slot, (unsigned)d->cooldown_until_tick);
+                else
+                    rb_begin_episode(d, t, slot, 1, 0u, 0u, 0u, 0u);
             } else if (t >= d->corr.load_tick &&
                        t <= d->corr.target_tick) {
                 /* Already covered. The open episode replays this tick, and
@@ -2557,6 +2728,14 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
                               "(invent + corrupt)\n",
                            slot, (unsigned)d->sim);
             }
+        }
+        /* An armed injection waits for an invent, and lockstep forbids one: the
+         * seat would then skip its real row and stall on every poll, forever.
+         * The knob must perturb the thing under test, never wedge it. */
+        if (d->force_invent_slot == slot && rb_gate_lockstep_no_invent(d)) {
+            rb_log_raw(d, "rbe: injected mispredict cancelled slot=%d sim=%u "
+                          "— lockstep forbids invent\n", slot, (unsigned)d->sim);
+            d->force_invent_slot = -1;
         }
         if (d->force_invent_slot != slot &&
             rnet_session_peek_remote_input(s, slot, wire, &sample) &&
