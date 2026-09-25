@@ -222,6 +222,11 @@ delay and prediction exactly as the scheduler bridge does, plus the replay
 shape, partition names, the store's depth (reported only), a log tag, and an
 environment alias (knobs are `RNET_RB_<NAME>`; `<alias>_<NAME>` is read first,
 so snesrecomp's `SNES_RB_*` names keep working).
+`inject_flip_bits` names the button bits the `FORCE_MISPREDICT` validation
+injector flips in an invented row (0 = the historical `0x0040`). It must be a
+bit the engine's pad layer hands the guest: n64lle masks `0x0040` as
+unmodeled, so there the default opened episodes whose mispredicted fields the
+guest never saw, and a replay that restored nothing would have passed them.
 
 The loop is the same in both shapes:
 

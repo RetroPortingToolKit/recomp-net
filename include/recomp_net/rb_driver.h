@@ -208,6 +208,15 @@ typedef struct RNetRbDriverConfig
      * LOCKSTEP LOCKSTEP_TICKS FORCE_FORK FORCE_MISPREDICT FORCE_BOOT_FORK
      * FORCE_MOD_MISMATCH FORCE_MODSET ALLOW_BOOT_FORK ALLOW_MOD_MISMATCH. */
     const char *env_alias;
+    /* Validation only (FORCE_MISPREDICT): the button bits flipped in an
+     * invented row so the prediction is guaranteed wrong. 0 = 0x0040, the bit
+     * snesrecomp's injector always flipped. It must be a bit the engine's pad
+     * layer passes to the guest: n64lle's n64_si_set_pad masks 0x0040 as
+     * unmodeled, so there the historical bit opened episodes whose mispredicted
+     * fields the guest never saw -- a rollback whose load restored nothing
+     * would have passed them. Appended last so a zeroed config keeps the old
+     * behaviour. */
+    uint16_t inject_flip_bits;
 } RNetRbDriverConfig;
 
 typedef struct RNetRbDriver RNetRbDriver;

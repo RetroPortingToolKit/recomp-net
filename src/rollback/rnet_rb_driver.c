@@ -3108,7 +3108,8 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
                 /* Guarantee the invention is WRONG: hold-last would otherwise
                  * match a peer sitting on the same buttons, and a correct
                  * prediction exercises nothing. */
-                row.buttons ^= 0x0040u;
+                row.buttons ^= d->cfg.inject_flip_bits ? d->cfg.inject_flip_bits
+                                                       : (uint16_t)0x0040u;
                 d->force_invent_slot = -1;
             }
             rb_row_sanitize(d, slot, &row);
