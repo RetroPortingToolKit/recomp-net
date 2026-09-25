@@ -278,7 +278,8 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
 
 /*
  * Rollback episode wire (opcodes 20–23, 25). MotK drains via take_* after pump.
- * Seal-row take copies up to RNET_RB_SEAL_ROWS_CHUNK_MAX frames.
+ * Seal-row take copies up to RNET_RB_SEAL_ROWS_CHUNK_MAX frames (rollback.h);
+ * send truncates a larger chunk to that bound.
  *
  * RB_SYNC op codes (the wire byte historically called "initiator"):
  *   NACK  — follower refuses/cannot follow. target_tick carries the
@@ -366,6 +367,18 @@ int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
 /* 1 and fills status/reason when an ack has arrived since the last take. */
 int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
                                  rnet_u32 cap);
+
+/* Sender slot (packet header) of the rb_* message most recently returned by
+ * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post, or -1
+ * before any. Call it right after the take it describes. With two seats there
+ * is one peer and this is redundant; with more, an episode needs a BASELINE
+ * and a POST from EVERY peer, and without the sender the first reply to
+ * arrive would answer for all of them. */
+int rnet_session_rb_last_take_from(const RNetSession *s);
+/* Episode-control datagrams refused because their receive queue was full
+ * (each refusal is also logged). Non-zero means the host let rb_* messages
+ * pile up between drains -- a long inline replay is the usual cause. */
+rnet_u32 rnet_session_rb_ctrl_dropped(const RNetSession *s);
 
 int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through);
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through);

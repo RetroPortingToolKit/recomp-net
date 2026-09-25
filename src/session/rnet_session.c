@@ -165,6 +165,7 @@ struct RNetSession
     struct {
         rnet_u32 epoch_id, mismatch_tick, load_tick, target_tick;
         rnet_u8 corrected_slot, initiator, flags;
+        rnet_u8 from; /* sender's wire slot (packet header) */
     } rb_sync_q[RNET_RB_CTRL_QUEUE];
     int rb_sync_head, rb_sync_tail, rb_sync_count;
 
@@ -173,19 +174,31 @@ struct RNetSession
         rnet_u8 slot;
         rnet_u16 row_count;
         RNetRbWireFrame rows[RNET_RB_SEAL_ROWS_CHUNK_MAX];
+        rnet_u8 from;
     } rb_seal_q[RNET_RB_CTRL_QUEUE];
     int rb_seal_head, rb_seal_tail, rb_seal_count;
 
     struct {
         rnet_u32 epoch_id, load_tick, digest_master, digest_a, digest_b, digest_c;
+        rnet_u8 from;
     } rb_base_q[RNET_RB_CTRL_QUEUE];
     int rb_base_head, rb_base_tail, rb_base_count;
 
     struct {
         rnet_u32 epoch_id, target_tick, digest_master, input_digest;
         rnet_u8 match;
+        rnet_u8 from;
     } rb_post_q[RNET_RB_CTRL_QUEUE];
     int rb_post_head, rb_post_tail, rb_post_count;
+    /* Sender slot of the most recent rb_* take (-1 = none yet). A two-seat
+     * host has one peer and never needs it; an N-seat episode has to know
+     * WHICH peer a BASELINE / POST / COMMIT answers for, or the first reply
+     * would stand in for every peer's. See rnet_session_rb_last_take_from. */
+    int rb_last_from;
+    /* Episode-control datagrams refused because their queue was full. These
+     * used to vanish without a trace; a dropped BEGIN or POST then surfaced
+     * seconds later as a watchdog abort that named the wrong cause. */
+    rnet_u32 rb_ctrl_dropped;
 
     /* Mod-set handshake. Latest-only by design: see the header. */
     char modset_text[RNET_MODSET_TEXT_MAX];
@@ -268,6 +281,22 @@ static void note_admit_ok(RNetSession *s)
 }
 
 static void send_raw(RNetSession *s, const rnet_u8 *buf, int len);
+
+/* An episode-control queue was full, so this datagram is refused. Said out
+ * loud: the first one and every 64th after, so a storm cannot flood the log
+ * but a single loss is never invisible. */
+static void rb_ctrl_note_drop(RNetSession *s, const char *what)
+{
+    s->rb_ctrl_dropped++;
+    if (s->rb_ctrl_dropped == 1u || (s->rb_ctrl_dropped % 64u) == 0u)
+    {
+        fprintf(stderr,
+                "recomp_net: %s dropped -- episode-control queue full "
+                "(%d entries, %u dropped this session); the host is not "
+                "draining rb_* messages between pumps\n",
+                what, RNET_RB_CTRL_QUEUE, (unsigned)s->rb_ctrl_dropped);
+    }
+}
 static void send_input_bundle(RNetSession *s);
 static void apply_pending_delay(RNetSession *s);
 static void emit_delay_sync(RNetSession *s, rnet_u8 new_delay, rnet_u32 effective_tick);
@@ -654,8 +683,13 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_sync_q[s->rb_sync_head].corrected_slot = pkt->rb_corrected_slot;
             s->rb_sync_q[s->rb_sync_head].initiator = pkt->rb_initiator;
             s->rb_sync_q[s->rb_sync_head].flags = pkt->rb_flags;
+            s->rb_sync_q[s->rb_sync_head].from = pkt->local_slot;
             s->rb_sync_head = (s->rb_sync_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_sync_count++;
+        }
+        else if (pkt->local_slot != s->wire_slot)
+        {
+            rb_ctrl_note_drop(s, "RB_SYNC");
         }
         break;
     case RNET_PKT_RB_SEAL_ROWS:
@@ -677,8 +711,13 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
                        sizeof(RNetRbWireFrame) * n);
                 s->rb_seal_q[s->rb_seal_head].row_count = n;
             }
+            s->rb_seal_q[s->rb_seal_head].from = pkt->local_slot;
             s->rb_seal_head = (s->rb_seal_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_seal_count++;
+        }
+        else if (pkt->local_slot != s->wire_slot)
+        {
+            rb_ctrl_note_drop(s, "RB_SEAL_ROWS");
         }
         break;
     case RNET_PKT_RB_BASELINE:
@@ -695,8 +734,13 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_base_q[s->rb_base_head].digest_a = pkt->rb_digest_a;
             s->rb_base_q[s->rb_base_head].digest_b = pkt->rb_digest_b;
             s->rb_base_q[s->rb_base_head].digest_c = pkt->rb_digest_c;
+            s->rb_base_q[s->rb_base_head].from = pkt->local_slot;
             s->rb_base_head = (s->rb_base_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_base_count++;
+        }
+        else if (pkt->local_slot != s->wire_slot)
+        {
+            rb_ctrl_note_drop(s, "RB_BASELINE");
         }
         break;
     case RNET_PKT_RB_POST:
@@ -712,8 +756,13 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->rb_post_q[s->rb_post_head].digest_master = pkt->rb_digest_master;
             s->rb_post_q[s->rb_post_head].input_digest = pkt->rb_input_digest;
             s->rb_post_q[s->rb_post_head].match = pkt->rb_match;
+            s->rb_post_q[s->rb_post_head].from = pkt->local_slot;
             s->rb_post_head = (s->rb_post_head + 1) % RNET_RB_CTRL_QUEUE;
             s->rb_post_count++;
+        }
+        else if (pkt->local_slot != s->wire_slot)
+        {
+            rb_ctrl_note_drop(s, "RB_POST");
         }
         break;
     case RNET_PKT_MODSET:
@@ -1748,6 +1797,7 @@ RNetSession *rnet_session_create(const RNetConfig *cfg, const RNetHostVTable *ho
      * 0, so this already answers no -- stated rather than relied upon. */
     s->is_sim_authority = (!s->is_observer && cfg->local_slot == 0) ? 1 : 0;
     s->rb_peer_slot = -1;
+    s->rb_last_from = -1;
     s->session_start_ms = rnet_os_monotonic_ms();
     s->last_peer_rx_ms = 0;
     s->peer_gone = 0;
@@ -3148,6 +3198,7 @@ int rnet_session_take_rb_sync(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *mism
         *op = s->rb_sync_q[s->rb_sync_tail].initiator;
     if (flags)
         *flags = s->rb_sync_q[s->rb_sync_tail].flags;
+    s->rb_last_from = s->rb_sync_q[s->rb_sync_tail].from;
     s->rb_sync_tail = (s->rb_sync_tail + 1) % RNET_RB_CTRL_QUEUE;
     s->rb_sync_count--;
     return 1;
@@ -3217,6 +3268,7 @@ int rnet_session_take_rb_seal_rows(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 
     }
     if (row_count)
         *row_count = n;
+    s->rb_last_from = s->rb_seal_q[s->rb_seal_tail].from;
     s->rb_seal_tail = (s->rb_seal_tail + 1) % RNET_RB_CTRL_QUEUE;
     s->rb_seal_count--;
     return 1;
@@ -3257,6 +3309,7 @@ int rnet_session_take_rb_baseline(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *
         *digest_b = s->rb_base_q[s->rb_base_tail].digest_b;
     if (digest_c)
         *digest_c = s->rb_base_q[s->rb_base_tail].digest_c;
+    s->rb_last_from = s->rb_base_q[s->rb_base_tail].from;
     s->rb_base_tail = (s->rb_base_tail + 1) % RNET_RB_CTRL_QUEUE;
     s->rb_base_count--;
     return 1;
@@ -3293,9 +3346,20 @@ int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *targ
         *input_digest = s->rb_post_q[s->rb_post_tail].input_digest;
     if (match)
         *match = s->rb_post_q[s->rb_post_tail].match;
+    s->rb_last_from = s->rb_post_q[s->rb_post_tail].from;
     s->rb_post_tail = (s->rb_post_tail + 1) % RNET_RB_CTRL_QUEUE;
     s->rb_post_count--;
     return 1;
+}
+
+int rnet_session_rb_last_take_from(const RNetSession *s)
+{
+    return (s != NULL) ? s->rb_last_from : -1;
+}
+
+rnet_u32 rnet_session_rb_ctrl_dropped(const RNetSession *s)
+{
+    return (s != NULL) ? s->rb_ctrl_dropped : 0u;
 }
 
 int rnet_session_send_sio_multi_xfer(RNetSession *s, rnet_u8 unit_id, rnet_u32 seq,

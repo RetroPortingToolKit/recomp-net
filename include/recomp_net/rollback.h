@@ -35,6 +35,12 @@ extern "C" {
  * tip-hold-commit and open a fresh episode when extend would exceed it. */
 #define RNET_RB_PEER_SEAL_MASK_BITS 64u
 #define RNET_RB_MAX_SLOTS 8
+/* Rows per RB_SEAL_ROWS datagram. The send path truncates a larger chunk to
+ * this and the receiver credits only what arrived, so a host that chunks at
+ * more than this posts a partial span and waits forever for the rest.
+ * Public so a host never has to carry its own copy of the number (the SNES
+ * host did, with a comment saying so). */
+#define RNET_RB_SEAL_ROWS_CHUNK_MAX 24u
 /* Tip episode: target - load at or below this may skip the ready-ACK RTT
  * (digests still compared). Sized for tip-extend re-replay after TipHold. */
 #define RNET_RB_LIGHT_TIP_MAX_DEPTH 16u
