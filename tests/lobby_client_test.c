@@ -1250,6 +1250,45 @@ static void case_guest_joined_and_host_spectates(void)
     g_lc.fd = -1;
 }
 
+/* A frame is queued whole or refused -- never cut. The slot used to be 2048
+ * bytes, and a create carrying a full caps object (the 4000 bytes the caps
+ * encoder allows) went out truncated, which the server drops whole. */
+static void case_large_frames_are_not_cut(void)
+{
+    RNetLobbyMatchCaps caps;
+    int i;
+    size_t len;
+    printf("  large frames\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    memset(&caps, 0, sizeof(caps));
+    caps.valid = 1;
+    caps.input_delay = 6;
+    caps.mod_count = 16;
+    for (i = 0; i < 40; ++i)
+        strcat(caps.mod_set, "pkg@1/feature opt=v;");
+    for (i = 0; i < caps.mod_count; ++i) {
+        snprintf(caps.mods[i].id, sizeof(caps.mods[i].id),
+                 "some.fairly.long.package.identifier.%02d", i);
+        snprintf(caps.mods[i].ver, sizeof(caps.mods[i].ver), "1.0.%d", i);
+        snprintf(caps.mods[i].name, sizeof(caps.mods[i].name),
+                 "A Package With A Descriptive Name %d", i);
+        snprintf(caps.mods[i].feats, sizeof(caps.mods[i].feats),
+                 "feature_one,feature_two");
+    }
+    ck(rnet_lobby_create("Big", "G", "1", "", "0.0.0.0:7777", &caps, 2) == 0,
+       "create with a large plan queues");
+    len = strlen(g_lc.pending_tx[0]);
+    printf("    create frame is %zu bytes\n", len);
+    ck(len > 2048, "the case really exceeds the old 2048-byte slot");
+    ck(g_lc.pending_tx[0][len - 1] == '}', "and ends where JSON ends");
+    ck(strstr(g_lc.pending_tx[0], "\"mod_cosmetic_allow\"") != NULL,
+       "the caps object's last key is on the wire");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 int main(void)
 {
     case_rows();
@@ -1285,6 +1324,7 @@ int main(void)
     case_legacy_env_alias();
     case_host_created_update_launch();
     case_guest_joined_and_host_spectates();
+    case_large_frames_are_not_cut();
     printf(fails ? "\n%d failure(s)\n" : "\nall lobby client cases passed\n", fails);
     return fails != 0;
 }

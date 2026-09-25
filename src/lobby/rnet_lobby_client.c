@@ -189,7 +189,10 @@ typedef struct {
     int need_mods_can_transfer;
     char need_mods_lobby_id[RNET_LOBBY_ID_LEN];
     char need_mods_host_player_id[RNET_LOBBY_ID_LEN];
-    char pending_tx[8][2048];
+    /* Outbound frames waiting for the handshake. Sized for the largest frame
+     * any op builds (set_blocks at 256 ids, ~10.5 KB; create with a full caps
+     * object, ~5 KB): a frame is queued whole or refused, never cut. */
+    char pending_tx[8][RNET_LOBBY_TX_MAX];
     int pending_n;
     /* Inbound ICE signals (WS op:signal). */
     struct {
@@ -1594,13 +1597,34 @@ size_t rnet_lobby_json_escape(const char *in, char *out, size_t cap)
     return json_escape(in, out, cap);
 }
 
+/* Queue one frame, whole or not at all.
+ *
+ * This used to strncpy into a 2048-byte slot. Every op that can exceed that
+ * -- create / start / set_match_caps with the 4000-byte caps object the rest
+ * of this file carefully allows, join with a full mod offer, set_blocks --
+ * was cut mid-token, the server dropped the malformed frame whole, and the
+ * caller had already returned success: the silent "Create Lobby created
+ * nothing" failure caps_json_build describes, one layer further down. The
+ * slot is now sized for the largest frame, and anything larger (or a full
+ * queue) is refused out loud. */
 static void queue_send(const char *json)
 {
-    if (g_lc.pending_n >= 8) {
+    size_t len;
+    if (!json) return;
+    len = strlen(json);
+    if (len >= sizeof(g_lc.pending_tx[0])) {
+        fprintf(stderr, "rnet_lobby: refusing to send a %zu-byte frame (limit "
+                        "%zu): %.40s...\n", len,
+                sizeof(g_lc.pending_tx[0]) - 1, json);
         return;
     }
-    strncpy(g_lc.pending_tx[g_lc.pending_n], json, sizeof(g_lc.pending_tx[0]) - 1);
-    g_lc.pending_tx[g_lc.pending_n][sizeof(g_lc.pending_tx[0]) - 1] = '\0';
+    if (g_lc.pending_n >= (int)(sizeof(g_lc.pending_tx) /
+                                sizeof(g_lc.pending_tx[0]))) {
+        fprintf(stderr, "rnet_lobby: send queue full before the handshake; "
+                        "dropping %.40s...\n", json);
+        return;
+    }
+    memcpy(g_lc.pending_tx[g_lc.pending_n], json, len + 1);
     g_lc.pending_n++;
 }
 

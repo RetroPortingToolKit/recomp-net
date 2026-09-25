@@ -13,6 +13,8 @@ extern "C" {
 #define RNET_LOBBY_VERSION_LEN 32
 #define RNET_LOBBY_ENDPOINT_LEN 64
 #define RNET_LOBBY_MAX_LIST 32
+/* Largest outbound frame the client queues (bytes, NUL included). */
+#define RNET_LOBBY_TX_MAX 12288
 
 /* Player seats the client can TRACK. A title's own ceiling is smaller and is
  * set at run time (RNetLobbyConfig.max_players); this is the array size, and
