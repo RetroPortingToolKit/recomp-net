@@ -188,11 +188,13 @@ Two rules it adds over what snesrecomp shipped, each found by
 `tests/rb_driver_test.c`'s toy engine (which folds every seat's row into its
 state, so a correction that never lands is a measurable divergence):
 
-- **A correction is owed until it commits.** Reconcile promotes the true row
-  the moment it decides to rewind; if the episode does not commit (NACK,
-  abort, watchdog, dual-initiation yield, a stage that cannot take it, the
-  initiator cooldown) the tick is re-opened later ("RB correction retried"),
-  or declared "RB correction LOST" once no snapshot reaches it.
+- **A correction is owed until a replay covering it completes.** Reconcile
+  promotes the true row the moment it decides to rewind; if the episode never
+  replays it (NACK, abort before the load, watchdog, dual-initiation yield, a
+  stage that cannot take it, the initiator cooldown) the tick is re-opened
+  later ("RB correction retried"), or declared "RB correction LOST" once no
+  snapshot reaches it. A completed replay pays it even if the episode then
+  fails to commit: the span was re-run on authoritative rows.
 - **An abort after the baseline load restores the live tip** ("RB tip
   restored"), instead of leaving the engine on the load tick while sim stays
   at the old tip.
