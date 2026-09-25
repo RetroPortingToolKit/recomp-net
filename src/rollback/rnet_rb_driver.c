@@ -198,6 +198,15 @@ struct RNetRbDriver {
     int      allow_mod_mismatch;
     char     allow_mod_mismatch_env[96];
 
+    /* The injector counts remote ROWS, once per seat per tick, as its
+     * interval is documented. It used to count polls, and a poll that stalls
+     * on a missing remote row is retried at the same tick -- so under latency
+     * the interval shrank with the stall rate (measured at 300 ms RTT: forced
+     * rows 2 ticks apart at an interval of 45), and cells at different
+     * latencies were injected at different rates. tick+1 of the last row
+     * counted per seat; 0 = none. */
+    uint32_t force_mispredict_row[RB_MAX_SLOTS];
+
     /* Episodes opened, by role. The harness counts log lines; these are the
      * same numbers from the other side, printed when a drain completes. */
     uint32_t ep_initiated;
@@ -2943,7 +2952,10 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
          * is of a session that was never valid. A validation knob must
          * perturb the thing under test, not the premise of the test. */
         if (d->force_mispredict_every > 0 && slot != local && d->boot_dig_settled &&
-            d->quiesce == RNET_RB_QUIESCE_NONE) {
+            d->quiesce == RNET_RB_QUIESCE_NONE &&
+            d->force_mispredict_row[slot] != d->sim + 1u) {
+            /* Once per row: a stalled poll retries the same tick. */
+            d->force_mispredict_row[slot] = d->sim + 1u;
             if ((++d->force_mispredict_n % (unsigned long)d->force_mispredict_every) == 0ul) {
                 d->force_invent_slot = slot;
                 rb_log_raw(d, "rbe: forced late row slot=%d sim=%u "
