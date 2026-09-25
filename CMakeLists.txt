@@ -49,6 +49,9 @@ set(RNET_CORE_SOURCES
   # rnet_ws.c differed only by two static helpers in swapped order.
   src/lobby_ws/rnet_ws.c
   src/lobby_ws/rnet_sha1.c
+  # The WebSocket lobby protocol client (recomp_net/lobby_client.h), lifted
+  # from snesrecomp's snes_lobby_client.c so every engine links one copy.
+  src/lobby/rnet_lobby_client.c
 )
 
 add_library(recomp_net STATIC ${RNET_CORE_SOURCES})
@@ -300,6 +303,22 @@ if(RNET_BUILD_TESTS)
   add_executable(rb_post_test tests/rb_post_test.c)
   target_link_libraries(rb_post_test PRIVATE recomp_net)
   add_test(NAME rb_post_test COMMAND rb_post_test)
+
+  # The lobby protocol client, driven through its own translation unit. NOT
+  # linked against recomp_net: the test replaces every network entry point the
+  # client could reach with an aborting trap (see the file header), so it
+  # compiles only the two pure modules it needs beside the client.
+  if(UNIX)
+    add_executable(lobby_client_test
+      tests/lobby_client_test.c
+      src/chat/rnet_chat_filter.c
+      src/chat/rnet_chat_report.c)
+    target_include_directories(lobby_client_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(lobby_client_test PRIVATE
+      _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    add_test(NAME lobby_client_test COMMAND lobby_client_test)
+  endif()
 
   add_executable(sched_smoke_test tests/sched_smoke_test.c)
   target_link_libraries(sched_smoke_test PRIVATE recomp_net)
