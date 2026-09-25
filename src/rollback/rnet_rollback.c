@@ -401,7 +401,10 @@ uint8_t rnet_rb_extend_target(RNetRbSession *s, uint32_t new_target)
     for (offset = s->sealed_span; offset < new_span; ++offset)
     {
         uint32_t tick = begin + offset;
-        for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
+        /* Active seats only. A seat outside the match has no owner to seal
+         * it and no row to replay, and asking the host for one invites a
+         * stub answer to credit a mask nobody waits on. */
+        for (slot = 0u; slot < s->cfg.slot_count; ++slot)
         {
             rnet_rb_fill_local_row(s, tick, offset, slot);
         }
@@ -533,7 +536,10 @@ void rnet_rb_seal_inputs(RNetRbSession *s, uint32_t begin_tick, uint32_t target_
     for (offset = 0u; offset < span; ++offset)
     {
         uint32_t tick = begin_tick + offset;
-        for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
+        /* Active seats only. A seat outside the match has no owner to seal
+         * it and no row to replay, and asking the host for one invites a
+         * stub answer to credit a mask nobody waits on. */
+        for (slot = 0u; slot < s->cfg.slot_count; ++slot)
         {
             rnet_rb_fill_local_row(s, tick, offset, slot);
         }
