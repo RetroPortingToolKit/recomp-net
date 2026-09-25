@@ -2883,8 +2883,9 @@ static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
         return;
     if (d->quiesce_all_ms == 0u)
         d->quiesce_all_ms = now ? now : 1u;
-    /* With the session down the peer has left, and it could only leave
-     * holding our marker: there is no acknowledgement left to wait for. */
+    /* wire_ok == 0: the session is down or the peer said BYE. It has left,
+     * and a draining peer leaves only once it holds our marker, so there is
+     * no acknowledgement left to wait for. */
     if (wire_ok && (d->peer_quiesce_ack_mask & expect) != expect &&
         (uint32_t)(now - d->quiesce_all_ms) < RB_QUIESCE_ACK_GRACE_MS)
         return;
@@ -2990,7 +2991,9 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     rb_modset_pump(d);
     rb_reconcile_wire(d);
     rb_pump_episode(d);
-    rb_quiesce_pump(d, 1);
+    /* A peer that said BYE has left even while the session still reads
+     * RUNNING; a drain must not wait for its acknowledgement. */
+    rb_quiesce_pump(d, rnet_session_peer_disconnected(s, 0) ? 0 : 1);
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */

@@ -184,7 +184,7 @@ FRAME_COMMIT hash chain, the boot-digest gate, the mod-set and identity
 handshakes, lockstep degrade, the advisory chain-stall report, and a cold
 reset on every start.
 
-Two rules it adds over what snesrecomp shipped, each found by
+Rules it adds over what snesrecomp shipped. The first two were found by
 `tests/rb_driver_test.c`'s toy engine (which folds every seat's row into its
 state, so a correction that never lands is a measurable divergence):
 
@@ -198,6 +198,14 @@ state, so a correction that never lands is a measurable divergence):
 - **An abort after the baseline load restores the live tip** ("RB tip
   restored"), instead of leaving the engine on the load tick while sim stays
   at the old tip.
+- **An answer that beats its BEGIN is held, not dropped** (2026-09-25). An
+  initiator that can seal from its own confirmed history sends BEGIN,
+  BASELINE and POST in one poll; under jitter the POST can arrive first. It
+  was discarded, and the follower waited out the 2 s episode budget and
+  aborted "timed out waiting for peer POST" on an epoch the initiator had
+  committed -- every POST timeout in snesrecomp's 200/300 ms sweep cells.
+  POST and BASELINE for a peer epoch newer than any BEGIN seen from that seat
+  are held per seat and taken when the BEGIN opens the episode.
 
 ### Integrating a host (n64lle, psxrecomp, the next engine)
 
