@@ -1327,7 +1327,7 @@ static void case_large_frames_are_not_cut(void)
     caps.valid = 1;
     caps.input_delay = 6;
     caps.mod_count = 16;
-    for (i = 0; i < 40; ++i)
+    for (i = 0; i < 40 && strlen(caps.mod_set) + sizeof("pkg@1/feature opt=v;") <= sizeof(caps.mod_set); ++i)
         strcat(caps.mod_set, "pkg@1/feature opt=v;");
     for (i = 0; i < caps.mod_count; ++i) {
         snprintf(caps.mods[i].id, sizeof(caps.mods[i].id),
