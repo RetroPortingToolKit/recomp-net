@@ -320,6 +320,7 @@ struct RNetRbDriver {
      * and follows that took the load snapshot at our own live tip. */
     uint32_t n_follow_deferred;
     uint32_t n_follow_at_tip;
+    uint32_t n_observer_skipped;  /* BEGINs an observer ignored */
 
     /* SEAL_ROWS chunks for an epoch whose BEGIN has not opened here yet: a
      * deferred follow, or a chunk that overtook its BEGIN under jitter. Same
@@ -453,7 +454,10 @@ static int rb_slot_count(const RNetRbDriver *d)
 static int rb_local_slot(const RNetRbDriver *d)
 {
     int s = d->cfg.local_slot ? *d->cfg.local_slot : 0;
-    return (s >= 0 && s < RB_MAX_SLOTS) ? s : 0;
+    /* RB_MAX_SLOTS itself is legal: the observer sentinel of a full room
+     * (local_slot == slot_count, rollback.h). Clamping it to 0 would make a
+     * spectator of an 8-seat room impersonate seat 0. */
+    return (s >= 0 && s <= RB_MAX_SLOTS) ? s : 0;
 }
 
 static RNetSession *rb_session(const RNetRbDriver *d)
@@ -900,13 +904,29 @@ static uint8_t rb_vt_get_input_row(void *ctx, int32_t slot, uint32_t tick,
 /* Can we seal our own seat across every tick of [load, target]? Asked with the
  * seal's own predicate rather than a tip comparison, so it also catches a tick
  * that has aged out of the history ring at the low end. */
+/* An OBSERVER (spectator): local_slot == slot_count, owns no seat. It must
+ * never predict (it has no seat whose input it could be right about, and
+ * nobody seals rows for its episodes), never open an episode, never follow
+ * or NACK one (the relay drops everything it sends, so a NACK only desyncs
+ * its own ledger and stalls it), and never tip-extend. Pinning lockstep makes
+ * all of that follow: it admits a tick only on every seat's wire row, so its
+ * state is always the corrected one and there is nothing to roll back.
+ * Measured before this (nesrecomp rb_lobby.sh, 4 seats + 1 spectator): the
+ * spectator invented 403 rows, opened 6 episodes nobody answered, refused
+ * every players' BEGIN ("no local row" for seat 4), and fell 600 ticks
+ * behind. */
+static int rb_is_observer(const RNetRbDriver *d)
+{
+    return rb_local_slot(d) >= rb_slot_count(d);
+}
+
 static int rb_local_rows_cover(RNetRbDriver *d, uint32_t load, uint32_t target,
                                uint32_t *gap)
 {
     uint32_t t;
     int local = rb_local_slot(d);
 
-    if (local < 0 || target < load)
+    if (local < 0 || rb_is_observer(d) || target < load)
         return 1;
     for (t = load; t <= target; ++t) {
         RNetRbFrame row;
@@ -1574,6 +1594,10 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
     {
         const char *v = rb_env_str(d, "LOCKSTEP", d->lockstep_env, sizeof(d->lockstep_env));
         d->lockstep_pinned = (v && v[0] && v[0] != '0') ? 1 : 0;
+        if (rb_is_observer(d) && !d->lockstep_pinned) {
+            d->lockstep_pinned = 1;
+            snprintf(d->lockstep_env, sizeof(d->lockstep_env), "observer");
+        }
         if (d->lockstep_pinned)
             rb_log_raw(d, "rbe: LOCKSTEP pinned on — remote input is never "
                           "predicted (%s)\n", d->lockstep_env);
@@ -2902,6 +2926,16 @@ static void rb_drain_wire(RNetRbDriver *d)
         int from = rnet_session_rb_last_take_from(s);
         switch (op) {
         case RNET_RB_SYNC_OP_BEGIN:
+            if (rb_is_observer(d)) {
+                /* See rb_is_observer: never predicted, so nothing to correct;
+                 * never answers (the relay would drop it anyway). Counted. */
+                d->n_observer_skipped++;
+                if (!(flags & RNET_RB_SYNC_FLAG_REREPLAY))
+                    rb_log(d, "RB observer ignores episode epoch=%u (seat %d) — "
+                              "lockstep, nothing to correct\n",
+                           (unsigned)epoch, from);
+                break;
+            }
             /* A tip-extend for the episode we are already holding — not a new
              * episode, so it must be recognised before the dual-initiation
              * arbitration below, which would otherwise decline our own

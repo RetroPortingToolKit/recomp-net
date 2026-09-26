@@ -442,6 +442,7 @@ typedef struct Report {
 } Report;
 
 #define MAX_SEATS 4
+#define MAX_PROCS 6   /* seats + observers */
 
 typedef struct Scenario {
     const char *name;
@@ -488,6 +489,10 @@ typedef struct Scenario {
      * (e.g. 0x5: seats 0 and 2 of 4) runs one process per occupied seat;
      * seat 0 must be occupied (it relays). */
     uint32_t occupied_mask;
+    /* Observers (spectators, local_slot == slot_count) dialing seat 0's hub.
+     * Each must open, follow and refuse nothing, keep up, drain, and agree
+     * with seat 0's timeline -- a spectator never predicts. */
+    int observers;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -557,7 +562,9 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     memset(&g_c, 0, sizeof(g_c));
     g_c.slot = slot;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
-    if (slots == 2)
+    if (slot >= slots)
+        snprintf(logname, sizeof(logname), "rb_driver_test_%s_observer.log", sc->name);
+    else if (slots == 2)
         snprintf(logname, sizeof(logname), "rb_driver_test_%s_%s.log", sc->name,
                  slot == 0 ? "initiator" : "follower");
     else
@@ -584,7 +591,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
 
     rnet_config_init_defaults(&rc);
     rc.slot_count = (rnet_u8)slots;
-    rc.local_slot = (rnet_u8)slot;
+    rc.local_slot = (rnet_u8)slot;   /* slot == slots: an observer */
     rc.input_delay = (rnet_u8)delay;
     rc.session_id = session_id;
     rc.occupied_mask = sc->occupied_mask;
@@ -600,6 +607,12 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
         started = rnet_session_start_lan(s, bind, peer) == 0;
     } else if (slot == 0) {
         started = rnet_session_start_lan_hub(s, bind) == 0;   /* seat 0 relays */
+    } else if (slot >= slots) {
+        /* An observer: its own port past the seats', dialing the hub. */
+        snprintf(bind, sizeof(bind), "127.0.0.1:%u",
+                 port_base + 4u + (unsigned)(slot - slots));
+        snprintf(peer, sizeof(peer), "127.0.0.1:%u", port_base);
+        started = rnet_session_start_lan(s, bind, peer) == 0;
     } else {
         snprintf(peer, sizeof(peer), "127.0.0.1:%u", port_base);
         started = rnet_session_start_lan(s, bind, peer) == 0;
@@ -797,12 +810,12 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
 {
     /* One process per occupied seat; nseats counts processes, seat_of names
      * each one's seat. */
-    int seat_of[MAX_SEATS];
-    int nseats = 0;
-    int pipes[MAX_SEATS][2], stops[MAX_SEATS][2], ready[2];
-    pid_t pids[MAX_SEATS];
-    Report *rr[MAX_SEATS];
-    int got[MAX_SEATS];
+    int seat_of[MAX_PROCS];
+    int nseats = 0, nprocs, nobs = sc->observers;
+    int pipes[MAX_PROCS][2], stops[MAX_PROCS][2], ready[2];
+    pid_t pids[MAX_PROCS];
+    Report *rr[MAX_PROCS];
+    int got[MAX_PROCS];
     char c;
     uint32_t session_id = 0x52424456u ^ (uint32_t)getpid() ^ port_base;
     uint32_t upto, t, first_bad = 0;
@@ -815,11 +828,14 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     for (k = 0; k < seats_of(sc); ++k)
         if (!sc->occupied_mask || (sc->occupied_mask & (1u << k)))
             seat_of[nseats++] = k;
+    nprocs = nseats;
+    for (k = 0; k < nobs && nprocs < MAX_PROCS; ++k)
+        seat_of[nprocs++] = seats_of(sc);   /* the observer sentinel */
     if (pipe(ready) != 0) {
         expect_true(0, "pipe");
         return;
     }
-    for (k = 0; k < nseats; ++k) {
+    for (k = 0; k < nprocs; ++k) {
         if (pipe(pipes[k]) != 0 || pipe(stops[k]) != 0) {
             expect_true(0, "pipe");
             return;
@@ -828,7 +844,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     }
     fflush(stdout);
     fflush(stderr);
-    for (k = 0; k < nseats; ++k) {
+    for (k = 0; k < nprocs; ++k) {
         pids[k] = fork();
         if (pids[k] == 0) {
             close(pipes[k][0]);
@@ -836,23 +852,53 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                       stops[k][0]);
         }
     }
-    for (k = 0; k < nseats; ++k)
+    for (k = 0; k < nprocs; ++k)
         close(pipes[k][1]);
     close(ready[1]);
     /* Every seat has played its ticks (or given up): stop them together. */
-    for (k = 0; k < nseats; ++k)
+    for (k = 0; k < nprocs; ++k)
         (void)read_all(ready[0], &c, 1);
-    for (k = 0; k < nseats; ++k)
+    for (k = 0; k < nprocs; ++k)
         (void)write_all(stops[k][1], "S", 1);
-    for (k = 0; k < nseats; ++k)
+    for (k = 0; k < nprocs; ++k)
         got[k] = read_all(pipes[k][0], rr[k], sizeof(Report));
-    for (k = 0; k < nseats; ++k) {
+    for (k = 0; k < nprocs; ++k) {
         waitpid(pids[k], NULL, 0);
         close(pipes[k][0]);
         close(stops[k][0]);
         close(stops[k][1]);
     }
     close(ready[0]);
+
+    for (k = nseats; k < nprocs; ++k) {
+        const Report *r = rr[k];
+        uint32_t t2, bad2 = 0, upto2 = r->confirmed < rr[0]->confirmed ? r->confirmed
+                                                                       : rr[0]->confirmed;
+        printf("%-22s observer init=%u follow=%u refused=%u fork=%u sim=%u (seat0 %u) "
+               "confirmed=%u quiesce=%d replay_admits=%u\n", sc->name, r->n_ep_init,
+               r->n_ep_follow, r->n_refused, r->n_fork, r->sim, rr[0]->sim, r->confirmed,
+               r->quiesce_state, r->replay_admits);
+        snprintf(msg, sizeof(msg), "%s: observer reported and ran", sc->name);
+        expect_true(got[k] && r->running, msg);
+        snprintf(msg, sizeof(msg), "%s: observer opened, followed and refused nothing "
+                 "(%u/%u/%u)", sc->name, r->n_ep_init, r->n_ep_follow, r->n_refused);
+        expect_true(r->n_ep_init + r->n_ep_follow + r->n_refused == 0u &&
+                        r->replay_admits == 0u, msg);
+        snprintf(msg, sizeof(msg), "%s: observer 0 forks", sc->name);
+        expect_true(r->n_fork == 0u, msg);
+        snprintf(msg, sizeof(msg), "%s: observer kept up (sim %u, want >= %u)", sc->name,
+                 r->sim, sc->ticks);
+        expect_true(r->sim >= sc->ticks, msg);
+        snprintf(msg, sizeof(msg), "%s: observer drained (state %d)", sc->name,
+                 r->quiesce_state);
+        expect_true(r->quiesce_state == RNET_RB_QUIESCE_DRAINED, msg);
+        if (upto2 >= TOY_TICKS) upto2 = TOY_TICKS - 1u;
+        for (t2 = 1; t2 <= upto2; ++t2)
+            if (rr[0]->timeline[t2] != r->timeline[t2]) { bad2 = t2; break; }
+        snprintf(msg, sizeof(msg), "%s: observer's timeline agrees with seat 0's through "
+                 "tick %u (first diff %u)", sc->name, upto2, bad2);
+        expect_true(bad2 == 0u && upto2 >= sc->ticks / 2u, msg);
+    }
 
     for (k = 0; k < nseats; ++k) {
         const Report *r = rr[k];
@@ -1009,7 +1055,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         expect_true(first_bad == 0u, msg);
     }
 done:
-    for (k = 0; k < nseats; ++k)
+    for (k = 0; k < nprocs; ++k)
         free(rr[k]);
 }
 
@@ -1061,6 +1107,10 @@ int main(int argc, char **argv)
           0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0x5u },
         { "sparse-0+2-of-4-inline", 0, 0,    "0",   "0",   45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0x5u },
+        /* A spectator watching four seats through seat 0's hub, with real
+         * latency so the players mispredict and roll back around it. */
+        { "4seat-observer-rtt60", 1, 1,      "30",  "8",   45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0u, 1 },
     };
     /* Four ports per scenario from a per-process base; kept inside
      * 20000..60003 however many scenarios there are (a base near the top of
