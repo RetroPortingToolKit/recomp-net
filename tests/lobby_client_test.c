@@ -77,6 +77,29 @@ int rnet_ws_write_text(int fd, const char *text, int client_mask)
                     "this test does no networking\n");
     abort();
 }
+int rnet_ws_tx_queue_text(RNetWsTx *tx, const char *text, int client_mask)
+{
+    (void)tx; (void)text; (void)client_mask;
+    fprintf(stderr, "lobby_client_test: rnet_ws_tx_queue_text was called; "
+                    "this test does no networking\n");
+    abort();
+}
+long rnet_ws_tx_flush(RNetWsTx *tx, int fd)
+{
+    (void)tx; (void)fd;
+    fprintf(stderr, "lobby_client_test: rnet_ws_tx_flush was called; "
+                    "this test does no networking\n");
+    abort();
+}
+/* Pure bookkeeping, no socket: disconnect() frees the (empty) buffer. The
+ * real ones are exercised against a socket by lobby_ws_backlog_test. */
+size_t rnet_ws_tx_pending(const RNetWsTx *tx) { return tx ? tx->len - tx->off : 0u; }
+void rnet_ws_tx_free(RNetWsTx *tx)
+{
+    if (!tx) return;
+    free(tx->buf);
+    memset(tx, 0, sizeof(*tx));
+}
 
 const char *rnet_account_session(void)
 {

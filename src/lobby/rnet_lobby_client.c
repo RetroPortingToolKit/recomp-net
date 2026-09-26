@@ -194,6 +194,14 @@ typedef struct {
      * object, ~5 KB): a frame is queued whole or refused, never cut. */
     char pending_tx[8][RNET_LOBBY_TX_MAX];
     int pending_n;
+    /* After the handshake every frame goes through this frame-atomic buffer
+     * (snesrecomp#104): the socket is non-blocking, and a would-block used to
+     * leave half a frame on the wire with the next frame written after it.
+     * tx_failed latches a hard socket error or a backlog past the cap; the
+     * next pump disconnects (never mid-op: disconnect wipes this struct). */
+    RNetWsTx tx;
+    int tx_failed;
+    char tx_error[96];
     /* Inbound ICE signals (WS op:signal). */
     struct {
         int type;
@@ -353,6 +361,7 @@ static int set_nonblock(int fd);   /* defined with the WS socket helpers */
 static const char *effective_game_version(const char *override_ver);
 static void queue_send(const char *json);
 static void flush_pending(void);
+static int ws_send(const char *json);
 static const char *json_get_str(const char *json, const char *key, char *out, size_t cap);
 static int json_get_int(const char *json, const char *key, int def);
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
@@ -1618,6 +1627,13 @@ static void queue_send(const char *json)
                 sizeof(g_lc.pending_tx[0]) - 1, json);
         return;
     }
+    /* After the handshake: straight into the outbound buffer, which keeps
+     * order and has no 8-frame ceiling. The slots below only hold frames
+     * written before there is a socket to write them to. */
+    if (g_lc.handshake_done && g_lc.fd >= 0) {
+        (void)ws_send(json);
+        return;
+    }
     if (g_lc.pending_n >= (int)(sizeof(g_lc.pending_tx) /
                                 sizeof(g_lc.pending_tx[0]))) {
         fprintf(stderr, "rnet_lobby: send queue full before the handshake; "
@@ -1628,6 +1644,52 @@ static void queue_send(const char *json)
     g_lc.pending_n++;
 }
 
+/* Latch the connection as broken; rnet_lobby_pump disconnects. */
+static void tx_fail(const char *why)
+{
+    if (g_lc.tx_failed) return;
+    g_lc.tx_failed = 1;
+    snprintf(g_lc.tx_error, sizeof(g_lc.tx_error), "%s", why);
+    fprintf(stderr, "rnet_lobby: lobby connection lost on send: %s (backlog %zu "
+                    "bytes, %llu would-blocks, %llu mid-frame); disconnecting\n",
+            why, rnet_ws_tx_pending(&g_lc.tx),
+            (unsigned long long)g_lc.tx.would_blocks,
+            (unsigned long long)g_lc.tx.split_frames);
+}
+
+/* Send what the socket takes now; keep the rest, in order, for the next pump.
+ * 0 = fine (sent or buffered), -1 = the connection is broken. */
+static int tx_flush(void)
+{
+    if (g_lc.tx_failed) return -1;
+    if (g_lc.fd < 0) return -1;
+    if (rnet_ws_tx_flush(&g_lc.tx, g_lc.fd) < 0) {
+        tx_fail("socket error");
+        return -1;
+    }
+    return 0;
+}
+
+/* One frame, whole: appended to the outbound buffer, then flushed as far as
+ * the socket allows. A would-block is not an error -- the frame stays queued
+ * and the pump finishes it. */
+static int ws_send(const char *json)
+{
+    int rc;
+    if (g_lc.tx_failed) return -1;
+    rc = rnet_ws_tx_queue_text(&g_lc.tx, json, 1);
+    if (rc == -2) {
+        tx_fail("outbound backlog over its cap (server not reading)");
+        return -1;
+    }
+    if (rc < 0) {
+        fprintf(stderr, "rnet_lobby: cannot frame a %zu-byte message: %.40s...\n",
+                strlen(json), json);
+        return -1;
+    }
+    return tx_flush();
+}
+
 static void flush_pending(void)
 {
     int i;
@@ -1635,9 +1697,10 @@ static void flush_pending(void)
         return;
     }
     for (i = 0; i < g_lc.pending_n; ++i) {
-        rnet_ws_write_text(g_lc.fd, g_lc.pending_tx[i], 1);
+        if (ws_send(g_lc.pending_tx[i]) < 0) break;
     }
     g_lc.pending_n = 0;
+    (void)tx_flush();
 }
 
 static int endpoint_has_usable_port(const char *endpoint)
@@ -2791,6 +2854,7 @@ void rnet_lobby_disconnect(void)
     if (g_lc.fd >= 0) {
         close(g_lc.fd);
     }
+    rnet_ws_tx_free(&g_lc.tx);   /* the memset below would leak it */
     {
         char dname[RNET_LOBBY_NAME_LEN];
         char fgame[RNET_LOBBY_NAME_LEN];
@@ -2888,6 +2952,10 @@ void rnet_lobby_pump(void)
     if (!rnet_lobby_connected()) {
         return;
     }
+    if (g_lc.tx_failed) {
+        rnet_lobby_disconnect();
+        return;
+    }
     if (!g_lc.handshake_done) {
         n = recv(g_lc.fd, buf, sizeof(buf), 0);
         if (n < 0) {
@@ -2933,6 +3001,10 @@ void rnet_lobby_pump(void)
         return;
     }
     flush_pending();
+    if (g_lc.tx_failed) {
+        rnet_lobby_disconnect();
+        return;
+    }
     drain_ws_pending();
     for (;;) {
         size_t available = sizeof(g_lc.ws_pending) - g_lc.ws_pending_len;
@@ -4572,11 +4644,11 @@ int rnet_lobby_send_signal_to(const char *to_player_id, int type, int flag,
              "{\"op\":\"signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"%s\","
              "\"type\":%d,\"flag\":%d,\"text\":\"%s\"}",
              lid_esc, to_esc, type, flag, esc);
-    /* Write immediately — ICE candidates arrive in bursts larger than pending_tx. */
+    /* Write immediately — ICE candidates arrive in bursts larger than
+     * pending_tx. Through the outbound buffer: a would-block keeps the frame
+     * (and the rest of a half-sent one) for the next pump. */
     if (g_lc.handshake_done && g_lc.fd >= 0) {
-        if (rnet_ws_write_text(g_lc.fd, msg, 1) < 0)
-            return -1;
-        return 0;
+        return ws_send(msg) < 0 ? -1 : 0;
     }
     queue_send(msg);
     return 0;

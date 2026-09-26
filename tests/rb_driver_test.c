@@ -484,6 +484,10 @@ typedef struct Scenario {
      * answered, so a lossy scenario grades the ledger as the harnesses do:
      * residual covered by watchdogs, and chain stalls are not a failure. */
     const char *loss_pct;
+    /* Seats with a player (bit i = seat i; 0 = every seat). A sparse room
+     * (e.g. 0x5: seats 0 and 2 of 4) runs one process per occupied seat;
+     * seat 0 must be occupied (it relays). */
+    uint32_t occupied_mask;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -583,6 +587,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     rc.local_slot = (rnet_u8)slot;
     rc.input_delay = (rnet_u8)delay;
     rc.session_id = session_id;
+    rc.occupied_mask = sc->occupied_mask;
     memset(&hv, 0, sizeof(hv));
     hv.sample_local = sample_local;
     hv.publish = publish_unused;
@@ -617,6 +622,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     cfg.local_slot = &local;
     cfg.slot_count = &slots;
     cfg.input_delay = &delay;
+    cfg.occupied_mask = sc->occupied_mask;
     cfg.replay_mode = g_c.mode ? RNET_RB_REPLAY_INCREMENTAL : RNET_RB_REPLAY_INLINE;
     cfg.part_names[0] = "acc_lo";
     cfg.part_names[1] = "acc_hi";
@@ -789,7 +795,10 @@ static uint32_t count_epoch(const uint32_t *ids, uint32_t n, uint32_t e)
 
 static void run_scenario(const Scenario *sc, unsigned port_base)
 {
-    int nseats = seats_of(sc);
+    /* One process per occupied seat; nseats counts processes, seat_of names
+     * each one's seat. */
+    int seat_of[MAX_SEATS];
+    int nseats = 0;
     int pipes[MAX_SEATS][2], stops[MAX_SEATS][2], ready[2];
     pid_t pids[MAX_SEATS];
     Report *rr[MAX_SEATS];
@@ -803,6 +812,9 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     char msg[320];
     int k, j;
 
+    for (k = 0; k < seats_of(sc); ++k)
+        if (!sc->occupied_mask || (sc->occupied_mask & (1u << k)))
+            seat_of[nseats++] = k;
     if (pipe(ready) != 0) {
         expect_true(0, "pipe");
         return;
@@ -820,7 +832,8 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         pids[k] = fork();
         if (pids[k] == 0) {
             close(pipes[k][0]);
-            run_child(sc, k, port_base, session_id, pipes[k][1], ready[1], stops[k][0]);
+            run_child(sc, seat_of[k], port_base, session_id, pipes[k][1], ready[1],
+                      stops[k][0]);
         }
     }
     for (k = 0; k < nseats; ++k)
@@ -847,7 +860,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                "extend=%u unapplied=%u forced=%u replay_admits=%u resim=%llu sim=%u "
                "confirmed=%u quiesce=%d unopened=%u tiphold_end=%u deferred=%u "
                "at_tip=%u stalls=%u\n",
-               sc->name, k, r->n_ep_init, r->n_ep_follow, r->n_refused, r->n_abort,
+               sc->name, seat_of[k], r->n_ep_init, r->n_ep_follow, r->n_refused, r->n_abort,
                r->n_timeout, r->n_fork, r->n_extend, r->n_unapplied, r->n_forced,
                r->replay_admits, (unsigned long long)r->resim_ticks, r->sim, r->confirmed,
                r->quiesce_state, r->n_drain_unopened, r->n_tiphold_end, r->n_deferred,
@@ -861,9 +874,9 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         sum_deferred += r->n_deferred;
         sum_at_tip += r->n_at_tip;
         sum_stall += r->n_chain_stall;
-        snprintf(msg, sizeof(msg), "%s: seat %d reported", sc->name, k);
+        snprintf(msg, sizeof(msg), "%s: seat %d reported", sc->name, seat_of[k]);
         expect_true(got[k], msg);
-        snprintf(msg, sizeof(msg), "%s: seat %d reached RUNNING", sc->name, k);
+        snprintf(msg, sizeof(msg), "%s: seat %d reached RUNNING", sc->name, seat_of[k]);
         expect_true(r->running, msg);
     }
 
@@ -905,10 +918,10 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         goto done;
     }
     for (k = 0; k < nseats; ++k) {
-        snprintf(msg, sizeof(msg), "%s: seat %d ran the match (sim %u)", sc->name, k, rr[k]->sim);
+        snprintf(msg, sizeof(msg), "%s: seat %d ran the match (sim %u)", sc->name, seat_of[k], rr[k]->sim);
         expect_true(rr[k]->sim >= (k == 0 ? sc->ticks : sc->ticks / 2u), msg);
         snprintf(msg, sizeof(msg), "%s: seat %d drained (state %d, %u quiesced lines)",
-                 sc->name, k, rr[k]->quiesce_state, rr[k]->n_quiesced);
+                 sc->name, seat_of[k], rr[k]->quiesce_state, rr[k]->n_quiesced);
         expect_true(rr[k]->quiesce_state == RNET_RB_QUIESCE_DRAINED &&
                         rr[k]->n_quiesced == 1u,
                     msg);
@@ -945,7 +958,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                     bad++;
             }
             snprintf(msg, sizeof(msg), "%s: pair %d->%d answered every episode exactly "
-                     "once (%u of %u wrong)", sc->name, k, j, bad, n);
+                     "once (%u of %u wrong)", sc->name, seat_of[k], seat_of[j], bad, n);
             expect_true(bad == 0u || (sc->loss_pct && sc->loss_pct[0] &&
                                       bad <= sum_timeout), msg);
         }
@@ -992,7 +1005,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
             }
         }
         snprintf(msg, sizeof(msg), "%s: seat %d's timeline agrees with seat 0's through "
-                 "tick %u (first diff %u)", sc->name, k, upto, first_bad);
+                 "tick %u (first diff %u)", sc->name, seat_of[k], upto, first_bad);
         expect_true(first_bad == 0u, msg);
     }
 done:
@@ -1041,6 +1054,13 @@ int main(int argc, char **argv)
          * POSTs keep that from costing the 2 s watchdog. */
         { "4seat-loss2",         1, 1,       "0",   "0",   45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0, 0, 0u, "2" },
+        /* A sparse room: seats 0 and 2 of 4, seats 1 and 3 empty. Nobody
+         * sits in an empty seat, so nobody seals its rows or sends its
+         * POST; an episode that waits on one never completes. */
+        { "sparse-0+2-of-4",     1, 1,       "30",  "8",   45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0x5u },
+        { "sparse-0+2-of-4-inline", 0, 0,    "0",   "0",   45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0x5u },
     };
     /* Four ports per scenario from a per-process base; kept inside
      * 20000..60003 however many scenarios there are (a base near the top of

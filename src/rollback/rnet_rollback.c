@@ -321,7 +321,10 @@ static void rnet_rb_fill_local_row(RNetRbSession *s, uint32_t tick, uint32_t off
          * authoritative without waiting for the peer's SEAL_ROWS. Predicted
          * rows stay unsealed: 2026-08-02 soak forked when a tip-extend left
          * the remote seat zeroed, the arm fell back to live hist
-         * (s1=---- at arm 4179) and the peers simmed different pads. */
+         * (s1=---- at arm 4179) and the peers simmed different pads.
+         * An EMPTY seat of a sparse room (occupied_mask) is sealed only here:
+         * nobody sends its SEAL_ROWS, so the host must answer with the
+         * deterministic row every peer synthesizes for it, unpredicted. */
         RNetRbFrame row;
         if (s->vt.get_input_row(s->vt.ctx, (int32_t)slot, tick, &row) != 0u &&
             row.is_valid != 0u && row.is_predicted == 0u)
@@ -684,25 +687,49 @@ uint8_t rnet_rb_peer_seal_rows_complete(const RNetRbSession *s, int32_t slot)
     return ((s->peer_seal_mask[(uint32_t)slot] & want) == want) ? 1u : 0u;
 }
 
-uint8_t rnet_rb_all_peer_seal_rows_complete(const RNetRbSession *s)
+uint32_t rnet_rb_expected_peer_mask(const RNetRbSession *s)
 {
-    uint32_t slot;
     uint32_t n;
+    uint32_t mask;
 
-    if ((s == NULL) || (rnet_rb_inputs_sealed(s) == 0u))
+    if (s == NULL)
     {
         return 0u;
     }
-    /* Only active match seats — waiting on unused slots (up to MAX=8) deadlocks
-     * 2P MotK episodes forever in SealInputs. */
     n = s->cfg.slot_count;
     if (n == 0u || n > RNET_RB_MAX_SLOTS)
     {
         n = RNET_RB_MAX_SLOTS;
     }
-    for (slot = 0u; slot < n; ++slot)
+    mask = (n >= 32u) ? 0xffffffffu : ((1u << n) - 1u);
+    if (s->cfg.occupied_mask != 0u)
     {
-        if (slot == s->cfg.local_slot)
+        mask &= s->cfg.occupied_mask;
+    }
+    if (s->cfg.local_slot < n)
+    {
+        mask &= ~(1u << s->cfg.local_slot);
+    }
+    return mask;
+}
+
+uint8_t rnet_rb_all_peer_seal_rows_complete(const RNetRbSession *s)
+{
+    uint32_t slot;
+    uint32_t want;
+
+    if ((s == NULL) || (rnet_rb_inputs_sealed(s) == 0u))
+    {
+        return 0u;
+    }
+    /* Only occupied match seats — waiting on unused slots (up to MAX=8)
+     * deadlocks 2P MotK episodes forever in SealInputs, and waiting on an
+     * empty seat of a sparse room (seats 0+2 of 4) does the same at N > 2:
+     * nobody sits there to send its rows. */
+    want = rnet_rb_expected_peer_mask(s);
+    for (slot = 0u; slot < RNET_RB_MAX_SLOTS; ++slot)
+    {
+        if ((want & (1u << slot)) == 0u)
         {
             continue;
         }

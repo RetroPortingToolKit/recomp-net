@@ -330,6 +330,20 @@ if(RNET_BUILD_TESTS)
     target_compile_definitions(lobby_client_test PRIVATE
       _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
     add_test(NAME lobby_client_test COMMAND lobby_client_test)
+
+    # The same client TU against a real (socketpair) socket that would-blocks
+    # mid-frame: the frame-atomic outbound buffer (snesrecomp#104).
+    add_executable(lobby_ws_backlog_test
+      tests/lobby_ws_backlog_test.c
+      src/lobby_ws/rnet_ws.c
+      src/lobby_ws/rnet_sha1.c
+      src/chat/rnet_chat_filter.c
+      src/chat/rnet_chat_report.c)
+    target_include_directories(lobby_ws_backlog_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(lobby_ws_backlog_test PRIVATE
+      _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    add_test(NAME lobby_ws_backlog_test COMMAND lobby_ws_backlog_test)
   endif()
 
   add_executable(sched_smoke_test tests/sched_smoke_test.c)

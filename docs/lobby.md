@@ -44,6 +44,22 @@ the effective mod set (`mod_set`) and the cosmetic grant
 (`mod_cosmetic_allow`). Spectators are a `create` option
 (`rnet_lobby_set_allow_spectators`), not a caps key.
 
+**Outbound writes are frame-atomic** (snesrecomp#104, fixed here
+2026-09-25). The lobby socket is non-blocking; `rnet_ws_write_text` used to
+give up on would-block after part of a frame had gone, its callers ignored
+that, and the next frame followed the fragment -- the server then parsed
+payload as headers. After the handshake every frame now goes through an
+`RNetWsTx` (`recomp_net/rnet_ws.h`): appended whole, flushed in order, the
+unsent tail (including the rest of a half-sent frame) kept for the next
+`rnet_lobby_pump`. The client stays connected across would-block and
+disconnects only on a hard socket error or a backlog past
+`RNET_WS_TX_CAP_DEFAULT` (256 KiB: a server that has stopped reading), with a
+log line naming which. The fixed 8-slot queue now only holds frames written
+before the handshake. `lobby_ws_backlog_test` forces would-block mid-frame on
+a socketpair and checks the byte stream is exactly the queued frames; the
+same socket driven the old way breaks after 6 of 240 frames.
+`rnet_ws_write_text` remains for blocking sockets only.
+
 The launcher-facing half -- `RecompLauncherCNetplayCallbacks` over this client
 and the LAN modules -- is recomp-ui's optional `recomp_launcher_netplay`
 module (`src/netplay/recomp_netplay_host.h`), not part of this library.

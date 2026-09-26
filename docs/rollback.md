@@ -491,6 +491,23 @@ stall" check failed 1 of 8 runs alone on the unfixed tree (one seat stalls=1
 after a dual-initiation abort, 0 % loss) and 1 of 4 full runs on the fixed one.
 Open; not root-caused.
 
+**Sparse rooms (found 2026-09-25).** A room whose occupied seats are not
+`0..n-1` -- seats 0 and 2 of 4 -- forked in `rb_driver_test`'s new
+`sparse-0+2-of-4` cell 3 of 8 runs (60 ms RTT, incremental). The injector
+invented a row for empty seat 3; the correction episode then waited on seat
+3's SEAL_ROWS, which nobody sends: the core's
+`rnet_rb_all_peer_seal_rows_complete` waited on every seat below `slot_count`,
+and the driver sealed seat 3 from its history ring, which still held the
+invented row. Watchdog, "correction LOST", POST fork. Now
+`RNetRbConfig.occupied_mask` (0 = every seat, as before) limits the wait to
+occupied seats (`rnet_rb_expected_peer_mask`; the driver passes its own
+`occupied_mask`), and the driver seals an empty seat with the zero sample
+every peer's session synthesizes for it. Measured apart: the wait set alone
+turned the timeout into "sealed row missing mid-replay slot=3" (3 of 6 runs
+failed); the seal source alone passed 6 of 6. Both halves are kept -- the
+core must never invent the row, and does not (`rollback_episode_test`,
+`test_sparse_room`). After both: 8 of 8 clean, 0 ms and 60 ms cells.
+
 **Not covered.** One injecting seat: organic episodes from several seats at
 once (true dual and triple initiation under a real game) have run only in
 `rb_driver_test`. The relay is seat 0's own process, so a relay that is slow
