@@ -2306,8 +2306,17 @@ static void handle_server_json(const char *json)
         fill_peer_bind_from_join();
         parse_slots_array(json);
         /* Kick/move/start clear ready; re-arm so host Play keeps working on
-         * servers that still require all_ready. */
-        if (g_lc.in_lobby && !g_lc.local_ready) {
+         * servers that still require all_ready.
+         *
+         * Never from the gallery: the server keeps `ready` in the PLAYER
+         * table only (a spectator cannot hold up a start), so a spectator's
+         * set_ready changes nothing it will ever read back as ready -- but
+         * the server still answers it with a lobby_update, which re-armed it
+         * again: an unbounded set_ready / lobby_update storm, tens of
+         * thousands of frames per second across the room, behind which the
+         * rematch's op:launch was never read (Genesis, 4 players + 1
+         * spectator, round 2: no peer launched). */
+        if (g_lc.in_lobby && !g_lc.local_ready && !g_lc.join.local_is_spectator) {
             send_set_ready(1);
             flush_pending();
         }

@@ -873,6 +873,44 @@ static void case_the_gallery_does_not_negotiate(void)
  * So the assertion is not "the flag is set" -- it was, briefly. It is that the
  * flag is still set after the traffic that used to clear it, and that the two
  * meanings of the name are read from two different places. */
+/* A spectator does not re-arm ready on every lobby_update: the server never
+ * stores its ready (the gallery cannot hold up a start) but answers each
+ * set_ready with another update, so re-arming was an endless storm. A player
+ * still re-arms. */
+static void case_gallery_does_not_rearm_ready(void)
+{
+    const char *json =
+        "{\"op\":\"lobby_update\",\"player_count\":2,\"max_slots\":2,"
+        "\"allow_spectators\":true,\"max_spectators\":4,"
+        "\"spectator_count\":1,\"spectator_slot_base\":64,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\",\"ready\":false},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\",\"ready\":false}],"
+        "\"spectators\":[{\"slot\":64,\"player_id\":\"s0\",\"display_name\":\"Watcher\",\"ready\":false}]}";
+    printf("  gallery does not re-arm ready\n");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "s0");
+    handle_server_json(json);
+    ck(g_lc.join.local_is_spectator == 1, "we are in the gallery");
+    ck(g_lc.pending_n == 0, "a spectator queues no set_ready on a lobby_update");
+    handle_server_json(json);
+    ck(g_lc.pending_n == 0, "nor on the next one (was: one per update, forever)");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    handle_server_json(json);
+    ck(g_lc.pending_n == 1 && strstr(g_lc.pending_tx[0], "set_ready") != NULL,
+       "a player still re-arms ready");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 static void case_launch_transport_survives_a_lobby_update(void)
 {
     const char *launch =
@@ -1337,6 +1375,7 @@ int main(void)
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
+    case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
     case_chat_ignores_empty_and_clears();
