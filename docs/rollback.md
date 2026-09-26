@@ -516,6 +516,29 @@ traffic crosses the relay's poll, which adds up to one of its fields of
 latency. A seat leaving mid-match is untested with more than two. Loopback,
 not a network; nobody has played it.
 
+### Observers (spectators), fixed 2026-09-25
+
+An observer is a session whose `local_slot == slot_count` (rollback.h): it
+simulates every seat from the wire and owns none. Until this date the driver
+had no observer path beyond the seal export, and an observer behaved like a
+player with a seat nobody reads: it PREDICTED remote rows, opened episodes
+that no player answers (a spectator relay drops everything it sends), refused
+every player's BEGIN ("no local row at tick" -- for its sentinel seat), and fell
+behind. Measured in nesrecomp's `rb_lobby.sh` (4 seats + 1 spectator on
+recomp-net-server's relay): 403 invents, 6 episodes opened, every BEGIN NACKed,
+600 ticks behind, and a rematch that never connected.
+
+Now: an observer pins lockstep (`lockstep_env` reads `observer`), so it only
+admits a tick on every seat's wire row and never has anything to roll back;
+it ignores peer BEGINs (logged "RB observer ignores episode", counted), and
+`rb_local_rows_cover` / `rb_local_slot` treat the sentinel -- including 8 in a
+full 8-seat room, which used to clamp to seat 0 -- as owning no rows. It still
+checks every player's FRAME_COMMIT chain and the boot digest, so a spectator
+that forks says so. `rb_driver_test 4seat-observer-rtt60`: the observer opens,
+follows and refuses nothing, keeps up (sim 436 vs seat 0's 431), drains and
+agrees with seat 0's timeline; on 03ee1b1 the same cell fails (2 opened, 17
+refused, 21 chain stalls).
+
 ## Portable input contract
 
 Pure decision core (no engine includes) for "published row vs late authoritative
