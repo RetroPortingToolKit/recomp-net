@@ -11,6 +11,7 @@
 #else
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -99,44 +100,68 @@ static void free_host_environment(char **env) {
 }
 #endif
 
-static int launch(const char *program, const char *url, char *const env[]) {
-    int report[2], status, child_error = 0;
+/* An opener can exec successfully and then fail (for example, xdg-open exits
+ * 3 because no browser is configured). Give it a short window to report that
+ * failure so the next opener can be tried. An opener that stays alive beyond
+ * the window may be the browser itself; treating it as started avoids opening
+ * the same URL twice. The detached supervisor reaps it when it eventually
+ * exits, so the game does not accumulate zombies. */
+static int launch(const char *program, const char *url, char *const env[],
+                  int gio_open) {
+    int report[2], status, result = -1;
     ssize_t got;
     pid_t child, waited;
-    char *const argv[] = { (char *)program, (char *)url, NULL };
+    struct pollfd ready;
+    char *const simple_argv[] = { (char *)program, (char *)url, NULL };
+    char *const gio_argv[] = { (char *)program, "open", (char *)url, NULL };
+    char *const *argv = gio_open ? gio_argv : simple_argv;
     if (pipe(report) != 0) return 0;
     if (fcntl(report[1], F_SETFD, FD_CLOEXEC) != 0) {
         close(report[0]); close(report[1]); return 0;
     }
     child = fork();
     if (child == 0) {
-        pid_t opener;
+        pid_t supervisor;
         close(report[0]);
-        /* The intermediate child exits immediately; the opener is reparented
-         * and cannot leave a zombie in the game process. */
-        opener = fork();
-        if (opener == 0) {
-            execve(program, argv, env);
-            child_error = errno;
-            (void)write(report[1], &child_error, sizeof(child_error));
-            _exit(127);
+        /* The supervisor is reparented; it waits for the opener after the
+         * game has moved on, even if that opener stays alive for hours. */
+        supervisor = fork();
+        if (supervisor == 0) {
+            pid_t opener = fork();
+            if (opener == 0) {
+                execve(program, argv, env);
+                _exit(127);
+            }
+            if (opener > 0) {
+                do { waited = waitpid(opener, &status, 0); }
+                while (waited < 0 && errno == EINTR);
+                if (waited == opener && WIFEXITED(status))
+                    result = WEXITSTATUS(status);
+            }
+            (void)write(report[1], &result, sizeof(result));
+            _exit(0);
         }
-        if (opener < 0) {
-            child_error = errno;
-            (void)write(report[1], &child_error, sizeof(child_error));
-        }
-        _exit(opener < 0 ? 127 : 0);
+        if (supervisor < 0)
+            (void)write(report[1], &result, sizeof(result));
+        _exit(supervisor < 0 ? 127 : 0);
     }
     close(report[1]);
     if (child < 0) { close(report[0]); return 0; }
-    do { got = read(report[0], &child_error, sizeof(child_error)); }
-    while (got < 0 && errno == EINTR);
-    close(report[0]);
     status = 0;
     do { waited = waitpid(child, &status, 0); }
     while (waited < 0 && errno == EINTR);
-    return got == 0 && waited == child &&
-           WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        close(report[0]);
+        return 0;
+    }
+    ready.fd = report[0];
+    ready.events = POLLIN | POLLHUP;
+    do { status = poll(&ready, 1, 2000); }
+    while (status < 0 && errno == EINTR);
+    if (status == 0) { close(report[0]); return 1; }
+    got = status > 0 ? read(report[0], &result, sizeof(result)) : -1;
+    close(report[0]);
+    return got == (ssize_t)sizeof(result) && result == 0;
 }
 #endif
 
@@ -156,24 +181,35 @@ int rnet_open_url(const char *url) {
 #if defined(__APPLE__)
         if (!find_opener("open", opener, sizeof(opener))) goto fail;
         env = environ;
+        if (launch(opener, url, env, 0)) return 1;
 #else
+        static const char *const linux_openers[] = {
+            "xdg-open", "gio", "sensible-browser", "wslview"
+        };
+        size_t i;
+        int wsl = getenv("WSL_INTEROP") != NULL;
         /* wslview is the WSL bridge to the Windows default browser. A WSL
          * installation can also contain xdg-open without a usable Linux
          * browser, so prefer the bridge when WSL_INTEROP is available. */
-        if (!(getenv("WSL_INTEROP") &&
-              find_opener("wslview", opener, sizeof(opener))) &&
-            !find_opener("xdg-open", opener, sizeof(opener)) &&
-            !find_opener("wslview", opener, sizeof(opener))) goto fail;
         env = host_environment();
         if (!env) goto fail;
-#endif
-        if (launch(opener, url, env)) {
-#if !defined(__APPLE__)
-            free_host_environment(env);
-#endif
-            return 1;
+        if (wsl && find_opener("wslview", opener, sizeof(opener))) {
+            if (launch(opener, url, env, 0)) {
+                free_host_environment(env);
+                return 1;
+            }
+            fprintf(stderr, "rnet_account: wslview failed; trying another browser opener\n");
         }
-#if !defined(__APPLE__)
+        for (i = 0; i < sizeof(linux_openers) / sizeof(linux_openers[0]); ++i) {
+            const char *name = linux_openers[i];
+            if (wsl && strcmp(name, "wslview") == 0) continue;
+            if (!find_opener(name, opener, sizeof(opener))) continue;
+            if (launch(opener, url, env, strcmp(name, "gio") == 0)) {
+                free_host_environment(env);
+                return 1;
+            }
+            fprintf(stderr, "rnet_account: %s failed; trying another browser opener\n", name);
+        }
         free_host_environment(env);
 #endif
     }

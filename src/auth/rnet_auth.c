@@ -441,13 +441,8 @@ static void job_login(void) {
     }
     g.unavailable = 0;
     if (!rnet_open_url(url)) {
-#if defined(_WIN32) || defined(__APPLE__)
-        set_err("Could not open the default browser. Check your browser "
+        set_err("Could not launch a browser. Check your default browser "
                 "setup, then press Retry.");
-#else
-        set_err("Could not open a browser. Install xdg-open (or wslview "
-                "on WSL), then press Retry.");
-#endif
         g.state = RNET_ACCOUNT_FAILED;
         return;
     }
