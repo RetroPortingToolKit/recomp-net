@@ -78,6 +78,8 @@ static const char *lobby_env(const char *rnet_name, const char *legacy_suffix)
 #include <unistd.h>
 #endif
 
+#include "platform/rnet_platform.h"
+
 static int socket_would_block(void)
 {
 #if defined(_WIN32)
@@ -244,15 +246,12 @@ enum {
     RNET_LOBBY_SIG_MOD_ICE_BASE = 120
 };
 
+/* The platform clock, not clock_gettime: MinGW resolves that through
+ * winpthread, which recomp_net does not link, and MSVC has no CLOCK_MONOTONIC
+ * at all, which fell back to time(NULL) -- whole seconds, for an RTT probe. */
 static uint64_t lobby_mono_ms(void)
 {
-#if defined(CLOCK_MONOTONIC)
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return (uint64_t)ts.tv_sec * 1000ull +
-               (uint64_t)ts.tv_nsec / 1000000ull;
-#endif
-    return (uint64_t)time(NULL) * 1000ull;
+    return (uint64_t)rnet_os_monotonic_ms();
 }
 
 /* Defined later; used by waiting-room RTT signal handling. */

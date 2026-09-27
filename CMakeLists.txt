@@ -334,12 +334,14 @@ if(RNET_BUILD_TESTS)
   # The lobby protocol client, driven through its own translation unit. NOT
   # linked against recomp_net: the test replaces every network entry point the
   # client could reach with an aborting trap (see the file header), so it
-  # compiles only the two pure modules it needs beside the client.
+  # compiles only the two pure modules it needs beside the client, plus the
+  # platform layer for its monotonic clock.
   if(UNIX)
     add_executable(lobby_client_test
       tests/lobby_client_test.c
       src/chat/rnet_chat_filter.c
-      src/chat/rnet_chat_report.c)
+      src/chat/rnet_chat_report.c
+      src/platform/rnet_platform.c)
     target_include_directories(lobby_client_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_client_test PRIVATE
@@ -353,7 +355,8 @@ if(RNET_BUILD_TESTS)
       src/lobby_ws/rnet_ws.c
       src/lobby_ws/rnet_sha1.c
       src/chat/rnet_chat_filter.c
-      src/chat/rnet_chat_report.c)
+      src/chat/rnet_chat_report.c
+      src/platform/rnet_platform.c)
     target_include_directories(lobby_ws_backlog_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_ws_backlog_test PRIVATE
