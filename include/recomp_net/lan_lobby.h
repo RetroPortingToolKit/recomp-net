@@ -43,6 +43,10 @@ typedef struct RNetLanLobby {
      * be taken for match N+1's). Trailing on both wires: older readers
      * ignore it, and read as 0 from an older writer. */
     rnet_u32 session_id;
+    /* Opaque engine-defined session variant. Zero is the legacy default.
+     * Carried at join, when caps change, and at start; never interpreted by
+     * the transport. Engines must include it in their startup identity. */
+    int session_variant;
 } RNetLanLobby;
 
 enum {

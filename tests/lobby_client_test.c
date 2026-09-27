@@ -1350,6 +1350,23 @@ static void case_large_frames_are_not_cut(void)
     g_lc.fd = -1;
 }
 
+static void case_session_variant(void)
+{
+    RNetLobbyMatchCaps caps, back;
+    char json[4096], obj[4096];
+    memset(&caps, 0, sizeof(caps));
+    caps.valid = 1;
+    ck(append_match_caps_json(json, sizeof(json), &caps) > 0, "default caps encode");
+    ck(strstr(json, "session_variant") == NULL, "default preserves legacy caps encoding");
+    caps.session_variant = 37;
+    ck(append_match_caps_json(json, sizeof(json), &caps) > 0, "variant caps encode");
+    ck(json_extract_object(json, "match_caps", obj, sizeof(obj)), "variant caps extract");
+    parse_match_caps_object(obj, &back);
+    ck(back.session_variant == 37, "opaque variant round-trips online");
+    parse_match_caps_object("{\"v\":1}", &back);
+    ck(back.session_variant == 0, "old host resets variant to default");
+}
+
 int main(void)
 {
     case_rows();
@@ -1381,6 +1398,7 @@ int main(void)
     case_chat_ignores_empty_and_clears();
     case_codec_round_trips_engine_keys();
     case_input_prediction_only_when_published();
+    case_session_variant();
     case_free_text_is_escaped_on_every_op();
     case_seat_ceiling_is_configured();
     case_legacy_env_alias();

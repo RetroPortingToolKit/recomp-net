@@ -1497,6 +1497,7 @@ static void parse_match_caps_object(const char *obj, RNetLobbyMatchCaps *out)
     /* Absent (a pre-lift host, or one that never set it) stays 0: "the host
      * published no runway", which is not the same as publishing the minimum. */
     out->input_prediction = json_get_int(obj, "input_prediction", 0);
+    out->session_variant = json_get_int(obj, "session_variant", 0);
     if (out->input_prediction < 0) out->input_prediction = 0;
     if (out->input_prediction > 0 && out->input_prediction < 2)
         out->input_prediction = 2;
@@ -1525,6 +1526,7 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const RNetLobbyMatc
     char set_esc[sizeof(caps->mod_set) * 2 + 4];
     char allow_esc[sizeof(caps->mod_cosmetic_allow) * 2 + 4];
     char pred[40];
+    char variant[40];
     char extra[1024];
     int n;
 
@@ -1550,17 +1552,20 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const RNetLobbyMatc
     /* Only when published, so a caps blob without it stays byte-identical to
      * what a client from before the field sent. */
     pred[0] = '\0';
+    variant[0] = '\0';
+    if (caps->session_variant)
+        snprintf(variant, sizeof(variant), ",\"session_variant\":%d", caps->session_variant);
     if (caps->input_prediction > 0)
         snprintf(pred, sizeof(pred), ",\"input_prediction\":%d",
                  caps->input_prediction);
     json_escape(caps->mod_set, set_esc, sizeof(set_esc));
     json_escape(caps->mod_cosmetic_allow, allow_esc, sizeof(allow_esc));
     n = snprintf(dst, dst_cap,
-                 ",\"match_caps\":{\"v\":1,\"input_delay\":%d%s,"
+                 ",\"match_caps\":{\"v\":1,\"input_delay\":%d%s%s,"
                  "\"force_turn\":%s,\"force_input_relay\":%s,"
                  "\"rollback\":%s%s,%s,\"mod_set\":\"%s\","
                  "\"mod_cosmetic_allow\":\"%s\"}",
-                 caps->input_delay, pred,
+                 caps->input_delay, pred, variant,
                  caps->force_turn ? "true" : "false",
                  caps->force_input_relay ? "true" : "false",
                  caps->rollback ? "true" : "false",
@@ -4712,4 +4717,3 @@ const RNetLobbyTurnCredentials *rnet_lobby_turn_credentials(void)
     }
     return &g_lc.turn;
 }
-

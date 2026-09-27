@@ -77,7 +77,8 @@ int rnet_lan_direct_host_ping(RNetLanDirectHost *host);
 int rnet_lan_direct_host_notify_start(RNetLanDirectHost *host,
                                       const RNetLanLobby *room);
 
-/* Host: push updated match caps (D / rollback / P) while a guest is seated. */
+/* Host: push updated match caps (D / rollback / P / opaque session variant)
+ * while a guest is seated. START repeats these authoritative values. */
 int rnet_lan_direct_host_notify_caps(RNetLanDirectHost *host,
                                      const RNetLanLobby *room);
 

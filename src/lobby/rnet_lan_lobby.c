@@ -100,6 +100,8 @@ static int write_lobby(const char *path, const RNetLanLobby *lobby)
      * which stops after the prediction line, still reads this file). */
     if (ok)
         ok = fprintf(file, "%u\n", (unsigned)lobby->session_id) > 0;
+    if (ok)
+        ok = fprintf(file, "%d\n", lobby->session_variant) > 0;
     if (fclose(file) != 0)
     {
         ok = 0;
@@ -193,6 +195,8 @@ int rnet_lan_lobby_read(const char *path, const char *expected_game,
         /* V4 session id: optional, absent from an older writer. */
         if (read_field(file, session_line, sizeof(session_line)))
             lobby.session_id = (rnet_u32)strtoul(session_line, NULL, 10);
+        if (read_field(file, session_line, sizeof(session_line)))
+            lobby.session_variant = (int)strtol(session_line, NULL, 10);
     }
     fclose(file);
     if (strcmp(magic, "RNET_LAN_LOBBY_1") != 0 &&
