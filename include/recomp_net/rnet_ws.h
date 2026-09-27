@@ -71,11 +71,9 @@ long rnet_ws_tx_flush(RNetWsTx *tx, int fd);
 size_t rnet_ws_tx_pending(const RNetWsTx *tx);
 void   rnet_ws_tx_free(RNetWsTx *tx);
 
-/*
- * Read one text frame into buf (NUL-terminated). Returns payload length, 0 if
- * would-block/incomplete, -1 on close/error. *need_more stays set when partial.
- */
-int rnet_ws_read_text(int fd, char *buf, size_t cap, int *closed);
+/* There is no frame reader here: inbound frames are parsed from a buffer by
+ * the lobby client (drain_ws_pending in rnet_lobby_client.c), which survives
+ * a frame split across non-blocking reads. */
 
 #ifdef __cplusplus
 }
