@@ -205,6 +205,7 @@ int rnet_lobby_local_missing_mods(void);
  * engine's to choose and must not collide with the ones below.
  */
 #define RNET_LOBBY_CAPS_EXT_BYTES 64
+#define RNET_HAS_SESSION_VARIANT 1
 
 typedef struct RNetLobbyMatchCaps {
     int  valid;            /* 1 when a host blob was received / set */
@@ -282,6 +283,10 @@ typedef struct RNetLobbyMatchCaps {
         long long     align_;
         double        align_d_;
     } ext;
+    /* Append-only: opaque engine-defined hardware/rules variant; 0 = legacy
+     * default. Mirrors the LAN lobby field. The engine validates support and
+     * includes it in its startup identity before any simulation executes. */
+    int session_variant;
 } RNetLobbyMatchCaps;
 
 /* Engine hook for match_caps keys this library does not know.
