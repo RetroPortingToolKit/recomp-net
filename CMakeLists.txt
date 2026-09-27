@@ -225,6 +225,10 @@ endif()
 if(RNET_BUILD_TESTS)
   enable_testing()
 
+  # Every function a public header declares links against recomp_net.
+  include(RnetApiLinkTest)
+  rnet_add_api_link_test()
+
   if(UNIX AND NOT APPLE)
     add_executable(open_url_test tests/open_url_test.c src/auth/rnet_open_url.c)
     target_compile_definitions(open_url_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
