@@ -88,7 +88,15 @@ struct RNetSession
     rnet_u8 state_slot;
     rnet_u32 state_xfer_id;
     rnet_u32 state_next_xfer_id;
-    rnet_u32 state_finished_xfer_id;
+    rnet_u8 state_source_slot;
+    /* Incoming transfer history is per sender, independent of our outgoing
+     * receipts. Survives state_clear/hard_resync so a reordered BEGIN cannot
+     * resurrect an old transfer or displace a newer one. */
+    struct {
+        rnet_u32 id, total, crc;
+        rnet_u8 op, slot;
+        int finished;
+    } state_received[RNET_MAX_SLOTS];
     rnet_u32 state_total;
     rnet_u32 state_crc;
     rnet_u32 state_contiguity; /* receiver: bytes from 0 received; sender: unused */
@@ -1247,21 +1255,34 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
-    if (pkt->state_xfer_id == s->state_finished_xfer_id)
-    {
-        /* A delayed/retransmitted BEGIN may survive the app's LOAD apply and
-         * hard resync. Re-ACK it instead of reopening a completed transfer. */
-        rnet_u8 buf[64];
-        int n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic,
-                                            s->cfg.session_id, s->wire_slot,
-                                            pkt->state_xfer_id, pkt->state_total_size);
-        if (n > 0) send_raw(s, buf, n);
+    if (pkt->local_slot >= RNET_MAX_SLOTS || !pkt->state_xfer_id)
         return;
-    }
-    if (s->state_active && s->state_xfer_id == pkt->state_xfer_id && s->state_buf != NULL)
+    if (s->state_received[pkt->local_slot].id)
     {
-        state_send_ack(s);
-        return;
+        /* Low 30 bits are the serial number; MEMCARD sets bit 30 as its
+         * historical direction namespace. Compare serials modulo that space. */
+        rnet_u32 distance = (pkt->state_xfer_id - s->state_received[pkt->local_slot].id) & 0x3fffffffu;
+        if (distance == 0)
+        {
+            if (pkt->state_xfer_id != s->state_received[pkt->local_slot].id ||
+                pkt->state_total_size != s->state_received[pkt->local_slot].total ||
+                pkt->state_payload_crc != s->state_received[pkt->local_slot].crc ||
+                pkt->state_op != s->state_received[pkt->local_slot].op ||
+                pkt->state_slot != s->state_received[pkt->local_slot].slot)
+                return;
+            if (s->state_received[pkt->local_slot].finished)
+            {
+                rnet_u8 buf[64];
+                int n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic,
+                    s->cfg.session_id, s->wire_slot, pkt->state_xfer_id, pkt->state_total_size);
+                if (n > 0) send_raw(s, buf, n);
+            }
+            else if (s->state_active && !s->state_sender && s->state_source_slot == pkt->local_slot &&
+                     s->state_xfer_id == pkt->state_xfer_id && s->state_buf != NULL)
+                state_send_ack(s);
+            return;
+        }
+        if (distance >= 0x20000000u) return; /* stale BEGIN, even during a newer transfer */
     }
     state_probe_clear(s); /* hash-miss path: transfer replaces probe */
     state_clear(s);
@@ -1277,6 +1298,13 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
     s->state_op = pkt->state_op;
     s->state_slot = pkt->state_slot;
     s->state_xfer_id = pkt->state_xfer_id;
+    s->state_source_slot = pkt->local_slot;
+    s->state_received[pkt->local_slot].id = pkt->state_xfer_id;
+    s->state_received[pkt->local_slot].total = pkt->state_total_size;
+    s->state_received[pkt->local_slot].crc = pkt->state_payload_crc;
+    s->state_received[pkt->local_slot].op = pkt->state_op;
+    s->state_received[pkt->local_slot].slot = pkt->state_slot;
+    s->state_received[pkt->local_slot].finished = 0;
     s->state_total = pkt->state_total_size;
     s->state_crc = pkt->state_payload_crc;
     s->state_contiguity = 0;
@@ -1291,7 +1319,7 @@ static void state_on_chunk(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
-    if (pkt->state_xfer_id != s->state_xfer_id)
+    if (pkt->state_xfer_id != s->state_xfer_id || pkt->local_slot != s->state_source_slot)
     {
         return;
     }
@@ -2996,18 +3024,17 @@ void rnet_session_prime_delay_inputs(RNetSession *s, const rnet_u8 *bytes, rnet_
 
 void rnet_session_state_finish(RNetSession *s, int hard_resync)
 {
-    rnet_u32 finished_xfer_id;
     if (s == NULL)
     {
         return;
     }
-    finished_xfer_id = s->state_xfer_id;
+    if (s->state_active && !s->state_sender && s->state_ready && s->state_source_slot < RNET_MAX_SLOTS)
+        s->state_received[s->state_source_slot].finished = 1;
     if (hard_resync)
     {
         rnet_session_hard_resync(s);
     }
     state_clear(s);
-    s->state_finished_xfer_id = finished_xfer_id;
 }
 
 int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,
