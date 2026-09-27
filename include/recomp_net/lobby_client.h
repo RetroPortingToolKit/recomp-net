@@ -218,10 +218,6 @@ typedef struct RNetLobbyMatchCaps {
     int  force_turn;       /* 0/1 — host: ICE relay-only (TURN) for all peers */
     int  force_input_relay; /* 0/1 — lobby-server UDP input relay */
     int  rollback;         /* 0/1 — session mode; lobby default ON */
-    /* Opaque engine-defined hardware/rules variant; 0 = legacy default.
-     * Mirrors the LAN lobby field. The engine validates support and includes
-     * it in its startup identity before any simulation executes. */
-    int session_variant;
     /* The host's required mod plan, one row per PACKAGE.
      *
      * Host-authoritative like everything else here: mods patch guest memory,
@@ -287,6 +283,10 @@ typedef struct RNetLobbyMatchCaps {
         long long     align_;
         double        align_d_;
     } ext;
+    /* Append-only: opaque engine-defined hardware/rules variant; 0 = legacy
+     * default. Mirrors the LAN lobby field. The engine validates support and
+     * includes it in its startup identity before any simulation executes. */
+    int session_variant;
 } RNetLobbyMatchCaps;
 
 /* Engine hook for match_caps keys this library does not know.
