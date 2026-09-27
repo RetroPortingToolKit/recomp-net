@@ -41,6 +41,7 @@ set(RNET_CORE_SOURCES
   src/chat/rnet_chat_filter.c
   src/chat/rnet_chat_report.c
   src/auth/rnet_auth.c
+  src/auth/rnet_open_url.c
   src/auth/rnet_sha256.c
   src/ice/rnet_ice_state.c
   src/ice/rnet_ice_agent.c
@@ -78,7 +79,7 @@ if(UNIX)
 endif()
 
 if(WIN32)
-  target_link_libraries(recomp_net PUBLIC ws2_32 iphlpapi bcrypt)
+  target_link_libraries(recomp_net PUBLIC ws2_32 iphlpapi bcrypt shell32)
 endif()
 
 if(RNET_ENABLE_ICE)
@@ -223,6 +224,12 @@ endif()
 # ---- Tests ----
 if(RNET_BUILD_TESTS)
   enable_testing()
+
+  if(UNIX AND NOT APPLE)
+    add_executable(open_url_test tests/open_url_test.c src/auth/rnet_open_url.c)
+    target_compile_definitions(open_url_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    add_test(NAME open_url_test COMMAND open_url_test)
+  endif()
 
   add_executable(chat_filter_test tests/chat_filter_test.c)
   target_link_libraries(chat_filter_test PRIVATE recomp_net)
