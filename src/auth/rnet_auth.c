@@ -6,6 +6,7 @@
  */
 
 #include "recomp_net/auth.h"
+#include "rnet_open_url.h"
 #include "rnet_sha256.h"
 
 #include <ctype.h>
@@ -29,7 +30,6 @@ typedef HANDLE auth_thread_t;
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
 typedef pthread_t auth_thread_t;
 #endif
@@ -420,55 +420,6 @@ static void auth_sleep_ms(int ms) {
 #endif
 }
 
-/* ---- opening the browser ------------------------------------------------ */
-
-/* The one thing the launcher cannot do for us: hand a URL to the desktop.
- * There is no SDL_OpenURL in this runtime, so this is per platform.
- *
- * NO SHELL. An earlier version built a `xdg-open '<url>'` command string and
- * screened the URL for shell metacharacters -- which refused every real
- * authorize URL, because an OAuth query string is full of `&`. Passing the URL
- * as a single argv element removes the quoting problem instead of policing it,
- * and there is nothing left for a metacharacter to escape into. */
-static void account_open_url(const char *url) {
-    if (!url || !url[0]) return;
-    /* Still scheme-checked: xdg-open will happily act on a file:// URL or a
-     * local path, and this only ever legitimately receives http(s). */
-    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
-        fprintf(stderr, "%s: refusing to open a non-http(s) URL\n", "rnet_account");
-        return;
-    }
-#if defined(_WIN32)
-    /* Takes the URL directly; no command line is built. */
-    ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL);
-#else
-    {
-#if defined(__APPLE__)
-        const char *opener = "open";
-#else
-        const char *opener = "xdg-open";
-#endif
-        pid_t pid = fork();
-        if (pid == 0) {
-            /* Double-fork: the opener is reparented to init, so it outlives
-             * this process and leaves no zombie for a game loop to reap. */
-            if (fork() == 0) {
-                execlp(opener, opener, url, (char *)NULL);
-                _exit(127);
-            }
-            _exit(0);
-        }
-        if (pid > 0) {
-            int st = 0;
-            (void)waitpid(pid, &st, 0);
-        } else {
-            fprintf(stderr, "%s: could not open a browser; visit:\n  %s\n",
-                    "rnet_account", url);
-        }
-    }
-#endif
-}
-
 /* ---- worker ------------------------------------------------------------- */
 
 static void job_login(void) {
@@ -489,7 +440,17 @@ static void job_login(void) {
         return;
     }
     g.unavailable = 0;
-    account_open_url(url);
+    if (!rnet_open_url(url)) {
+#if defined(_WIN32) || defined(__APPLE__)
+        set_err("Could not open the default browser. Check your browser "
+                "setup, then press Retry.");
+#else
+        set_err("Could not open a browser. Install xdg-open (or wslview "
+                "on WSL), then press Retry.");
+#endif
+        g.state = RNET_ACCOUNT_FAILED;
+        return;
+    }
 
     /* Poll until the server has an answer. The pairing code expires server
      * side after ten minutes; stop a little before that rather than spinning
