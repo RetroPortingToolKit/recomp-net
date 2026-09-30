@@ -61,6 +61,7 @@
  * Single-threaded, like the session: every call on the host's sim thread.
  */
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "recomp_net/input.h"
@@ -324,6 +325,8 @@ uint32_t rnet_rb_driver_rtt_estimate_ms(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_confirmed_through(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d);
 int rnet_rb_driver_episode_active(const RNetRbDriver *d);
+/* Bounded snapshot for a stalled match report. */
+void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap);
 /* 1 between resim_begin and resim_end. */
 int rnet_rb_driver_in_resim(const RNetRbDriver *d);
 const char *rnet_rb_driver_stall_tag(const RNetRbDriver *d);

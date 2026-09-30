@@ -4166,6 +4166,25 @@ int rnet_rb_driver_episode_active(const RNetRbDriver *d)
     return d && d->stage != kRbIdle;
 }
 
+void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap)
+{
+    if (!out || cap == 0u)
+        return;
+    if (!d) {
+        snprintf(out, cap, "no driver");
+        return;
+    }
+    snprintf(out, cap,
+             "stage=%s epoch=%u span=%u..%u sim=%u age_ms=%u seal=%d "
+             "answered=%x posts=%x commits=%x expect=%x deferred=%d",
+             rb_stage_name(d->stage), (unsigned)d->corr.epoch_id,
+             (unsigned)d->corr.load_tick, (unsigned)d->corr.target_tick,
+             (unsigned)d->sim, (unsigned)(rb_now((RNetRbDriver *)d) - d->stage_entered_ms),
+             d->rb ? rnet_rb_all_peer_seal_rows_complete(d->rb) : 0,
+             (unsigned)d->answered_mask, (unsigned)d->peer_post_mask,
+             (unsigned)d->peer_commit_mask, (unsigned)rb_expect_mask(d), d->defer_valid);
+}
+
 int rnet_rb_driver_in_resim(const RNetRbDriver *d)
 {
     return d && d->in_resim;
