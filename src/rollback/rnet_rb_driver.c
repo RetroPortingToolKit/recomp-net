@@ -3820,6 +3820,8 @@ static RNetRbAdmit rb_replay_step(RNetRbDriver *d)
     return RNET_RB_ADMIT_REPLAY;
 }
 
+static void rb_check_chain_fork(RNetRbDriver *d);
+
 RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
 {
     RNetSession *s;
@@ -3877,6 +3879,9 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
      * flag): the rest are still there, and still need our marker. */
     rb_quiesce_pump(d, (rb_popcount(rb_expect_mask(d)) == 1 &&
                         rnet_session_peer_disconnected(s, 0)) ? 0 : 1);
+    /* The hash-chain watermark can stop all frame admission. Its recovery
+     * timer must advance from the poll path, including while no frame runs. */
+    rb_check_chain_fork(d);
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
@@ -4093,9 +4098,8 @@ static void rb_check_chain_fork(RNetRbDriver *d)
         }
         if ((uint32_t)(now - d->chain_pending_ms[i]) < settle)
             continue;
-        if (d->chain_fork_tick[i] == tick)
+        if (rb_popcount(expect) == 1 && d->chain_fork_tick[i] == tick)
             continue; /* already reported; the watermark is stuck here */
-        d->chain_fork_tick[i] = tick;
 
         if (rb_popcount(expect) > 1) {
             /* Every seat may hold every input row and still disagree about
@@ -4105,18 +4109,23 @@ static void rb_check_chain_fork(RNetRbDriver *d)
              * the last agreed snapshot is still in reach: open a normal
              * sealed-row episode for it. Owed bookkeeping retries if this
              * first exchange aborts or cooldown delays it. */
-            rb_log(d, "RB chain repair tick=%u local=%08x peer=%08x seat=%d "
-                      "after %ums\n", (unsigned)tick, (unsigned)local,
-                   (unsigned)peer, i, (unsigned)(now - d->chain_pending_ms[i]));
-            rb_owed_mark(d, tick, i);
-            if (rb_begin_episode(d, tick, i, 1, 0u, 0u, 0u, 0u))
+            if (rb_begin_episode(d, tick, i, 1, 0u, 0u, 0u, 0u)) {
+                rb_log(d, "RB chain repair tick=%u local=%08x peer=%08x seat=%d "
+                          "after %ums\n", (unsigned)tick, (unsigned)local,
+                       (unsigned)peer, i, (unsigned)(now - d->chain_pending_ms[i]));
+                rb_owed_mark(d, tick, i);
+                d->chain_pending_tick[i] = 0u;
                 return;
-        } else
+            }
+            d->chain_pending_ms[i] = now; /* cooldown or drain: retry later */
+        } else {
+            d->chain_fork_tick[i] = tick;
             rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x "
                       "— unresolved for %ums (settle %ums). The confirmed watermark "
                       "cannot advance past this tick. ADVISORY: not acted on.\n",
                    (unsigned)tick, (unsigned)local, (unsigned)peer,
                    (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
+        }
     }
 }
 
