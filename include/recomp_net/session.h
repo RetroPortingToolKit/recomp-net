@@ -428,6 +428,10 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * Additive like IDENT: a peer that predates it ignores an unknown op, and the
  * sender's drain then ends on its bound rather than hanging. */
 #define RNET_RB_SYNC_OP_QUIESCE 5u
+/* Request the named seat's FRAME_COMMIT for mismatch_tick (RB_SYNC a).
+ * Needed when one UDP commit is lost and the hash-chain frontier has only
+ * its local half. No episode or input row is changed by this request. */
+#define RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST 6u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */
