@@ -99,6 +99,11 @@ struct RNetSession
     rnet_u64 delay_pending_last_tx_ms;
     rnet_u32 sim_tick;
     rnet_u32 highest_remote_ack;
+    /* Multi-seat INPUT carries one contiguous acknowledgment per source.
+     * UINT32_MAX means the receiver has not yet seen tick zero. */
+    rnet_u32 remote_contiguous_ack[RNET_MAX_SLOTS];
+    rnet_u32 peer_ack_tick[RNET_MAX_SLOTS];
+    rnet_u8 peer_ack_seen[RNET_MAX_SLOTS];
     rnet_u64 last_hello_ms;
     rnet_u64 last_ready_ms;
     rnet_u64 last_input_ms;
@@ -468,6 +473,17 @@ static void store_remote_frame(RNetSession *s, rnet_u8 slot, const RNetWireFrame
     }
     sample.valid = 1;
     rnet_ring_store(&s->remote_rings[slot], &sample);
+    if (s->cfg.slot_count > 2)
+    {
+        rnet_u32 next = s->remote_contiguous_ack[slot] + 1u;
+        while (rnet_ring_get(&s->remote_rings[slot], next, &existing))
+        {
+            s->remote_contiguous_ack[slot] = next;
+            if (next == 0xffffffffu)
+                break;
+            ++next;
+        }
+    }
     {
         rnet_u32 idx = frame->tick % RNET_HISTORY_LENGTH;
         rnet_u64 now = session_now(s);
@@ -612,7 +628,21 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             store_remote_frame(s, pkt->local_slot, &pkt->frames[i]);
         }
-        if (pkt->ack_tick > s->highest_remote_ack)
+        if (s->cfg.slot_count > 2 && pkt->local_slot < s->cfg.slot_count &&
+            pkt->ack_count == s->cfg.slot_count &&
+            rnet_config_slot_occupied(&s->cfg, pkt->local_slot))
+        {
+            rnet_u32 ack = pkt->acks[s->cfg.local_slot];
+            if (!s->peer_ack_seen[pkt->local_slot] ||
+                (ack != 0xffffffffu &&
+                 (s->peer_ack_tick[pkt->local_slot] == 0xffffffffu ||
+                  ack > s->peer_ack_tick[pkt->local_slot])))
+            {
+                s->peer_ack_tick[pkt->local_slot] = ack;
+                s->peer_ack_seen[pkt->local_slot] = 1;
+            }
+        }
+        else if (s->cfg.slot_count == 2 && pkt->ack_tick > s->highest_remote_ack)
         {
             s->highest_remote_ack = pkt->ack_tick;
         }
@@ -1908,6 +1938,8 @@ static void send_input_bundle(RNetSession *s)
     rnet_u32 lo;
     rnet_u32 t;
     rnet_u32 ack;
+    rnet_u32 ack_vector[RNET_MAX_SLOTS];
+    rnet_u8 slot;
     int sent_any = 0;
     rnet_u64 now = session_now(s);
 
@@ -1954,7 +1986,26 @@ static void send_input_bundle(RNetSession *s)
     /* Peer ACK of our tips: resend from ack+1 when they fell behind the
      * tip-redundancy window (WAN/TURN loss). Cap so one pump cannot emit
      * the whole 128-slot history. */
-    if (s->highest_remote_ack < tip)
+    if (s->cfg.slot_count > 2)
+    {
+        rnet_u32 ack_lo = tip + 1u;
+        rnet_u32 max_back = (rnet_u32)RNET_HISTORY_LENGTH / 2u;
+        if (max_back < 32u) max_back = 32u;
+        if (max_back > 64u) max_back = 64u;
+        for (slot = 0; slot < s->cfg.slot_count; ++slot)
+        {
+            rnet_u32 peer_lo;
+            if (slot == s->cfg.local_slot || !rnet_config_slot_occupied(&s->cfg, slot))
+                continue;
+            peer_lo = (!s->peer_ack_seen[slot] || s->peer_ack_tick[slot] == 0xffffffffu)
+                          ? 0u : s->peer_ack_tick[slot] + 1u;
+            if (peer_lo < ack_lo) ack_lo = peer_lo;
+        }
+        if (tip + 1u > max_back && ack_lo + max_back <= tip)
+            ack_lo = tip + 1u - max_back;
+        if (ack_lo < lo) lo = ack_lo;
+    }
+    else if (s->highest_remote_ack < tip)
     {
         rnet_u32 ack_lo = s->highest_remote_ack + 1U;
         rnet_u32 max_back = (rnet_u32)RNET_HISTORY_LENGTH / 2U;
@@ -1976,6 +2027,8 @@ static void send_input_bundle(RNetSession *s)
         &s->remote_rings[s->is_observer
                              ? 0
                              : ((s->cfg.local_slot + 1) % s->cfg.slot_count)]);
+    for (slot = 0; slot < s->cfg.slot_count; ++slot)
+        ack_vector[slot] = s->remote_contiguous_ack[slot];
     t = lo;
     while (t <= tip)
     {
@@ -2001,9 +2054,14 @@ static void send_input_bundle(RNetSession *s)
         {
             continue;
         }
-        len = rnet_proto_encode_input(buf, sizeof(buf), s->cfg.protocol_magic,
-                                      s->cfg.session_id, s->wire_slot, s->input_epoch, ack,
-                                      frames, count);
+        if (s->cfg.slot_count > 2)
+            len = rnet_proto_encode_input_acks(buf, sizeof(buf), s->cfg.protocol_magic,
+                                               s->cfg.session_id, s->wire_slot, s->input_epoch,
+                                               ack, frames, count, ack_vector, s->cfg.slot_count);
+        else
+            len = rnet_proto_encode_input(buf, sizeof(buf), s->cfg.protocol_magic,
+                                          s->cfg.session_id, s->wire_slot, s->input_epoch, ack,
+                                          frames, count);
         if (len < 0)
         {
             break;
@@ -2223,6 +2281,8 @@ RNetSession *rnet_session_create(const RNetConfig *cfg, const RNetHostVTable *ho
         return NULL;
     }
     s->cfg = *cfg;
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        s->remote_contiguous_ack[i] = 0xffffffffu;
     s->host = *host;
     s->delay = cfg->input_delay;
     s->phase = RNET_PHASE_IDLE;
@@ -3646,6 +3706,9 @@ void rnet_session_hard_resync(RNetSession *s)
     s->desync_local_hash = 0;
     s->desync_remote_hash = 0;
     s->highest_remote_ack = 0;
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        s->remote_contiguous_ack[i] = 0xffffffffu;
+    memset(s->peer_ack_seen, 0, sizeof(s->peer_ack_seen));
     s->last_input_tip_valid = 0;
     /* Peers may have applied a load on different sim ticks; restart together. */
     s->sim_tick = 0;
@@ -3983,6 +4046,9 @@ void rnet_session_clear_remote_inputs(RNetSession *s)
         rnet_ring_clear(&s->remote_rings[i]);
     }
     s->highest_remote_ack = 0;
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        s->remote_contiguous_ack[i] = 0xffffffffu;
+    memset(s->peer_ack_seen, 0, sizeof(s->peer_ack_seen));
 }
 
 int rnet_session_send_rb_sync(RNetSession *s, rnet_u32 epoch_id, rnet_u32 mismatch_tick,

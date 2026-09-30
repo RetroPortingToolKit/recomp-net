@@ -109,6 +109,12 @@ int rnet_proto_encode_start(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 s
 int rnet_proto_encode_input(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                             rnet_u16 input_epoch, rnet_u32 ack_tick, const RNetWireFrame *frames,
                             int frame_count);
+/* Multi-seat INPUT adds an acknowledgment for each source seat after the
+ * frames. Two-seat callers keep using encode_input and its original bytes. */
+int rnet_proto_encode_input_acks(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                 rnet_u8 local_slot, rnet_u16 input_epoch, rnet_u32 ack_tick,
+                                 const RNetWireFrame *frames, int frame_count,
+                                 const rnet_u32 *acks, rnet_u8 ack_count);
 int rnet_proto_encode_delay_sync(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 new_delay,
                                  rnet_u32 effective_tick);
 /* Agree on resolved pad hash for sim_tick before publish/advance. */
@@ -190,6 +196,8 @@ typedef struct RNetDecodedPacket
     rnet_u8 delay;
     rnet_u32 start_tick;
     rnet_u32 ack_tick;
+    rnet_u8 ack_count;
+    rnet_u32 acks[RNET_MAX_SLOTS];
     rnet_u8 new_delay;
     rnet_u32 effective_tick;
     rnet_u32 confirm_sim_tick;

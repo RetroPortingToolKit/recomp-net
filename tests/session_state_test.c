@@ -342,6 +342,11 @@ typedef struct Room
     int drop_all_acks_to[kMaxSeats]; /* drop every STATE_ACK to seat */
     rnet_u32 drop_acks_from_at[kMaxSeats]; /* drop STATE_ACKs from seat with ack_bytes >= this (0 = off) */
     int drop_replies;               /* also drop PROBE_REPLY at state_loss_pct */
+    int drop_input_src;
+    int drop_input_dst;
+    rnet_u32 drop_input_tick;
+    rnet_u64 drop_input_until_ms;
+    unsigned dropped_input;
     int dropped_reply_from[kMaxSeats];
     rnet_u32 first_begin_id[kMaxSeats]; /* first STATE_BEGIN xfer id per sender */
     unsigned dropped;
@@ -449,6 +454,20 @@ static void room_forward(Room *r)
                 int is_state = type >= RNET_PKT_STATE_BEGIN && type <= RNET_PKT_STATE_PROBE_REPLY;
                 if (dst == src || r->vanished[dst])
                     continue;
+                if (type == RNET_PKT_INPUT && src == r->drop_input_src &&
+                    dst == r->drop_input_dst && g_now_ms < r->drop_input_until_ms)
+                {
+                    int row;
+                    int has_missing_row = 0;
+                    for (row = 0; row < pkt.frame_count; ++row)
+                        if (pkt.frames[row].tick == r->drop_input_tick)
+                            has_missing_row = 1;
+                    if (has_missing_row)
+                    {
+                        r->dropped_input++;
+                        continue;
+                    }
+                }
                 if (type == RNET_PKT_STATE_BEGIN && r->drop_begin_to[dst] > 0)
                 {
                     r->drop_begin_to[dst]--;
@@ -642,6 +661,32 @@ static int room_drive(Room *r, int frames)
     return 1;
 }
 
+/* Hold one source row away from one receiver while other seats advance.
+ * Their later acknowledgments must not suppress retransmission to the seat
+ * with the hole. Both the relay schedule and loss window are deterministic. */
+static void multi_seat_input_hole_test(int seats, rnet_u32 seed)
+{
+    Room r;
+    int before = g_failures;
+    if (!room_open(&r, seats, seed))
+        goto out;
+    if (!room_drive(&r, 12))
+        goto out;
+    r.drop_input_src = 0;
+    r.drop_input_dst = 1;
+    r.drop_input_tick = rnet_session_sim_tick(r.s[0]) + 5u;
+    r.drop_input_until_ms = g_now_ms + 180u;
+    if (!room_drive(&r, 35))
+        goto out;
+    if (r.dropped_input == 0)
+        fail("input hole: target row was never dropped");
+    printf("session_state_test: %d-seat input hole (seed %u, %u drops) %s\n",
+           seats, (unsigned)seed, r.dropped_input,
+           g_failures != before ? "FAILED" : "ok");
+out:
+    room_close(&r);
+}
+
 static void fill_pattern(rnet_u8 *p, size_t n, unsigned salt)
 {
     size_t i;
@@ -772,7 +817,6 @@ out:
 }
 
 #ifndef RNET_STATE_TEST_LEGACY_ONLY
-
 static int popcount32(rnet_u32 v)
 {
     int c = 0;
@@ -1722,6 +1766,8 @@ int main(void)
     multi_seat_broadcast_test(4, 20, RNET_STATE_OP_BOOT, 13u);
     multi_seat_broadcast_test(4, 35, RNET_STATE_OP_SRAM, 14u);
 #ifndef RNET_STATE_TEST_LEGACY_ONLY
+    multi_seat_input_hole_test(3, 0x316a5u);
+    multi_seat_input_hole_test(4, 0x4b127u);
     multi_seat_memcard_test(2, 20, 21u);
     multi_seat_memcard_test(3, 20, 22u);
     multi_seat_memcard_test(4, 25, 23u);
