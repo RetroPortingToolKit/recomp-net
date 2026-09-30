@@ -288,7 +288,12 @@ if(RNET_BUILD_TESTS)
   add_test(NAME stun_test COMMAND stun_test)
 
   add_executable(session_state_test tests/session_state_test.c)
+  # The multi-seat cases drive a lossy relay built on the internal transport.
+  target_include_directories(session_state_test PRIVATE src)
   target_link_libraries(session_state_test PRIVATE recomp_net)
+  if(UNIX)
+    target_compile_definitions(session_state_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
   add_test(NAME session_state_test COMMAND session_state_test)
 
   add_executable(state_replay_test tests/state_replay_test.c)

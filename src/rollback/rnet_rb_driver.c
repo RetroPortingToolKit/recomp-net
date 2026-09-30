@@ -156,6 +156,7 @@ struct RNetRbDriver {
      * that peer forked. A peer answers each BEGIN once (begin_seen); a
      * repeat of one it refused repeats the NACK, since that is what was lost. */
     uint32_t begin_resend_ms;
+    uint32_t frame_commit_request_ms;
     uint32_t answered_mask;
     uint32_t n_begin_resent;
 #define RB_BEGIN_SEEN 32
@@ -574,6 +575,38 @@ static void rb_hc_heal(RNetRbDriver *d)
     for (i = 0; i < RB_MAX_SLOTS; ++i)
         if (m & (1u << i))
             (void)rnet_hc_heal_stale_gap(&d->hc[i]);
+}
+
+static uint32_t rb_now(RNetRbDriver *d);
+
+static void rb_request_missing_frame_commits(RNetRbDriver *d)
+{
+    RNetSession *s = rb_session(d);
+    uint32_t now, mask;
+    int i, sent = 0;
+    if (!s || (d->stage != kRbIdle && d->stage != kRbTipHold))
+        return;
+    mask = rb_expect_mask(d);
+    if (rb_popcount(mask) <= 1)
+        return; /* retain two-seat wire traffic */
+    now = rb_now(d);
+    if ((uint32_t)(now - d->frame_commit_request_ms) < 50u)
+        return;
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        uint32_t next;
+        if (!(mask & (1u << i)))
+            continue;
+        next = d->hc[i].resolved_valid ? d->hc[i].resolved_through + 1u : 0u;
+        if (next >= d->sim ||
+            !rnet_hc_local_digest(&d->hc[i], next, NULL) ||
+            rnet_hc_peer_digest(&d->hc[i], next, NULL))
+            continue;
+        rnet_session_send_rb_sync(s, 0u, next, 0u, 0u, (rnet_u8)i,
+                                  RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST, 0u);
+        sent = 1;
+    }
+    if (sent)
+        d->frame_commit_request_ms = now;
 }
 
 /* ── row helpers ─────────────────────────────────────────────────────── */
@@ -2925,6 +2958,17 @@ static void rb_drain_wire(RNetRbDriver *d)
     while (rnet_session_take_rb_sync(s, &epoch, &a, &b, &c, &slot, &op, &flags)) {
         int from = rnet_session_rb_last_take_from(s);
         switch (op) {
+        case RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST:
+            if ((int)slot == rb_local_slot(d) && rb_from_bit(d, from)) {
+                uint32_t mask = rb_expect_mask(d);
+                uint32_t digest;
+                if (mask && a < d->sim) {
+                    int first = rb_bit_slot(mask & (~mask + 1u));
+                    if (rnet_hc_local_digest(&d->hc[first], a, &digest))
+                        rnet_session_send_rb_frame_commit(s, a, digest);
+                }
+            }
+            break;
         case RNET_RB_SYNC_OP_BEGIN:
             if (rb_is_observer(d)) {
                 /* See rb_is_observer: never predicted, so nothing to correct;
@@ -3776,6 +3820,8 @@ static RNetRbAdmit rb_replay_step(RNetRbDriver *d)
     return RNET_RB_ADMIT_REPLAY;
 }
 
+static void rb_check_chain_fork(RNetRbDriver *d);
+
 RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
 {
     RNetSession *s;
@@ -3813,6 +3859,7 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     local = rb_local_slot(d);
 
     rb_drain_wire(d);
+    rb_request_missing_frame_commits(d);
     rb_defer_pump(d);
     /* Before anything else: the gate below stops the frame from happening
      * while this is outstanding, so pumping it from finish_frame deadlocked
@@ -3832,6 +3879,9 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
      * flag): the rest are still there, and still need our marker. */
     rb_quiesce_pump(d, (rb_popcount(rb_expect_mask(d)) == 1 &&
                         rnet_session_peer_disconnected(s, 0)) ? 0 : 1);
+    /* The hash-chain watermark can stop all frame admission. Its recovery
+     * timer must advance from the poll path, including while no frame runs. */
+    rb_check_chain_fork(d);
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
@@ -3995,10 +4045,10 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
  * in-flight FRAME_COMMITs describing the peer's pre-correction timeline. A
  * transient resolves within a round trip; a genuine fork never can.
  *
- * ADVISORY ONLY. An episode that aborts leaves our local digests describing a
- * timeline the peer did not run, and wiring this to the fork cap and lockstep
- * turned clean runs red. Two of those traces are now removed at the source,
- * so what is left is closer to a verdict (it still only reports):
+ * Two-seat sessions keep this advisory: an episode that aborts can leave
+ * local digests describing a timeline the peer did not run. Multi-seat
+ * sessions retry a persistent fork through a sealed-row episode. Two traces
+ * that previously produced false reports were removed at the source:
  *
  *   - an episode that aborted AFTER its replay (a peer NACK that arrived
  *     while we verified) left the live, mispredicted digests of the replayed
@@ -4048,22 +4098,34 @@ static void rb_check_chain_fork(RNetRbDriver *d)
         }
         if ((uint32_t)(now - d->chain_pending_ms[i]) < settle)
             continue;
-        if (d->chain_fork_tick[i] == tick)
+        if (rb_popcount(expect) == 1 && d->chain_fork_tick[i] == tick)
             continue; /* already reported; the watermark is stuck here */
-        d->chain_fork_tick[i] = tick;
 
-        if (rb_popcount(expect) > 1)
-            rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x (seat %d) "
-                      "— unresolved for %ums (settle %ums). The confirmed watermark "
-                      "cannot advance past this tick. ADVISORY: not acted on.\n",
-                   (unsigned)tick, (unsigned)local, (unsigned)peer, i,
-                   (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
-        else
+        if (rb_popcount(expect) > 1) {
+            /* Every seat may hold every input row and still disagree about
+             * the state it produced. In an N-seat room this can follow a
+             * declined tip extension or a correction that was not replayed
+             * everywhere. The chain has identified the first bad tick and
+             * the last agreed snapshot is still in reach: open a normal
+             * sealed-row episode for it. Owed bookkeeping retries if this
+             * first exchange aborts or cooldown delays it. */
+            if (rb_begin_episode(d, tick, i, 1, 0u, 0u, 0u, 0u)) {
+                rb_log(d, "RB chain repair tick=%u local=%08x peer=%08x seat=%d "
+                          "after %ums\n", (unsigned)tick, (unsigned)local,
+                       (unsigned)peer, i, (unsigned)(now - d->chain_pending_ms[i]));
+                rb_owed_mark(d, tick, i);
+                d->chain_pending_tick[i] = 0u;
+                return;
+            }
+            d->chain_pending_ms[i] = now; /* cooldown or drain: retry later */
+        } else {
+            d->chain_fork_tick[i] = tick;
             rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x "
                       "— unresolved for %ums (settle %ums). The confirmed watermark "
                       "cannot advance past this tick. ADVISORY: not acted on.\n",
                    (unsigned)tick, (unsigned)local, (unsigned)peer,
                    (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
+        }
     }
 }
 
@@ -4164,6 +4226,42 @@ uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d)
 int rnet_rb_driver_episode_active(const RNetRbDriver *d)
 {
     return d && d->stage != kRbIdle;
+}
+
+void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap)
+{
+    uint32_t mask;
+    int i;
+    if (!out || cap == 0u)
+        return;
+    if (!d) {
+        snprintf(out, cap, "no driver");
+        return;
+    }
+    snprintf(out, cap,
+             "stage=%s epoch=%u span=%u..%u sim=%u age_ms=%u seal=%d "
+             "answered=%x posts=%x commits=%x expect=%x deferred=%d",
+             rb_stage_name(d->stage), (unsigned)d->corr.epoch_id,
+             (unsigned)d->corr.load_tick, (unsigned)d->corr.target_tick,
+             (unsigned)d->sim, (unsigned)(rb_now((RNetRbDriver *)d) - d->stage_entered_ms),
+             d->rb ? rnet_rb_all_peer_seal_rows_complete(d->rb) : 0,
+             (unsigned)d->answered_mask, (unsigned)d->peer_post_mask,
+             (unsigned)d->peer_commit_mask, (unsigned)rb_expect_mask(d), d->defer_valid);
+    mask = rb_expect_mask(d);
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        uint32_t through, next;
+        size_t used;
+        if (!(mask & (1u << i)))
+            continue;
+        through = rnet_hc_resolved_through(&d->hc[i]);
+        next = through + 1u;
+        used = strlen(out);
+        if (used < cap)
+            snprintf(out + used, cap - used, " hc%d=%u:%u%u", i,
+                     (unsigned)through,
+                     (unsigned)rnet_hc_local_digest(&d->hc[i], next, NULL),
+                     (unsigned)rnet_hc_peer_digest(&d->hc[i], next, NULL));
+    }
 }
 
 int rnet_rb_driver_in_resim(const RNetRbDriver *d)

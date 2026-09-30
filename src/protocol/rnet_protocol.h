@@ -109,6 +109,12 @@ int rnet_proto_encode_start(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 s
 int rnet_proto_encode_input(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                             rnet_u16 input_epoch, rnet_u32 ack_tick, const RNetWireFrame *frames,
                             int frame_count);
+/* Multi-seat INPUT adds an acknowledgment for each source seat after the
+ * frames. Two-seat callers keep using encode_input and its original bytes. */
+int rnet_proto_encode_input_acks(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                 rnet_u8 local_slot, rnet_u16 input_epoch, rnet_u32 ack_tick,
+                                 const RNetWireFrame *frames, int frame_count,
+                                 const rnet_u32 *acks, rnet_u8 ack_count);
 int rnet_proto_encode_delay_sync(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 new_delay,
                                  rnet_u32 effective_tick);
 /* Agree on resolved pad hash for sim_tick before publish/advance. */
@@ -128,6 +134,16 @@ int rnet_proto_encode_state_ack(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u
 /* Hash probe: skip transfer when guest already has identical blob. */
 int rnet_proto_encode_state_probe(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                                   rnet_u8 op, rnet_u8 slot, rnet_u32 total_size, rnet_u32 payload_crc);
+/* Same, with the byte that used to be pad carrying `replied_mask`: bit i =
+ * seat i's reply to THIS probe already reached the prober, so seat i ignores
+ * the retransmit. 0 (what every older encoder wrote) = everyone answers, so
+ * the field is additive. With more than one receiver the prober keeps
+ * retransmitting until the slowest seat answers, and without it a seat that
+ * already answered a LOAD/BOOT ready probe (and cleared it) would see the
+ * retransmit as a fresh probe and re-raise it to its app. */
+int rnet_proto_encode_state_probe_ex(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                     rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot, rnet_u32 total_size,
+                                     rnet_u32 payload_crc, rnet_u8 replied_mask);
 /* Reply echoes the probe's size+crc so a late coord ACK (size=0) cannot be
  * accepted as a hash/ready reply for a different probe with the same op/slot. */
 int rnet_proto_encode_state_probe_reply(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
@@ -180,6 +196,8 @@ typedef struct RNetDecodedPacket
     rnet_u8 delay;
     rnet_u32 start_tick;
     rnet_u32 ack_tick;
+    rnet_u8 ack_count;
+    rnet_u32 acks[RNET_MAX_SLOTS];
     rnet_u8 new_delay;
     rnet_u32 effective_tick;
     rnet_u32 confirm_sim_tick;
@@ -199,6 +217,8 @@ typedef struct RNetDecodedPacket
     rnet_u8 state_chunk[RNET_STATE_CHUNK_MAX];
     rnet_u8 state_probe_match; /* PROBE_REPLY only; size/crc echoed in
                                 * state_total_size / state_payload_crc */
+    rnet_u8 state_probe_replied; /* PROBE only: seats whose reply already
+                                  * landed (0 from older encoders) */
     /* RB_* rollback control */
     rnet_u32 rb_epoch_id;
     rnet_u32 rb_mismatch_tick;

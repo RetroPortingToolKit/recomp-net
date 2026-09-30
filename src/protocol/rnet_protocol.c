@@ -151,6 +151,27 @@ int rnet_proto_encode_input(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 s
     return finish_packet(out, c, cap);
 }
 
+int rnet_proto_encode_input_acks(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                 rnet_u8 local_slot, rnet_u16 input_epoch, rnet_u32 ack_tick,
+                                 const RNetWireFrame *frames, int frame_count,
+                                 const rnet_u32 *acks, rnet_u8 ack_count)
+{
+    int len;
+    rnet_u8 *c;
+    rnet_u8 i;
+    if (acks == NULL || ack_count < 3 || ack_count > RNET_MAX_SLOTS)
+        return -1;
+    len = rnet_proto_encode_input(out, cap, magic, session_id, local_slot,
+                                  input_epoch, ack_tick, frames, frame_count);
+    if (len < 0 || (size_t)len + 1u + 4u * ack_count > cap)
+        return -1;
+    c = out + len - 4; /* replace the old checksum with the extension */
+    *c++ = ack_count;
+    for (i = 0; i < ack_count; ++i)
+        write_u32(&c, acks[i]);
+    return finish_packet(out, c, cap);
+}
+
 int rnet_proto_encode_delay_sync(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 new_delay,
                                  rnet_u32 effective_tick)
 {
@@ -280,6 +301,14 @@ int rnet_proto_encode_state_ack(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u
 int rnet_proto_encode_state_probe(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                                   rnet_u8 op, rnet_u8 slot, rnet_u32 total_size, rnet_u32 payload_crc)
 {
+    return rnet_proto_encode_state_probe_ex(out, cap, magic, session_id, local_slot, op, slot,
+                                            total_size, payload_crc, 0u);
+}
+
+int rnet_proto_encode_state_probe_ex(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                     rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot, rnet_u32 total_size,
+                                     rnet_u32 payload_crc, rnet_u8 replied_mask)
+{
     rnet_u8 *c = out;
     if (cap < 28)
     {
@@ -291,7 +320,7 @@ int rnet_proto_encode_state_probe(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet
     *c++ = local_slot;
     *c++ = op;
     *c++ = slot;
-    *c++ = 0;
+    *c++ = replied_mask; /* was pad (always 0): 0 = every receiver answers */
     write_u32(&c, total_size);
     write_u32(&c, payload_crc);
     return finish_packet(out, c, cap);
@@ -660,6 +689,15 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
                 c += sz;
             }
         }
+        if (c != end)
+        {
+            out->ack_count = *c++;
+            if (out->ack_count < 3 || out->ack_count > RNET_MAX_SLOTS ||
+                (size_t)(end - c) != 4u * out->ack_count)
+                return -1;
+            for (i = 0; i < out->ack_count; ++i)
+                out->acks[i] = read_u32(&c);
+        }
         break;
     case RNET_PKT_DELAY_SYNC:
         if ((size_t)(end - c) < 8)
@@ -740,7 +778,7 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->local_slot = *c++;
         out->state_op = *c++;
         out->state_slot = *c++;
-        c++;
+        out->state_probe_replied = *c++;
         out->state_total_size = read_u32(&c);
         out->state_payload_crc = read_u32(&c);
         break;
