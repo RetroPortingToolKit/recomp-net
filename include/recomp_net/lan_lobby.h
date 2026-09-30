@@ -20,6 +20,8 @@ extern "C" {
 #define RNET_LAN_LOBBY_ENDPOINT_MAX   64
 #define RNET_LAN_LOBBY_PLAYER_MAX     64
 #define RNET_LAN_LOBBY_PASSWORD_MAX   64
+#define RNET_LAN_LOBBY_MOD_SET_MAX    512
+#define RNET_LAN_LOBBY_HAS_MOD_SET    1
 
 typedef struct RNetLanLobby {
     char name[RNET_LAN_LOBBY_NAME_MAX];
@@ -47,6 +49,10 @@ typedef struct RNetLanLobby {
      * Carried at join, when caps change, and at start; never interpreted by
      * the transport. Engines must include it in their startup identity. */
     int session_variant;
+    /* Canonical host mod selections, semicolon-separated feature lines.
+     * No local paths or resource bytes. Empty means an older host / vanilla.
+     * Optional trailing field on registry, JOIN_OK, CAPS and START. */
+    char mod_set[RNET_LAN_LOBBY_MOD_SET_MAX];
 } RNetLanLobby;
 
 enum {
