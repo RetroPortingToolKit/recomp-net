@@ -146,6 +146,7 @@ int main(void)
     snprintf(bind_g, sizeof(bind_g), "127.0.0.1:%u", port + 1u);
     snprintf(hroom.endpoint, sizeof(hroom.endpoint), "%s", bind_h);
     hroom.session_variant = 37;
+    snprintf(hroom.mod_set, sizeof(hroom.mod_set), "test.coop@1/coop player1=zero");
 
     /* --- 1. the non-blocking join, single-threaded -------------------- */
     printf("  non-blocking join while the host is pumped on the same thread\n");
@@ -169,6 +170,8 @@ int main(void)
     ck(strcmp(hroom.joiner_name, "Guesty") == 0, "the host holds the seat");
     ck(strcmp(groom.host_name, "Hostess") == 0, "the guest has the room");
     ck(groom.session_variant == 37, "JOIN_OK carries the opaque engine variant");
+    ck(!strcmp(groom.mod_set, hroom.mod_set), "JOIN_OK carries the host mod settings");
+    snprintf(hroom.mod_set, sizeof(hroom.mod_set), "test.view@1/wide aspect=21:9");
     hroom.session_variant = 9;
     ck(rnet_lan_direct_host_notify_caps(host, &hroom) == RNET_LAN_DIRECT_OK,
        "host changes the session variant in the waiting room");
@@ -180,6 +183,7 @@ int main(void)
         }
     }
     ck(groom.session_variant == 9, "CAPS updates the guest's variant");
+    ck(!strcmp(groom.mod_set, hroom.mod_set), "CAPS updates the guest mod settings");
     ck(rnet_lan_direct_guest_join_poll(guest, &groom) == RNET_LAN_DIRECT_OK,
        "polling a seated handle stays OK");
     /* The seated guest asks again from the same address -- what a guest does
@@ -230,11 +234,13 @@ int main(void)
     hroom.started = 1;
     hroom.session_id = 0x7000001u;
     hroom.session_variant = 42;
+    snprintf(hroom.mod_set, sizeof(hroom.mod_set), "test.view@1/wide aspect=32:9");
     ck(rnet_lan_direct_host_notify_start(host, &hroom) == RNET_LAN_DIRECT_OK,
        "notify_start");
     ck(guest_event(host, &hroom, guest, &groom) == 1, "the guest hears START");
     ck(groom.session_id == 0x7000001u, "with the host's session id");
     ck(groom.session_variant == 42, "START settles the variant even if the last CAPS was lost");
+    ck(!strcmp(groom.mod_set, hroom.mod_set), "START settles mod settings even if CAPS was lost");
 
     /* --- 3. the soft return: both sockets closed, the guest asks first -- */
     printf("  rematch: the guest asks before the host listens again\n");
