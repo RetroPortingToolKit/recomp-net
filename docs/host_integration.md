@@ -38,6 +38,16 @@ exit immediately. While waiting on admit, poll
 `rnet_session_peer_disconnected(session, 1500)` (~1.5s silence or peer BYE)
 and leave the session instead of spinning forever.
 
+With three or more seats that aggregate check cannot see a single silent seat
+(the others' traffic keeps it fresh). Use the per-seat calls —
+`rnet_session_peer_slot_disconnected(session, slot, 1500)`,
+`rnet_session_disconnected_peers(session, 1500)`,
+`rnet_session_peer_gone(session, slot)`, `rnet_session_peer_rx_age_ms` — and,
+if the match continues without that seat, `rnet_session_state_drop_peer` so
+an open STATE transfer or probe barrier stops waiting on it. STATE with more
+than two seats (per-receiver completion, concurrent MEMCARD uploads, N-party
+probe barriers) is specified in `docs/protocol.md` "Multi-seat STATE".
+
 ## Host vtable
 
 | Callback | Role |

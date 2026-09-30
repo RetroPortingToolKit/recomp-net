@@ -28,6 +28,57 @@ typedef enum RNetSessionPhase
     RNET_PHASE_RUNNING
 } RNetSessionPhase;
 
+/* Outbound STATE transfer. Chunks go out once and reach every receiver (the
+ * relay / hub fans them out), but completion, the send window and
+ * retransmission are all per receiver: the transfer is done only when every
+ * seat in expect_mask has ACKed the whole blob, the window is anchored on the
+ * SLOWEST receiver, and a receiver whose ACK stops advancing rewinds the
+ * cursor to its own watermark. With one receiver this is exactly the former
+ * single-peer sender. */
+typedef struct RNetStateTx
+{
+    int active;
+    int ready;
+    rnet_u8 op;
+    rnet_u8 slot;
+    rnet_u32 xfer_id;
+    rnet_u32 total;
+    rnet_u32 crc;
+    rnet_u8 *buf;
+    rnet_u32 expect_mask;                  /* receivers the transfer waits on */
+    rnet_u32 ack[RNET_MAX_SLOTS];          /* contiguous ACK per receiver */
+    rnet_u64 ack_timer_ms[RNET_MAX_SLOTS]; /* last progress/timeout; 0 = none */
+    rnet_u32 send_cursor;
+    rnet_u64 last_tx_ms;
+    rnet_u64 last_begin_ms;
+    rnet_u64 last_progress_log_ms;
+    rnet_u32 last_progress_acked;
+    rnet_u64 start_ms;
+    /* AIMD pacing for STATE_CHUNK (esp. ICE/TURN — juice drops on flood). */
+    rnet_u32 cwnd;       /* in-flight byte budget */
+    rnet_u32 chunks_cap; /* max chunks emitted per pump */
+    rnet_u32 ack_timeout_ms;
+} RNetStateTx;
+
+/* Inbound STATE transfer from one source seat. */
+typedef struct RNetStateRx
+{
+    int active;
+    int ready;
+    rnet_u8 op;
+    rnet_u8 slot;
+    rnet_u32 xfer_id;
+    rnet_u32 total;
+    rnet_u32 crc;
+    rnet_u32 contiguity; /* bytes from 0 received */
+    rnet_u8 *buf;
+    rnet_u64 last_ack_ms;
+    rnet_u64 start_ms;
+    rnet_u8 bits[(RNET_STATE_MAX_CHUNKS + 7u) / 8u];
+} RNetStateRx;
+
+#define RNET_STATE_TAKEN_TX RNET_MAX_SLOTS
+
 struct RNetSession
 {
     RNetConfig cfg;
@@ -75,20 +126,26 @@ struct RNetSession
     rnet_u32 desync_tick;
     rnet_u32 desync_local_hash;
     rnet_u32 desync_remote_hash;
-    /* Peer liveness: any valid packet stamps last_peer_rx_ms; BYE sets peer_gone. */
+    /* Peer liveness. Aggregate: any valid packet stamps last_peer_rx_ms and a
+     * BYE from anyone sets peer_gone -- the two-seat view, kept as it was.
+     * Per seat: the same two facts indexed by the packet's sender slot, so a
+     * seat that went silent in a room of four is visible instead of hiding
+     * behind the others' traffic. Indexed by wire slot; seats are < 8. */
     rnet_u64 last_peer_rx_ms;
     rnet_u64 session_start_ms;
     int peer_gone;
-    /* Host→guest savestate / SRAM transfer (chunked + ACK). */
-    int state_active;
-    int state_sender;
-    int state_ready;
+    rnet_u64 peer_rx_ms[RNET_MAX_SLOTS]; /* 0 = never heard from */
+    rnet_u32 peer_gone_mask;             /* bit i = seat i sent BYE */
+    /* Chunked blob transfer. One outbound (tx) at a time; inbound (rx) is
+     * per SOURCE seat so several guests can upload MEMCARD to the host at
+     * once without one BEGIN clobbering another's receive. */
+    RNetStateTx tx;
+    RNetStateRx rx[RNET_MAX_SLOTS];
+    /* Which transfer the last take_ready reported: -1 none, RNET_MAX_SLOTS =
+     * tx, else rx[source]. state_finish finishes that one. */
+    int state_taken;
     int state_stall_sim; /* probe + all transfers stall admit until finished */
-    rnet_u8 state_op;
-    rnet_u8 state_slot;
-    rnet_u32 state_xfer_id;
     rnet_u32 state_next_xfer_id;
-    rnet_u8 state_source_slot;
     /* Incoming transfer history is per sender, independent of our outgoing
      * receipts. Survives state_clear/hard_resync so a reordered BEGIN cannot
      * resurrect an old transfer or displace a newer one. */
@@ -96,31 +153,18 @@ struct RNetSession
         rnet_u32 id, total, crc;
         rnet_u8 op, slot;
         int finished;
+        rnet_u64 last_reack_ms; /* paces re-ACKs of a finished transfer */
     } state_received[RNET_MAX_SLOTS];
-    rnet_u32 state_total;
-    rnet_u32 state_crc;
-    rnet_u32 state_contiguity; /* receiver: bytes from 0 received; sender: unused */
-    rnet_u32 state_peer_ack;   /* sender: peer contiguous ACK */
-    rnet_u32 state_send_cursor;
-    rnet_u8 *state_buf;
-    rnet_u8 state_rx_bits[(RNET_STATE_MAX_CHUNKS + 7u) / 8u];
-    rnet_u64 state_last_tx_ms;
-    rnet_u64 state_last_ack_ms;
-    rnet_u64 state_last_begin_ms;
-    rnet_u64 state_last_progress_log_ms;
-    rnet_u32 state_last_progress_acked;
-    /* AIMD pacing for STATE_CHUNK (esp. ICE/TURN — juice drops on flood). */
-    rnet_u32 state_cwnd;        /* in-flight byte budget */
-    rnet_u32 state_chunks_cap;  /* max chunks emitted per pump */
-    rnet_u32 state_ack_timeout_ms;
     /* Survives state_clear — warm-start the next ICE transfer in-session. */
     rnet_u32 state_sticky_cwnd;
     rnet_u32 state_sticky_chunks;
-    rnet_u64 state_xfer_start_ms;
-    /* Hash probe before transfer (host announce → guest reply). */
+    /* Hash probe before transfer (host announce → guest reply). The prober
+     * waits for a reply from every seat in expect_mask. */
     int state_probe_active;
     int state_probe_sender;
-    int state_probe_reply_ready; /* host: guest answered */
+    rnet_u32 state_probe_expect_mask; /* host: seats that must answer */
+    rnet_u32 state_probe_reply_mask;  /* host: seats that answered */
+    rnet_u32 state_probe_match_mask;  /* host: seats that answered "match" */
     int state_probe_pending;     /* guest: awaiting app reply */
     int state_probe_match;
     rnet_u8 state_probe_op;
@@ -322,7 +366,7 @@ static void emit_delay_sync(RNetSession *s, rnet_u8 new_delay, rnet_u32 effectiv
 static void seed_delay_prefix(RNetSession *s);
 static void state_clear(RNetSession *s);
 static void state_probe_clear(RNetSession *s);
-static void state_send_ack(RNetSession *s);
+static int state_any_active(const RNetSession *s);
 static void state_drive_sender(RNetSession *s);
 static void state_drive_probe(RNetSession *s);
 static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt);
@@ -614,7 +658,12 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     case RNET_PKT_BYE:
         if (pkt->local_slot != s->wire_slot)
         {
+            /* Aggregate: any peer's BYE, as before. Per seat: who said it. */
             s->peer_gone = 1;
+            if (pkt->local_slot < RNET_MAX_SLOTS)
+            {
+                s->peer_gone_mask |= 1u << pkt->local_slot;
+            }
         }
         break;
     case RNET_PKT_STATE_BEGIN:
@@ -848,12 +897,28 @@ static void send_raw(RNetSession *s, const rnet_u8 *buf, int len)
     (void)rnet_transport_send(&s->transport, buf, (size_t)len);
 }
 
+/* Sender seat of a decoded packet, or -1 when the packet carries none.
+ * START has no slot field but only the sim authority (seat 0) sends it;
+ * DELAY_SYNC has none and may come from any seat, so it is not attributed. */
+static int packet_sender_slot(const RNetDecodedPacket *pkt)
+{
+    switch (pkt->type)
+    {
+    case RNET_PKT_START:
+        return 0;
+    case RNET_PKT_DELAY_SYNC:
+        return -1;
+    default:
+        return (int)pkt->local_slot;
+    }
+}
+
 static void pump_recv(RNetSession *s)
 {
     rnet_u8 buf[RNET_MAX_PACKET];
     int n;
     RNetDecodedPacket pkt;
-    int guard = s->state_active ? 512 : 64;
+    int guard = state_any_active(s) ? 512 : 64;
 
     while (guard-- > 0)
     {
@@ -865,12 +930,104 @@ static void pump_recv(RNetSession *s)
         if (rnet_proto_decode(buf, (size_t)n, s->cfg.protocol_magic, &pkt) == 0 &&
             pkt.session_id == s->cfg.session_id)
         {
+            int from = packet_sender_slot(&pkt);
             rnet_transport_accept_pending_peer(&s->transport);
             s->last_peer_rx_ms = session_now(s);
+            if (from >= 0 && from < RNET_MAX_SLOTS && from != (int)s->wire_slot)
+            {
+                s->peer_rx_ms[from] = s->last_peer_rx_ms ? s->last_peer_rx_ms : 1u;
+            }
             s->packets_rx++;
             handle_decoded(s, &pkt);
         }
     }
+}
+
+static int state_rx_any_active(const RNetSession *s)
+{
+    int i;
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        if (s->rx[i].active)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* 1 while any transfer (outbound or any inbound) is open, ready or not --
+ * what the single-transfer code called state_active. */
+static int state_any_active(const RNetSession *s)
+{
+    return s != NULL && (s->tx.active || state_rx_any_active(s));
+}
+
+/* 1 while some open transfer has not completed yet. */
+static int state_any_in_progress(const RNetSession *s)
+{
+    int i;
+    if (s->tx.active && !s->tx.ready)
+    {
+        return 1;
+    }
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        if (s->rx[i].active && !s->rx[i].ready)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int state_popcount(rnet_u32 v)
+{
+    int n = 0;
+    while (v != 0u)
+    {
+        v &= v - 1u;
+        n++;
+    }
+    return n;
+}
+
+/* Seats a transfer or probe of `op` from this session must reach.
+ *   MEMCARD (guest -> host): the host alone.
+ *   anything else (host -> guests): every occupied seat but our own, or
+ *   only rb_peer_slot when PSX-Link group scoping is on -- STATE packets
+ *   from any other seat are filtered there, so waiting on one would hang.
+ * Observers are never counted: they are not seats. */
+static rnet_u32 state_default_receivers(const RNetSession *s, rnet_u8 op)
+{
+    rnet_u32 mask = 0;
+    rnet_u8 slot;
+    if (op == RNET_STATE_OP_MEMCARD)
+    {
+        return 1u;
+    }
+    if (s->rb_peer_slot >= 0)
+    {
+        if (s->rb_peer_slot < RNET_MAX_SLOTS && s->rb_peer_slot != (int)s->cfg.local_slot &&
+            rnet_config_slot_occupied(&s->cfg, (rnet_u8)s->rb_peer_slot))
+        {
+            return 1u << s->rb_peer_slot;
+        }
+        return 0;
+    }
+    for (slot = 0; slot < s->cfg.slot_count && slot < RNET_MAX_SLOTS; ++slot)
+    {
+        if (slot != s->cfg.local_slot && rnet_config_slot_occupied(&s->cfg, slot))
+        {
+            mask |= 1u << slot;
+        }
+    }
+    return mask;
+}
+
+static int state_probe_all_replied(const RNetSession *s)
+{
+    return (s->state_probe_reply_mask & s->state_probe_expect_mask) == s->state_probe_expect_mask;
 }
 
 static void state_probe_clear(RNetSession *s)
@@ -881,7 +1038,9 @@ static void state_probe_clear(RNetSession *s)
     }
     s->state_probe_active = 0;
     s->state_probe_sender = 0;
-    s->state_probe_reply_ready = 0;
+    s->state_probe_expect_mask = 0;
+    s->state_probe_reply_mask = 0;
+    s->state_probe_match_mask = 0;
     s->state_probe_pending = 0;
     s->state_probe_match = 0;
     s->state_probe_op = 0;
@@ -889,7 +1048,7 @@ static void state_probe_clear(RNetSession *s)
     s->state_probe_size = 0;
     s->state_probe_crc = 0;
     s->state_probe_last_tx_ms = 0;
-    if (!s->state_active)
+    if (!state_any_active(s))
     {
         s->state_stall_sim = 0;
     }
@@ -912,6 +1071,9 @@ static void state_probe_clear(RNetSession *s)
 #define RNET_STATE_LAN_CWND            (256u * 1024u)
 #define RNET_STATE_LAN_CHUNKS          128u
 #define RNET_STATE_LAN_ACK_TO_MS       40u
+/* Re-ACK pacing for a transfer this receiver already finished (the sender
+ * missed the final ACK and is still retransmitting chunks). */
+#define RNET_STATE_REACK_MS            20u
 
 static int state_transport_is_ice(const RNetSession *s)
 {
@@ -938,15 +1100,15 @@ static void state_pacing_reset(RNetSession *s)
             if (chunks > RNET_STATE_ICE_CHUNKS_MAX)
                 chunks = RNET_STATE_ICE_CHUNKS_MAX;
         }
-        s->state_cwnd = cwnd;
-        s->state_chunks_cap = chunks;
-        s->state_ack_timeout_ms = RNET_STATE_ICE_ACK_TO_START_MS;
+        s->tx.cwnd = cwnd;
+        s->tx.chunks_cap = chunks;
+        s->tx.ack_timeout_ms = RNET_STATE_ICE_ACK_TO_START_MS;
     }
     else
     {
-        s->state_cwnd = RNET_STATE_LAN_CWND;
-        s->state_chunks_cap = RNET_STATE_LAN_CHUNKS;
-        s->state_ack_timeout_ms = RNET_STATE_LAN_ACK_TO_MS;
+        s->tx.cwnd = RNET_STATE_LAN_CWND;
+        s->tx.chunks_cap = RNET_STATE_LAN_CHUNKS;
+        s->tx.ack_timeout_ms = RNET_STATE_LAN_ACK_TO_MS;
     }
 }
 
@@ -955,23 +1117,23 @@ static void state_pacing_on_ack_progress(RNetSession *s)
     if (s == NULL || !state_transport_is_ice(s))
         return;
     /* Additive increase: +8 KiB and +2 chunks/pump per advancing ACK. */
-    if (s->state_cwnd < RNET_STATE_ICE_CWND_MAX)
+    if (s->tx.cwnd < RNET_STATE_ICE_CWND_MAX)
     {
-        s->state_cwnd += RNET_STATE_ICE_AI_CWND;
-        if (s->state_cwnd > RNET_STATE_ICE_CWND_MAX)
-            s->state_cwnd = RNET_STATE_ICE_CWND_MAX;
+        s->tx.cwnd += RNET_STATE_ICE_AI_CWND;
+        if (s->tx.cwnd > RNET_STATE_ICE_CWND_MAX)
+            s->tx.cwnd = RNET_STATE_ICE_CWND_MAX;
     }
-    if (s->state_chunks_cap < RNET_STATE_ICE_CHUNKS_MAX)
+    if (s->tx.chunks_cap < RNET_STATE_ICE_CHUNKS_MAX)
     {
-        s->state_chunks_cap += RNET_STATE_ICE_AI_CHUNKS;
-        if (s->state_chunks_cap > RNET_STATE_ICE_CHUNKS_MAX)
-            s->state_chunks_cap = RNET_STATE_ICE_CHUNKS_MAX;
+        s->tx.chunks_cap += RNET_STATE_ICE_AI_CHUNKS;
+        if (s->tx.chunks_cap > RNET_STATE_ICE_CHUNKS_MAX)
+            s->tx.chunks_cap = RNET_STATE_ICE_CHUNKS_MAX;
     }
-    if (s->state_ack_timeout_ms > RNET_STATE_ICE_ACK_TO_MIN_MS)
+    if (s->tx.ack_timeout_ms > RNET_STATE_ICE_ACK_TO_MIN_MS)
     {
-        s->state_ack_timeout_ms -= 5u;
-        if (s->state_ack_timeout_ms < RNET_STATE_ICE_ACK_TO_MIN_MS)
-            s->state_ack_timeout_ms = RNET_STATE_ICE_ACK_TO_MIN_MS;
+        s->tx.ack_timeout_ms -= 5u;
+        if (s->tx.ack_timeout_ms < RNET_STATE_ICE_ACK_TO_MIN_MS)
+            s->tx.ack_timeout_ms = RNET_STATE_ICE_ACK_TO_MIN_MS;
     }
 }
 
@@ -980,259 +1142,373 @@ static void state_pacing_on_timeout(RNetSession *s)
     if (s == NULL || !state_transport_is_ice(s))
         return;
     /* Multiplicative decrease — juice/TURN drop when we outrun the relay. */
-    s->state_cwnd /= 2u;
-    if (s->state_cwnd < RNET_STATE_ICE_CWND_MIN)
-        s->state_cwnd = RNET_STATE_ICE_CWND_MIN;
-    s->state_chunks_cap /= 2u;
-    if (s->state_chunks_cap < RNET_STATE_ICE_CHUNKS_MIN)
-        s->state_chunks_cap = RNET_STATE_ICE_CHUNKS_MIN;
-    s->state_ack_timeout_ms += 20u;
-    if (s->state_ack_timeout_ms > RNET_STATE_ICE_ACK_TO_MAX_MS)
-        s->state_ack_timeout_ms = RNET_STATE_ICE_ACK_TO_MAX_MS;
+    s->tx.cwnd /= 2u;
+    if (s->tx.cwnd < RNET_STATE_ICE_CWND_MIN)
+        s->tx.cwnd = RNET_STATE_ICE_CWND_MIN;
+    s->tx.chunks_cap /= 2u;
+    if (s->tx.chunks_cap < RNET_STATE_ICE_CHUNKS_MIN)
+        s->tx.chunks_cap = RNET_STATE_ICE_CHUNKS_MIN;
+    s->tx.ack_timeout_ms += 20u;
+    if (s->tx.ack_timeout_ms > RNET_STATE_ICE_ACK_TO_MAX_MS)
+        s->tx.ack_timeout_ms = RNET_STATE_ICE_ACK_TO_MAX_MS;
     /* Decay sticky so the next transfer does not restart at a failed peak. */
-    if (s->state_sticky_cwnd > s->state_cwnd)
-        s->state_sticky_cwnd = s->state_cwnd;
-    if (s->state_sticky_chunks > s->state_chunks_cap)
-        s->state_sticky_chunks = s->state_chunks_cap;
+    if (s->state_sticky_cwnd > s->tx.cwnd)
+        s->state_sticky_cwnd = s->tx.cwnd;
+    if (s->state_sticky_chunks > s->tx.chunks_cap)
+        s->state_sticky_chunks = s->tx.chunks_cap;
 }
 
 static void state_pacing_remember_success(RNetSession *s)
 {
     if (s == NULL || !state_transport_is_ice(s))
         return;
-    if (s->state_cwnd > s->state_sticky_cwnd)
-        s->state_sticky_cwnd = s->state_cwnd;
-    if (s->state_chunks_cap > s->state_sticky_chunks)
-        s->state_sticky_chunks = s->state_chunks_cap;
+    if (s->tx.cwnd > s->state_sticky_cwnd)
+        s->state_sticky_cwnd = s->tx.cwnd;
+    if (s->tx.chunks_cap > s->state_sticky_chunks)
+        s->state_sticky_chunks = s->tx.chunks_cap;
 }
 
+/* After one part of the transfer state was cleared: admit stays stalled while
+ * any other transfer is open, else it follows the probe (as the
+ * single-transfer state_clear did). */
+static void state_recompute_stall(RNetSession *s)
+{
+    s->state_stall_sim = state_any_active(s) ? 1 : (s->state_probe_active ? 1 : 0);
+}
+
+static void state_tx_clear(RNetSession *s)
+{
+    free(s->tx.buf);
+    memset(&s->tx, 0, sizeof(s->tx));
+    if (s->state_taken == RNET_STATE_TAKEN_TX)
+    {
+        s->state_taken = -1;
+    }
+}
+
+static void state_rx_clear(RNetSession *s, int src)
+{
+    RNetStateRx *rx = &s->rx[src];
+    free(rx->buf);
+    rx->buf = NULL;
+    rx->active = 0;
+    rx->ready = 0;
+    rx->op = 0;
+    rx->slot = 0;
+    rx->xfer_id = 0;
+    rx->total = 0;
+    rx->crc = 0;
+    rx->contiguity = 0;
+    rx->last_ack_ms = 0;
+    rx->start_ms = 0;
+    memset(rx->bits, 0, sizeof(rx->bits));
+    if (s->state_taken == src)
+    {
+        s->state_taken = -1;
+    }
+}
+
+/* Clear every transfer, outbound and inbound. */
 static void state_clear(RNetSession *s)
 {
+    int i;
     if (s == NULL)
     {
         return;
     }
-    free(s->state_buf);
-    s->state_buf = NULL;
-    s->state_active = 0;
-    s->state_sender = 0;
-    s->state_ready = 0;
-    s->state_stall_sim = s->state_probe_active ? 1 : 0;
-    s->state_op = 0;
-    s->state_slot = 0;
-    s->state_xfer_id = 0;
-    s->state_total = 0;
-    s->state_crc = 0;
-    s->state_contiguity = 0;
-    s->state_peer_ack = 0;
-    s->state_send_cursor = 0;
-    memset(s->state_rx_bits, 0, sizeof(s->state_rx_bits));
-    s->state_last_tx_ms = 0;
-    s->state_last_ack_ms = 0;
-    s->state_last_begin_ms = 0;
-    s->state_last_progress_log_ms = 0;
-    s->state_last_progress_acked = 0;
-    s->state_xfer_start_ms = 0;
-    s->state_cwnd = 0;
-    s->state_chunks_cap = 0;
-    s->state_ack_timeout_ms = 0;
+    state_tx_clear(s);
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        state_rx_clear(s, i);
+    }
+    s->state_taken = -1;
+    state_recompute_stall(s);
 }
 
-static void state_rx_set_chunk(RNetSession *s, rnet_u32 chunk_index)
+static void state_rx_set_chunk(RNetStateRx *rx, rnet_u32 chunk_index)
 {
     if (chunk_index >= RNET_STATE_MAX_CHUNKS)
     {
         return;
     }
-    s->state_rx_bits[chunk_index >> 3] |= (rnet_u8)(1u << (chunk_index & 7u));
+    rx->bits[chunk_index >> 3] |= (rnet_u8)(1u << (chunk_index & 7u));
 }
 
-static int state_rx_has_chunk(const RNetSession *s, rnet_u32 chunk_index)
+static int state_rx_has_chunk(const RNetStateRx *rx, rnet_u32 chunk_index)
 {
     if (chunk_index >= RNET_STATE_MAX_CHUNKS)
     {
         return 0;
     }
-    return (s->state_rx_bits[chunk_index >> 3] >> (chunk_index & 7u)) & 1;
+    return (rx->bits[chunk_index >> 3] >> (chunk_index & 7u)) & 1;
 }
 
-static void state_rx_advance_contiguity(RNetSession *s)
+static void state_rx_advance_contiguity(RNetStateRx *rx)
 {
-    rnet_u32 chunks = (s->state_total + RNET_STATE_CHUNK_MAX - 1u) / RNET_STATE_CHUNK_MAX;
-    rnet_u32 i = s->state_contiguity / RNET_STATE_CHUNK_MAX;
-    while (i < chunks && state_rx_has_chunk(s, i))
+    rnet_u32 chunks = (rx->total + RNET_STATE_CHUNK_MAX - 1u) / RNET_STATE_CHUNK_MAX;
+    rnet_u32 i = rx->contiguity / RNET_STATE_CHUNK_MAX;
+    while (i < chunks && state_rx_has_chunk(rx, i))
     {
         rnet_u32 end = (i + 1u) * RNET_STATE_CHUNK_MAX;
-        if (end > s->state_total)
+        if (end > rx->total)
         {
-            end = s->state_total;
+            end = rx->total;
         }
-        s->state_contiguity = end;
+        rx->contiguity = end;
         i++;
     }
 }
 
-static void state_send_ack(RNetSession *s)
+static void state_send_ack_raw(RNetSession *s, rnet_u32 xfer_id, rnet_u32 ack_bytes)
 {
     rnet_u8 buf[64];
-    int n;
-    n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
-                                    s->state_xfer_id, s->state_contiguity);
+    int n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
+                                        xfer_id, ack_bytes);
     if (n > 0)
     {
         send_raw(s, buf, n);
-        s->state_last_ack_ms = session_now(s);
     }
 }
 
-static void state_mark_ready_if_complete(RNetSession *s)
+static void state_rx_send_ack(RNetSession *s, RNetStateRx *rx)
+{
+    state_send_ack_raw(s, rx->xfer_id, rx->contiguity);
+    rx->last_ack_ms = session_now(s);
+}
+
+static void state_rx_mark_ready_if_complete(RNetSession *s, RNetStateRx *rx)
 {
     rnet_u32 crc;
-    if (!s->state_active || s->state_ready || s->state_buf == NULL)
+    if (!rx->active || rx->ready || rx->buf == NULL)
     {
         return;
     }
-    if (s->state_sender)
-    {
-        if (s->state_peer_ack >= s->state_total)
-        {
-            s->state_ready = 1;
-            state_pacing_remember_success(s);
-        }
-        return;
-    }
-    if (s->state_contiguity < s->state_total)
+    if (rx->contiguity < rx->total)
     {
         return;
     }
-    crc = rnet_proto_checksum(s->state_buf, s->state_total);
-    if (crc != s->state_crc)
+    crc = rnet_proto_checksum(rx->buf, rx->total);
+    if (crc != rx->crc)
     {
         /* Restart receive — ask host to resend from 0 by ACKing 0 after clear. */
-        s->state_contiguity = 0;
-        state_send_ack(s);
+        rx->contiguity = 0;
+        state_rx_send_ack(s, rx);
         return;
     }
-    s->state_ready = 1;
-    state_send_ack(s);
+    rx->ready = 1;
+    state_rx_send_ack(s, rx);
+}
+
+/* Lowest contiguous ACK over the receivers still expected (total when none
+ * are left -- every one of them was dropped by the host). */
+static rnet_u32 state_tx_min_ack(const RNetSession *s)
+{
+    rnet_u32 min = s->tx.total;
+    int r;
+    for (r = 0; r < RNET_MAX_SLOTS; ++r)
+    {
+        if ((s->tx.expect_mask & (1u << r)) && s->tx.ack[r] < min)
+        {
+            min = s->tx.ack[r];
+        }
+    }
+    return min;
+}
+
+/* Receivers in expect_mask that have ACKed the whole blob. */
+static rnet_u32 state_tx_done_mask(const RNetSession *s)
+{
+    rnet_u32 done = 0;
+    int r;
+    for (r = 0; r < RNET_MAX_SLOTS; ++r)
+    {
+        if ((s->tx.expect_mask & (1u << r)) && s->tx.ack[r] >= s->tx.total)
+        {
+            done |= 1u << r;
+        }
+    }
+    return done;
+}
+
+static void state_tx_mark_ready_if_complete(RNetSession *s)
+{
+    if (!s->tx.active || s->tx.ready || s->tx.buf == NULL)
+    {
+        return;
+    }
+    if (state_tx_min_ack(s) >= s->tx.total)
+    {
+        s->tx.ready = 1;
+        state_pacing_remember_success(s);
+    }
 }
 
 static void state_drive_sender(RNetSession *s)
 {
     rnet_u8 buf[RNET_MAX_PACKET];
     int n;
+    int r;
     rnet_u64 now;
     rnet_u32 window_end;
+    rnet_u32 min_ack;
     rnet_u32 sent_this_pump = 0;
     const int is_ice = state_transport_is_ice(s);
     const rnet_u64 kBeginRetransmitMs = is_ice ? 80ULL : 40ULL;
     rnet_u32 cwnd;
     rnet_u32 chunks_cap;
     rnet_u64 ack_timeout_ms;
+    int backoff = 0;
+    int need_begin = 0;
 
-    if (!s->state_active || !s->state_sender || s->state_ready || s->state_buf == NULL)
+    if (!s->tx.active || s->tx.ready || s->tx.buf == NULL)
     {
         return;
     }
-    if (s->state_cwnd == 0 || s->state_chunks_cap == 0)
+    if (s->tx.cwnd == 0 || s->tx.chunks_cap == 0)
         state_pacing_reset(s);
-    cwnd = s->state_cwnd;
-    chunks_cap = s->state_chunks_cap;
-    ack_timeout_ms = (rnet_u64)s->state_ack_timeout_ms;
+    cwnd = s->tx.cwnd;
+    chunks_cap = s->tx.chunks_cap;
+    ack_timeout_ms = (rnet_u64)s->tx.ack_timeout_ms;
     if (ack_timeout_ms == 0)
         ack_timeout_ms = is_ice ? (rnet_u64)RNET_STATE_ICE_ACK_TO_START_MS
                                 : (rnet_u64)RNET_STATE_LAN_ACK_TO_MS;
 
     now = session_now(s);
-    /* Retransmit BEGIN until the peer has ACKed past 0 (saw BEGIN). */
-    if (s->state_peer_ack == 0 &&
-        (s->state_last_begin_ms == 0 || now - s->state_last_begin_ms >= kBeginRetransmitMs))
+    /* Retransmit BEGIN until EVERY expected receiver has ACKed past 0 (saw
+     * BEGIN). Stopping at the first one left a receiver that lost BEGIN with
+     * nothing to open its receive, so it dropped every chunk. */
+    for (r = 0; r < RNET_MAX_SLOTS; ++r)
+    {
+        if ((s->tx.expect_mask & (1u << r)) && s->tx.ack[r] == 0)
+        {
+            need_begin = 1;
+            break;
+        }
+    }
+    if (need_begin &&
+        (s->tx.last_begin_ms == 0 || now - s->tx.last_begin_ms >= kBeginRetransmitMs))
     {
         n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
-                                          s->state_op, s->state_slot, s->state_xfer_id, s->state_total, s->state_crc);
+                                          s->tx.op, s->tx.slot, s->tx.xfer_id, s->tx.total, s->tx.crc);
         if (n > 0)
         {
             send_raw(s, buf, n);
         }
-        s->state_last_begin_ms = now;
+        s->tx.last_begin_ms = now;
     }
 
-    if (s->state_peer_ack >= s->state_total)
+    min_ack = state_tx_min_ack(s);
+    if (min_ack >= s->tx.total)
     {
-        state_mark_ready_if_complete(s);
+        state_tx_mark_ready_if_complete(s);
         return;
     }
 
-    /* On ACK timeout, rewind send cursor to peer_ack for retransmission.
-     * The timer runs from the last ACK that made progress or, before any
-     * has, from the transfer's start. It used to run only from a progress
-     * ACK, so a first burst whose chunks overtook BEGIN (reordering) or
-     * lost chunk 0 left peer_ack at 0 with nothing ever resent: the receiver
-     * sat in receive with 0/N and the sender logged "0 acked" until the app
-     * gave up. Reproduced with the link simulator at 35 ms +/- 15 ms. */
-    if (now - (s->state_last_ack_ms != 0 ? s->state_last_ack_ms : s->state_xfer_start_ms) >= ack_timeout_ms)
+    /* Per-receiver ACK timeout: a receiver whose ACK has not advanced for
+     * ack_timeout_ms rewinds the send cursor to ITS watermark. The timer runs
+     * from that receiver's last progress ACK or, before any, from the
+     * transfer's start -- a first burst whose chunks overtook BEGIN
+     * (reordering) or lost chunk 0 otherwise left the ACK at 0 with nothing
+     * ever resent (reproduced with the link simulator at 35 ms +/- 15 ms).
+     * Per receiver, not one timer: with several receivers a fast one's
+     * progress kept a single timer fresh, and a slow one that lost chunks was
+     * never served. Back off (AIMD) when the slowest receiver times out or a
+     * rewind actually happened -- a fast receiver that is merely waiting for
+     * the window to reach its gap is not loss. */
+    for (r = 0; r < RNET_MAX_SLOTS; ++r)
     {
-        s->state_send_cursor = s->state_peer_ack;
-        s->state_last_ack_ms = now; /* avoid spinning every pump */
+        rnet_u64 base;
+        if (!(s->tx.expect_mask & (1u << r)) || s->tx.ack[r] >= s->tx.total)
+        {
+            continue;
+        }
+        base = (s->tx.ack_timer_ms[r] != 0) ? s->tx.ack_timer_ms[r] : s->tx.start_ms;
+        if (now - base < ack_timeout_ms)
+        {
+            continue;
+        }
+        if (s->tx.send_cursor > s->tx.ack[r] || s->tx.ack[r] == min_ack)
+        {
+            backoff = 1;
+        }
+        if (s->tx.send_cursor > s->tx.ack[r])
+        {
+            s->tx.send_cursor = s->tx.ack[r];
+        }
+        s->tx.ack_timer_ms[r] = now; /* avoid spinning every pump */
+    }
+    if (backoff)
+    {
         state_pacing_on_timeout(s);
-        cwnd = s->state_cwnd;
-        chunks_cap = s->state_chunks_cap;
-        ack_timeout_ms = (rnet_u64)s->state_ack_timeout_ms;
+        cwnd = s->tx.cwnd;
+        chunks_cap = s->tx.chunks_cap;
+        ack_timeout_ms = (rnet_u64)s->tx.ack_timeout_ms;
     }
 
-    if (s->state_send_cursor < s->state_peer_ack)
+    if (s->tx.send_cursor < min_ack)
     {
-        s->state_send_cursor = s->state_peer_ack;
+        s->tx.send_cursor = min_ack;
     }
-    window_end = s->state_peer_ack + cwnd;
-    if (window_end > s->state_total)
+    window_end = min_ack + cwnd;
+    if (window_end > s->tx.total)
     {
-        window_end = s->state_total;
+        window_end = s->tx.total;
     }
 
-    while (s->state_send_cursor < window_end && sent_this_pump < chunks_cap)
+    while (s->tx.send_cursor < window_end && sent_this_pump < chunks_cap)
     {
-        rnet_u32 off = s->state_send_cursor;
-        rnet_u32 left = s->state_total - off;
+        rnet_u32 off = s->tx.send_cursor;
+        rnet_u32 left = s->tx.total - off;
         rnet_u16 chunk = (left > RNET_STATE_CHUNK_MAX) ? (rnet_u16)RNET_STATE_CHUNK_MAX : (rnet_u16)left;
         n = rnet_proto_encode_state_chunk(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
-                                          s->state_xfer_id, off, s->state_buf + off, chunk);
+                                          s->tx.xfer_id, off, s->tx.buf + off, chunk);
         if (n <= 0)
         {
             break;
         }
         send_raw(s, buf, n);
-        s->state_send_cursor += chunk;
+        s->tx.send_cursor += chunk;
         sent_this_pump++;
     }
-    s->state_last_tx_ms = now;
+    s->tx.last_tx_ms = now;
 
-    /* Progress log every ~500ms (or on first ACK) — useful on slow TURN paths. */
-    if (s->state_peer_ack != s->state_last_progress_acked || s->state_last_progress_log_ms == 0 ||
-        now - s->state_last_progress_log_ms >= 500ULL)
+    /* Progress log every ~500ms (or on first ACK) — useful on slow TURN paths.
+     * "acked" is the slowest receiver's watermark. */
+    if (min_ack != s->tx.last_progress_acked || s->tx.last_progress_log_ms == 0 ||
+        now - s->tx.last_progress_log_ms >= 500ULL)
     {
         unsigned kib_s = 0;
-        if (s->state_xfer_start_ms != 0 && now > s->state_xfer_start_ms)
+        char rcv[48];
+        int expect_n = state_popcount(s->tx.expect_mask);
+        rcv[0] = '\0';
+        if (s->tx.start_ms != 0 && now > s->tx.start_ms)
         {
-            rnet_u64 elapsed = now - s->state_xfer_start_ms;
+            rnet_u64 elapsed = now - s->tx.start_ms;
             if (elapsed > 0)
-                kib_s = (unsigned)((s->state_peer_ack * 1000ULL) / elapsed / 1024ULL);
+                kib_s = (unsigned)((min_ack * 1000ULL) / elapsed / 1024ULL);
+        }
+        if (expect_n > 1)
+        {
+            snprintf(rcv, sizeof(rcv), " rcv_done=%d/%d mask=0x%02x", state_popcount(state_tx_done_mask(s)),
+                     expect_n, (unsigned)s->tx.expect_mask);
         }
         fprintf(stderr,
-                "rnet_state: xfer_id=%u op=%u %u/%u acked (%u KiB/s) cwnd=%u chunks=%u to=%ums%s\n",
-                (unsigned)s->state_xfer_id, (unsigned)s->state_op, (unsigned)s->state_peer_ack,
-                (unsigned)s->state_total, kib_s, (unsigned)s->state_cwnd, (unsigned)s->state_chunks_cap,
-                (unsigned)s->state_ack_timeout_ms, is_ice ? " (ice)" : "");
-        s->state_last_progress_log_ms = now;
-        s->state_last_progress_acked = s->state_peer_ack;
+                "rnet_state: xfer_id=%u op=%u %u/%u acked (%u KiB/s) cwnd=%u chunks=%u to=%ums%s%s\n",
+                (unsigned)s->tx.xfer_id, (unsigned)s->tx.op, (unsigned)min_ack,
+                (unsigned)s->tx.total, kib_s, (unsigned)s->tx.cwnd, (unsigned)s->tx.chunks_cap,
+                (unsigned)s->tx.ack_timeout_ms, is_ice ? " (ice)" : "", rcv);
+        s->tx.last_progress_log_ms = now;
+        s->tx.last_progress_acked = min_ack;
     }
 
-    state_mark_ready_if_complete(s);
+    state_tx_mark_ready_if_complete(s);
 }
 
 static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
 {
-    if (pkt->local_slot == s->wire_slot)
+    rnet_u8 src = pkt->local_slot;
+    RNetStateRx *rx;
+    if (src == s->wire_slot)
     {
         return; /* ignore echo */
     }
@@ -1242,7 +1518,7 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
          * guest. Other guests see the same broadcast and must not open a
          * receive for it, or they would sit on a transfer nobody drives for
          * them (the sender only tracks the host's ACKs). */
-        if (s->cfg.local_slot != 0 || pkt->local_slot == 0)
+        if (s->cfg.local_slot != 0 || src == 0)
         {
             return;
         }
@@ -1255,126 +1531,190 @@ static void state_on_begin(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
-    if (pkt->local_slot >= RNET_MAX_SLOTS || !pkt->state_xfer_id)
+    if (src >= RNET_MAX_SLOTS || !pkt->state_xfer_id)
         return;
-    if (s->state_received[pkt->local_slot].id)
+    rx = &s->rx[src];
+    if (s->state_received[src].id)
     {
         /* Low 30 bits are the serial number; MEMCARD sets bit 30 as its
-         * historical direction namespace. Compare serials modulo that space. */
-        rnet_u32 distance = (pkt->state_xfer_id - s->state_received[pkt->local_slot].id) & 0x3fffffffu;
+         * historical direction namespace. Compare serials modulo that space.
+         * A MEMCARD id carries the sender's seat in bits 24..29 and its serial
+         * in the low 24, so its serials compare in a 24-bit window (a 30-bit
+         * compare would call every BEGIN after the serial wraps stale). */
+        const int seat_ids = (pkt->state_xfer_id & 0x40000000u) && (s->state_received[src].id & 0x40000000u);
+        const rnet_u32 space = seat_ids ? 0x00ffffffu : 0x3fffffffu;
+        const rnet_u32 half = (space >> 1) + 1u;
+        rnet_u32 distance = (pkt->state_xfer_id - s->state_received[src].id) & space;
+        if (distance == 0 && pkt->state_xfer_id != s->state_received[src].id)
+            return; /* same serial, different seat bits: not this sender's */
         if (distance == 0)
         {
-            if (pkt->state_xfer_id != s->state_received[pkt->local_slot].id ||
-                pkt->state_total_size != s->state_received[pkt->local_slot].total ||
-                pkt->state_payload_crc != s->state_received[pkt->local_slot].crc ||
-                pkt->state_op != s->state_received[pkt->local_slot].op ||
-                pkt->state_slot != s->state_received[pkt->local_slot].slot)
+            if (pkt->state_xfer_id != s->state_received[src].id ||
+                pkt->state_total_size != s->state_received[src].total ||
+                pkt->state_payload_crc != s->state_received[src].crc ||
+                pkt->state_op != s->state_received[src].op ||
+                pkt->state_slot != s->state_received[src].slot)
                 return;
-            if (s->state_received[pkt->local_slot].finished)
-            {
-                rnet_u8 buf[64];
-                int n = rnet_proto_encode_state_ack(buf, sizeof(buf), s->cfg.protocol_magic,
-                    s->cfg.session_id, s->wire_slot, pkt->state_xfer_id, pkt->state_total_size);
-                if (n > 0) send_raw(s, buf, n);
-            }
-            else if (s->state_active && !s->state_sender && s->state_source_slot == pkt->local_slot &&
-                     s->state_xfer_id == pkt->state_xfer_id && s->state_buf != NULL)
-                state_send_ack(s);
+            if (s->state_received[src].finished)
+                state_send_ack_raw(s, pkt->state_xfer_id, pkt->state_total_size);
+            else if (rx->active && rx->xfer_id == pkt->state_xfer_id && rx->buf != NULL)
+                state_rx_send_ack(s, rx);
             return;
         }
-        if (distance >= 0x20000000u) return; /* stale BEGIN, even during a newer transfer */
+        if (distance >= half) return; /* stale BEGIN, even during a newer transfer */
     }
-    state_probe_clear(s); /* hash-miss path: transfer replaces probe */
-    state_clear(s);
-    s->state_buf = (rnet_u8 *)malloc(pkt->state_total_size);
-    if (s->state_buf == NULL)
+    /* Hash-miss path: a transfer from the prober replaces the probe it
+     * answered. As a prober we drop our probe only when `src` is the one
+     * seat it waits on (the two-seat rule, unchanged); a host whose barrier
+     * waits on several seats keeps it while guests upload. */
+    if (s->state_probe_active &&
+        (!s->state_probe_sender || s->state_probe_expect_mask == (1u << src)))
     {
+        state_probe_clear(s);
+    }
+    /* Supersede: a new transfer from the ONE receiver of our outbound
+     * transfer replaces it, exactly as the single-transfer session did -- the
+     * peer only starts its own after consuming ours (a guest's MEMCARD
+     * receipt after the host's proposal, the host's BOOT after a guest's
+     * upload), and hosts rely on the outbound transfer being gone rather
+     * than completing (gbarecomp multiplayer_startup.cpp / _checkpoint.cpp).
+     * An outbound transfer that still has other receivers keeps running for
+     * them; `src` completes it through its ACK / finished re-ACK. */
+    if (s->tx.active && s->tx.expect_mask == (1u << src))
+    {
+        state_tx_clear(s);
+    }
+    /* A new transfer from `src` replaces only src's receive: another source's
+     * receive is untouched. */
+    state_rx_clear(s, src);
+    rx->buf = (rnet_u8 *)malloc(pkt->state_total_size);
+    if (rx->buf == NULL)
+    {
+        state_recompute_stall(s);
         return;
     }
-    memset(s->state_buf, 0, pkt->state_total_size);
-    s->state_active = 1;
-    s->state_sender = 0;
+    memset(rx->buf, 0, pkt->state_total_size);
+    rx->active = 1;
+    rx->ready = 0;
     s->state_stall_sim = 1;
-    s->state_op = pkt->state_op;
-    s->state_slot = pkt->state_slot;
-    s->state_xfer_id = pkt->state_xfer_id;
-    s->state_source_slot = pkt->local_slot;
-    s->state_received[pkt->local_slot].id = pkt->state_xfer_id;
-    s->state_received[pkt->local_slot].total = pkt->state_total_size;
-    s->state_received[pkt->local_slot].crc = pkt->state_payload_crc;
-    s->state_received[pkt->local_slot].op = pkt->state_op;
-    s->state_received[pkt->local_slot].slot = pkt->state_slot;
-    s->state_received[pkt->local_slot].finished = 0;
-    s->state_total = pkt->state_total_size;
-    s->state_crc = pkt->state_payload_crc;
-    s->state_contiguity = 0;
-    s->state_xfer_start_ms = session_now(s);
-    state_send_ack(s);
+    rx->op = pkt->state_op;
+    rx->slot = pkt->state_slot;
+    rx->xfer_id = pkt->state_xfer_id;
+    s->state_received[src].id = pkt->state_xfer_id;
+    s->state_received[src].total = pkt->state_total_size;
+    s->state_received[src].crc = pkt->state_payload_crc;
+    s->state_received[src].op = pkt->state_op;
+    s->state_received[src].slot = pkt->state_slot;
+    s->state_received[src].finished = 0;
+    s->state_received[src].last_reack_ms = 0;
+    rx->total = pkt->state_total_size;
+    rx->crc = pkt->state_payload_crc;
+    rx->contiguity = 0;
+    rx->start_ms = session_now(s);
+    state_rx_send_ack(s, rx);
 }
 
 static void state_on_chunk(RNetSession *s, const RNetDecodedPacket *pkt)
 {
     rnet_u32 end;
-    if (!s->state_active || s->state_sender || s->state_buf == NULL)
+    rnet_u8 src = pkt->local_slot;
+    RNetStateRx *rx;
+    if (src >= RNET_MAX_SLOTS || src == s->wire_slot)
     {
         return;
     }
-    if (pkt->state_xfer_id != s->state_xfer_id || pkt->local_slot != s->state_source_slot)
+    rx = &s->rx[src];
+    if (!rx->active || rx->buf == NULL || pkt->state_xfer_id != rx->xfer_id)
     {
+        /* A chunk of a transfer we already finished: the sender missed our
+         * final ACK and is retransmitting. Answer with the full watermark
+         * (paced), or it would retransmit forever. */
+        if (s->state_received[src].id != 0 && s->state_received[src].finished &&
+            s->state_received[src].id == pkt->state_xfer_id)
+        {
+            rnet_u64 now = session_now(s);
+            if (s->state_received[src].last_reack_ms == 0 ||
+                now - s->state_received[src].last_reack_ms >= RNET_STATE_REACK_MS)
+            {
+                state_send_ack_raw(s, pkt->state_xfer_id, s->state_received[src].total);
+                s->state_received[src].last_reack_ms = now ? now : 1u;
+            }
+        }
         return;
     }
-    if (pkt->state_offset > s->state_total || pkt->state_chunk_size == 0)
+    if (pkt->state_offset > rx->total || pkt->state_chunk_size == 0)
     {
         return;
     }
     end = pkt->state_offset + (rnet_u32)pkt->state_chunk_size;
-    if (end > s->state_total)
+    if (end > rx->total)
     {
         return;
     }
-    memcpy(s->state_buf + pkt->state_offset, pkt->state_chunk, pkt->state_chunk_size);
+    memcpy(rx->buf + pkt->state_offset, pkt->state_chunk, pkt->state_chunk_size);
     {
         rnet_u32 chunk_index = pkt->state_offset / RNET_STATE_CHUNK_MAX;
-        state_rx_set_chunk(s, chunk_index);
-        (void)end;
-        state_rx_advance_contiguity(s);
+        state_rx_set_chunk(rx, chunk_index);
+        state_rx_advance_contiguity(rx);
     }
     {
         rnet_u64 now = session_now(s);
         /* ICE: ACK every chunk so the sender's cwnd can grow without waiting
          * on a 4ms coalesce that fights TURN RTT. LAN keeps light coalescing. */
-        if (state_transport_is_ice(s) || now - s->state_last_ack_ms >= 4ULL ||
-            s->state_contiguity >= s->state_total)
+        if (state_transport_is_ice(s) || now - rx->last_ack_ms >= 4ULL ||
+            rx->contiguity >= rx->total)
         {
-            state_send_ack(s);
+            state_rx_send_ack(s, rx);
         }
     }
-    state_mark_ready_if_complete(s);
+    state_rx_mark_ready_if_complete(s, rx);
 }
 
 static void state_on_ack(RNetSession *s, const RNetDecodedPacket *pkt)
 {
-    if (!s->state_active || !s->state_sender)
+    rnet_u8 from = pkt->local_slot;
+    rnet_u32 min_before;
+    rnet_u32 ack;
+    if (!s->tx.active)
     {
         return;
     }
-    if (pkt->state_xfer_id != s->state_xfer_id)
+    if (pkt->state_xfer_id != s->tx.xfer_id)
     {
         return;
     }
-    if (pkt->state_ack_bytes > s->state_peer_ack)
+    /* Only an expected receiver's ACK counts. The single-peer sender took the
+     * max over ANY ACK, so with several receivers the fastest one completed
+     * the transfer for all of them (and an observer's ACK could too). */
+    if (from >= RNET_MAX_SLOTS || !(s->tx.expect_mask & (1u << from)))
     {
-        s->state_peer_ack = pkt->state_ack_bytes;
-        if (s->state_peer_ack > s->state_total)
+        return;
+    }
+    ack = pkt->state_ack_bytes;
+    if (ack > s->tx.total)
+    {
+        ack = s->tx.total;
+    }
+    if (ack > s->tx.ack[from])
+    {
+        rnet_u64 now = session_now(s);
+        min_before = state_tx_min_ack(s);
+        s->tx.ack[from] = ack;
+        s->tx.ack_timer_ms[from] = now ? now : 1u;
+        s->tx.last_tx_ms = 0; /* send next chunk immediately */
+        /* Grow the window only when the SLOWEST receiver advances: the window
+         * is anchored on it, and N receivers each ACKing must not grow cwnd N
+         * times as fast. With one receiver every advance is the slowest's. */
+        if (state_tx_min_ack(s) > min_before)
         {
-            s->state_peer_ack = s->state_total;
+            state_pacing_on_ack_progress(s);
         }
-        s->state_last_ack_ms = session_now(s);
-        s->state_last_tx_ms = 0; /* send next chunk immediately */
-        state_pacing_on_ack_progress(s);
     }
-    state_mark_ready_if_complete(s);
+    state_tx_mark_ready_if_complete(s);
 }
+
+/* The PROBE replied mask is one byte on the wire: one bit per seat. */
+typedef char rnet_probe_replied_mask_fits_u8[(RNET_MAX_SLOTS <= 8) ? 1 : -1];
 
 static void state_drive_probe(RNetSession *s)
 {
@@ -1382,7 +1722,7 @@ static void state_drive_probe(RNetSession *s)
     int n;
     rnet_u64 now;
 
-    if (!s->state_probe_active || !s->state_probe_sender || s->state_probe_reply_ready)
+    if (!s->state_probe_active || !s->state_probe_sender || state_probe_all_replied(s))
     {
         return;
     }
@@ -1392,9 +1732,13 @@ static void state_drive_probe(RNetSession *s)
     {
         return;
     }
-    n = rnet_proto_encode_state_probe(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
-                                      s->wire_slot, s->state_probe_op, s->state_probe_slot,
-                                      s->state_probe_size, s->state_probe_crc);
+    /* The replied mask tells seats that already answered to ignore this
+     * retransmit (0 while nobody has -- the only value a two-seat host ever
+     * sends, since it stops at the first reply). */
+    n = rnet_proto_encode_state_probe_ex(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id,
+                                         s->wire_slot, s->state_probe_op, s->state_probe_slot,
+                                         s->state_probe_size, s->state_probe_crc,
+                                         (rnet_u8)(s->state_probe_reply_mask & 0xffu));
     if (n > 0)
     {
         send_raw(s, buf, n);
@@ -1412,7 +1756,14 @@ static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return; /* host never receives PROBE */
     }
-    if (s->state_active)
+    /* The prober already holds our reply to this probe: it is retransmitting
+     * for a slower seat. Re-raising it would hand a LOAD/BOOT ready probe we
+     * already answered (and cleared) back to the app as a fresh one. */
+    if (s->wire_slot < 8u && (pkt->state_probe_replied & (1u << s->wire_slot)))
+    {
+        return;
+    }
+    if (state_any_active(s))
     {
         return; /* transfer in flight takes precedence */
     }
@@ -1437,7 +1788,9 @@ static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
     s->state_probe_active = 1;
     s->state_probe_sender = 0;
     s->state_probe_pending = 1;
-    s->state_probe_reply_ready = 0;
+    s->state_probe_expect_mask = 0;
+    s->state_probe_reply_mask = 0;
+    s->state_probe_match_mask = 0;
     s->state_probe_match = 0;
     s->state_probe_op = pkt->state_op;
     s->state_probe_slot = pkt->state_slot;
@@ -1448,11 +1801,12 @@ static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
 
 static void state_on_probe_reply(RNetSession *s, const RNetDecodedPacket *pkt)
 {
+    rnet_u8 from = pkt->local_slot;
     if (!s->state_probe_active || !s->state_probe_sender)
     {
         return;
     }
-    if (pkt->local_slot == s->wire_slot)
+    if (from == s->wire_slot)
     {
         return;
     }
@@ -1464,8 +1818,21 @@ static void state_on_probe_reply(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
-    s->state_probe_match = pkt->state_probe_match ? 1 : 0;
-    s->state_probe_reply_ready = 1;
+    /* Per seat: every expected seat must answer; one seat's reply never
+     * stands in for another's. Latest answer per seat wins. */
+    if (from >= RNET_MAX_SLOTS || !(s->state_probe_expect_mask & (1u << from)))
+    {
+        return;
+    }
+    s->state_probe_reply_mask |= 1u << from;
+    if (pkt->state_probe_match)
+    {
+        s->state_probe_match_mask |= 1u << from;
+    }
+    else
+    {
+        s->state_probe_match_mask &= ~(1u << from);
+    }
 }
 
 static void maybe_bootstrap(RNetSession *s)
@@ -1866,6 +2233,7 @@ RNetSession *rnet_session_create(const RNetConfig *cfg, const RNetHostVTable *ho
     s->is_sim_authority = (!s->is_observer && cfg->local_slot == 0) ? 1 : 0;
     s->rb_peer_slot = -1;
     s->rb_last_from = -1;
+    s->state_taken = -1;
     s->session_start_ms = rnet_os_monotonic_ms();
     s->last_peer_rx_ms = 0;
     s->peer_gone = 0;
@@ -2100,7 +2468,7 @@ void rnet_session_pump(RNetSession *s)
     {
         state_drive_probe(s);
     }
-    if (s->state_active)
+    if (state_any_active(s))
     {
         /* Burst recv↔send so ACK progress can refill the window inside one
          * host pump (otherwise TURN transfers are gated to one cwnd/frame). */
@@ -2108,7 +2476,7 @@ void rnet_session_pump(RNetSession *s)
         for (burst = 0; burst < 4; burst++)
         {
             state_drive_sender(s);
-            if (!s->state_active || s->state_ready)
+            if (!state_any_in_progress(s))
                 break;
             pump_recv(s);
         }
@@ -2180,7 +2548,7 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
             note_admit_stall(s, RNET_ADMIT_NOT_RUNNING);
         return 0;
     }
-    if (s->state_stall_sim && (s->state_active || s->state_probe_active))
+    if (s->state_stall_sim && (state_any_active(s) || s->state_probe_active))
     {
         /* Stall while probe or chunked transfer is in flight. */
         note_admit_stall(s, RNET_ADMIT_STATE_XFER);
@@ -2518,11 +2886,115 @@ int rnet_session_peer_disconnected(const RNetSession *s, rnet_u64 timeout_ms)
 
 void rnet_session_touch_peer_liveness(RNetSession *s)
 {
-    if (s == NULL || s->peer_gone)
+    rnet_u64 now;
+    rnet_u8 slot;
+    if (s == NULL)
     {
         return;
     }
-    s->last_peer_rx_ms = session_now(s);
+    now = session_now(s);
+    /* Per seat: every occupied remote seat that has not said BYE. Done even
+     * when the aggregate is already gone -- one seat leaving a room of four
+     * must not freeze the others' silence budgets. */
+    for (slot = 0; slot < s->cfg.slot_count && slot < RNET_MAX_SLOTS; ++slot)
+    {
+        if (slot == s->cfg.local_slot || !rnet_config_slot_occupied(&s->cfg, slot) ||
+            (s->peer_gone_mask & (1u << slot)))
+        {
+            continue;
+        }
+        s->peer_rx_ms[slot] = now ? now : 1u;
+    }
+    if (s->peer_gone)
+    {
+        return;
+    }
+    s->last_peer_rx_ms = now;
+}
+
+/* Remote seat index valid for the per-seat liveness accessors. */
+static int liveness_seat_ok(const RNetSession *s, int slot)
+{
+    return s != NULL && slot >= 0 && slot < (int)s->cfg.slot_count && slot < RNET_MAX_SLOTS &&
+           slot != (int)s->cfg.local_slot;
+}
+
+int rnet_session_peer_gone(const RNetSession *s, int slot)
+{
+    if (!liveness_seat_ok(s, slot))
+    {
+        return 0;
+    }
+    return (s->peer_gone_mask & (1u << slot)) ? 1 : 0;
+}
+
+rnet_u32 rnet_session_peer_gone_mask(const RNetSession *s)
+{
+    return (s != NULL) ? s->peer_gone_mask : 0u;
+}
+
+rnet_u64 rnet_session_peer_rx_age_ms(const RNetSession *s, int slot)
+{
+    rnet_u64 now;
+    if (!liveness_seat_ok(s, slot) || s->peer_rx_ms[slot] == 0)
+    {
+        return RNET_PEER_RX_NEVER;
+    }
+    now = session_now((RNetSession *)s);
+    return (now > s->peer_rx_ms[slot]) ? (now - s->peer_rx_ms[slot]) : 0u;
+}
+
+int rnet_session_peer_slot_disconnected(const RNetSession *s, int slot, rnet_u64 timeout_ms)
+{
+    rnet_u64 age;
+    if (!liveness_seat_ok(s, slot) || !rnet_config_slot_occupied(&s->cfg, (rnet_u8)slot))
+    {
+        return 0;
+    }
+    if (s->peer_gone_mask & (1u << slot))
+    {
+        return 1;
+    }
+    if (timeout_ms == 0)
+    {
+        return 0;
+    }
+    if (s->peer_rx_ms[slot] == 0)
+    {
+        /* Never heard from this seat: the same long link budget as the
+         * aggregate (rematch boots can exceed 15 s on one peer). */
+        rnet_u64 link_budget_ms;
+        rnet_u64 os_now;
+        if (s->phase != RNET_PHASE_RUNNING && s->phase != RNET_PHASE_LINKING)
+        {
+            return 0;
+        }
+        link_budget_ms = timeout_ms * 60u;
+        if (link_budget_ms < 90000u)
+            link_budget_ms = 90000u;
+        os_now = rnet_os_monotonic_ms();
+        return (s->session_start_ms != 0 && os_now - s->session_start_ms > link_budget_ms) ? 1 : 0;
+    }
+    age = rnet_session_peer_rx_age_ms(s, slot);
+    return (age >= timeout_ms) ? 1 : 0;
+}
+
+rnet_u32 rnet_session_disconnected_peers(const RNetSession *s, rnet_u64 timeout_ms)
+{
+    rnet_u32 mask = 0;
+    int slot;
+    if (s == NULL)
+    {
+        return 0;
+    }
+    for (slot = 0; slot < (int)s->cfg.slot_count && slot < RNET_MAX_SLOTS; ++slot)
+    {
+        if (rnet_session_peer_slot_disconnected(s, slot, timeout_ms))
+        {
+            mask |= 1u << slot;
+        }
+    }
+    return mask;
 }
 
 void rnet_session_push_signal(RNetSession *s, const RNetSignal *msg)
@@ -2636,15 +3108,48 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     out->stall_streaks = s->stall_streaks;
     out->last_admit_wait_ms = s->last_admit_wait_ms;
     out->max_admit_wait_ms = s->max_admit_wait_ms;
-    out->state_busy = (s->state_active || s->state_probe_active) ? 1 : 0;
-    out->state_op = s->state_active ? s->state_op
-                    : (s->state_probe_active ? s->state_probe_op : 0);
-    out->state_sender = s->state_active ? s->state_sender : 0;
-    out->state_bytes_total = s->state_active ? s->state_total : 0;
-    if (s->state_active)
-        out->state_bytes_acked = s->state_sender ? s->state_peer_ack : s->state_contiguity;
+    out->state_busy = (state_any_active(s) || s->state_probe_active) ? 1 : 0;
+    /* The single-transfer fields describe the outbound transfer when there is
+     * one, else the lowest-seat inbound one (the only one with two seats). */
+    if (s->tx.active)
+    {
+        out->state_op = s->tx.op;
+        out->state_sender = 1;
+        out->state_bytes_total = s->tx.total;
+        out->state_bytes_acked = state_tx_min_ack(s);
+    }
     else
-        out->state_bytes_acked = 0;
+    {
+        int i;
+        const RNetStateRx *rx = NULL;
+        for (i = 0; i < RNET_MAX_SLOTS && rx == NULL; ++i)
+        {
+            if (s->rx[i].active)
+                rx = &s->rx[i];
+        }
+        out->state_op = (rx != NULL) ? rx->op : (s->state_probe_active ? s->state_probe_op : 0);
+        out->state_sender = 0;
+        out->state_bytes_total = (rx != NULL) ? rx->total : 0;
+        out->state_bytes_acked = (rx != NULL) ? rx->contiguity : 0;
+    }
+    out->state_expect_mask = s->tx.active ? s->tx.expect_mask : 0u;
+    out->state_done_mask = s->tx.active ? state_tx_done_mask(s) : 0u;
+    {
+        int i;
+        for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        {
+            if (s->rx[i].active)
+                out->state_rx_mask |= 1u << i;
+        }
+    }
+    out->state_probe_expect_mask = (s->state_probe_active && s->state_probe_sender) ? s->state_probe_expect_mask : 0u;
+    out->state_probe_reply_mask = (s->state_probe_active && s->state_probe_sender) ? s->state_probe_reply_mask : 0u;
+    out->peer_gone_mask = s->peer_gone_mask;
+    {
+        int i;
+        for (i = 0; i < RNET_MAX_SLOTS; ++i)
+            out->peer_rx_age_ms[i] = rnet_session_peer_rx_age_ms(s, i);
+    }
     out->packets_rx = s->packets_rx;
     out->input_bundle_sends = s->input_bundle_sends;
 
@@ -2692,11 +3197,12 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
 
 int rnet_session_state_probe(RNetSession *s, rnet_u8 op, rnet_u8 slot, rnet_u32 total_size, rnet_u32 payload_crc)
 {
+    rnet_u32 expect;
     if ((s == NULL) || s->cfg.local_slot != 0 || s->phase != RNET_PHASE_RUNNING)
     {
         return -1;
     }
-    if (s->state_active || (s->state_probe_active && s->state_probe_sender && !s->state_probe_reply_ready))
+    if (state_any_active(s) || (s->state_probe_active && s->state_probe_sender && !state_probe_all_replied(s)))
     {
         return -1;
     }
@@ -2709,11 +3215,18 @@ int rnet_session_state_probe(RNetSession *s, rnet_u8 op, rnet_u8 slot, rnet_u32 
     {
         return -1;
     }
+    expect = state_default_receivers(s, op);
+    if (expect == 0u)
+    {
+        return -1; /* nobody to answer */
+    }
 
     state_probe_clear(s);
     s->state_probe_active = 1;
     s->state_probe_sender = 1;
-    s->state_probe_reply_ready = 0;
+    s->state_probe_expect_mask = expect;
+    s->state_probe_reply_mask = 0;
+    s->state_probe_match_mask = 0;
     s->state_probe_pending = 0;
     s->state_probe_match = 0;
     s->state_probe_op = op;
@@ -2733,13 +3246,49 @@ int rnet_session_state_probe(RNetSession *s, rnet_u8 op, rnet_u8 slot, rnet_u32 
 
 int rnet_session_state_probe_take_reply(RNetSession *s, int *match_out)
 {
-    if ((s == NULL) || !s->state_probe_active || !s->state_probe_sender || !s->state_probe_reply_ready)
+    if ((s == NULL) || !s->state_probe_active || !s->state_probe_sender || !state_probe_all_replied(s))
     {
         return 0;
     }
     if (match_out)
     {
-        *match_out = s->state_probe_match;
+        *match_out = ((s->state_probe_match_mask & s->state_probe_expect_mask) == s->state_probe_expect_mask) ? 1 : 0;
+    }
+    return 1;
+}
+
+int rnet_session_state_probe_take_reply_from(RNetSession *s, int slot, int *match_out)
+{
+    if ((s == NULL) || !s->state_probe_active || !s->state_probe_sender || slot < 0 || slot >= RNET_MAX_SLOTS ||
+        !(s->state_probe_expect_mask & (1u << slot)) || !(s->state_probe_reply_mask & (1u << slot)))
+    {
+        return 0;
+    }
+    if (match_out)
+    {
+        *match_out = (s->state_probe_match_mask & (1u << slot)) ? 1 : 0;
+    }
+    return 1;
+}
+
+int rnet_session_state_probe_replies(const RNetSession *s, rnet_u32 *expect_mask, rnet_u32 *replied_mask,
+                                     rnet_u32 *match_mask)
+{
+    if ((s == NULL) || !s->state_probe_active || !s->state_probe_sender)
+    {
+        return 0;
+    }
+    if (expect_mask)
+    {
+        *expect_mask = s->state_probe_expect_mask;
+    }
+    if (replied_mask)
+    {
+        *replied_mask = s->state_probe_reply_mask & s->state_probe_expect_mask;
+    }
+    if (match_mask)
+    {
+        *match_mask = s->state_probe_match_mask & s->state_probe_reply_mask & s->state_probe_expect_mask;
     }
     return 1;
 }
@@ -2819,12 +3368,13 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
 {
     rnet_u8 buf[64];
     int n;
+    rnet_u32 expect;
 
     if ((s == NULL) || (data == NULL) || (size == 0) || (size > RNET_STATE_MAX))
     {
         return -1;
     }
-    if (s->phase != RNET_PHASE_RUNNING || s->state_active)
+    if (s->phase != RNET_PHASE_RUNNING || state_any_active(s) || s->is_observer)
     {
         return -1;
     }
@@ -2846,55 +3396,64 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
     {
         return -1;
     }
+    expect = state_default_receivers(s, op);
+    if (expect == 0u)
+    {
+        return -1; /* nobody to send to */
+    }
 
     /* Drop any open probe — transfer is the authority path after a hash miss. */
     state_probe_clear(s);
 
-    s->state_buf = (rnet_u8 *)malloc(size);
-    if (s->state_buf == NULL)
+    state_tx_clear(s);
+    s->tx.buf = (rnet_u8 *)malloc(size);
+    if (s->tx.buf == NULL)
     {
+        state_recompute_stall(s);
         return -1;
     }
-    memcpy(s->state_buf, data, size);
-    s->state_active = 1;
-    s->state_sender = 1;
-    s->state_ready = 0;
+    memcpy(s->tx.buf, data, size);
+    s->tx.active = 1;
+    s->tx.ready = 0;
     s->state_stall_sim = 1;
-    s->state_op = op;
-    s->state_slot = slot;
+    s->tx.op = op;
+    s->tx.slot = slot;
+    s->tx.expect_mask = expect;
     s->state_next_xfer_id++;
     if (s->state_next_xfer_id == 0)
     {
         s->state_next_xfer_id = 1;
     }
-    s->state_xfer_id = s->state_next_xfer_id;
+    s->tx.xfer_id = s->state_next_xfer_id;
     if (op == RNET_STATE_OP_MEMCARD)
     {
         /* The receiver compares against the ids of transfers IT finished — its
          * own, small counter. Keep guest uploads out of that space so a fresh
          * upload is never mistaken for a completed host transfer and re-ACKed
-         * instead of received. */
-        s->state_xfer_id |= 0x40000000u;
+         * instead of received.
+         *
+         * Bits 24..29 carry (seat - 1): the host's STATE_ACK names only the
+         * transfer id, and it is broadcast to every guest, so two guests
+         * uploading at once with the same serial would each take the host's
+         * ACK of the OTHER's upload as its own. Seat 1 gets 0 there, so a
+         * two-seat guest's id is exactly what it always was. The serial keeps
+         * the low 24 bits; the receiver's stale-BEGIN window compares ids from
+         * one sender, whose seat bits never change. */
+        s->tx.xfer_id = 0x40000000u | ((((rnet_u32)s->cfg.local_slot - 1u) & 0x3fu) << 24) |
+                        (s->state_next_xfer_id & 0x00ffffffu);
     }
-    s->state_total = (rnet_u32)size;
-    s->state_crc = rnet_proto_checksum(s->state_buf, s->state_total);
-    s->state_contiguity = 0;
-    s->state_peer_ack = 0;
-    s->state_send_cursor = 0;
-    s->state_last_tx_ms = 0;
-    s->state_last_ack_ms = 0;
-    s->state_last_begin_ms = 0;
-    s->state_last_progress_log_ms = 0;
-    s->state_last_progress_acked = 0;
-    s->state_xfer_start_ms = session_now(s);
+    s->tx.total = (rnet_u32)size;
+    s->tx.crc = rnet_proto_checksum(s->tx.buf, s->tx.total);
+    s->tx.send_cursor = 0;
+    s->tx.start_ms = session_now(s);
     state_pacing_reset(s);
 
     n = rnet_proto_encode_state_begin(buf, sizeof(buf), s->cfg.protocol_magic, s->cfg.session_id, s->wire_slot,
-                                      s->state_op, s->state_slot, s->state_xfer_id, s->state_total, s->state_crc);
+                                      s->tx.op, s->tx.slot, s->tx.xfer_id, s->tx.total, s->tx.crc);
     if (n > 0)
     {
         send_raw(s, buf, n);
-        s->state_last_begin_ms = session_now(s);
+        s->tx.last_begin_ms = session_now(s);
     }
     state_drive_sender(s);
     return 0;
@@ -2906,7 +3465,7 @@ int rnet_session_state_busy(const RNetSession *s)
     {
         return 0;
     }
-    if (s->state_probe_active && s->state_probe_sender && !s->state_probe_reply_ready)
+    if (s->state_probe_active && s->state_probe_sender && !state_probe_all_replied(s))
     {
         return 1;
     }
@@ -2914,33 +3473,154 @@ int rnet_session_state_busy(const RNetSession *s)
     {
         return 1;
     }
-    return (s->state_active && !s->state_ready) ? 1 : 0;
+    return state_any_in_progress(s);
+}
+
+/* The transfer take_ready reports: the outbound one when it is complete,
+ * else the ready inbound one from the lowest source seat. -1 = none ready. */
+static int state_pick_ready(const RNetSession *s)
+{
+    int i;
+    if (s->tx.active && s->tx.ready && s->tx.buf != NULL)
+    {
+        return RNET_STATE_TAKEN_TX;
+    }
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        if (s->rx[i].active && s->rx[i].ready && s->rx[i].buf != NULL)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+int rnet_session_state_take_ready_from(RNetSession *s, int *from_out, rnet_u8 *op_out, rnet_u8 *slot_out,
+                                       const void **data_out, size_t *size_out)
+{
+    int pick;
+    rnet_u8 op, slot;
+    const rnet_u8 *data;
+    rnet_u32 total;
+    int from;
+    if (s == NULL)
+    {
+        return 0;
+    }
+    pick = state_pick_ready(s);
+    if (pick < 0)
+    {
+        return 0;
+    }
+    if (pick == RNET_STATE_TAKEN_TX)
+    {
+        op = s->tx.op;
+        slot = s->tx.slot;
+        data = s->tx.buf;
+        total = s->tx.total;
+        from = (int)s->cfg.local_slot;
+    }
+    else
+    {
+        op = s->rx[pick].op;
+        slot = s->rx[pick].slot;
+        data = s->rx[pick].buf;
+        total = s->rx[pick].total;
+        from = pick;
+    }
+    s->state_taken = pick;
+    if (from_out)
+    {
+        *from_out = from;
+    }
+    if (op_out)
+    {
+        *op_out = op;
+    }
+    if (slot_out)
+    {
+        *slot_out = slot;
+    }
+    if (data_out)
+    {
+        *data_out = data;
+    }
+    if (size_out)
+    {
+        *size_out = total;
+    }
+    return 1;
 }
 
 int rnet_session_state_take_ready(RNetSession *s, rnet_u8 *op_out, rnet_u8 *slot_out, const void **data_out,
                                   size_t *size_out)
 {
-    if ((s == NULL) || !s->state_active || !s->state_ready || s->state_buf == NULL)
+    return rnet_session_state_take_ready_from(s, NULL, op_out, slot_out, data_out, size_out);
+}
+
+int rnet_session_state_drop_peer(RNetSession *s, int slot)
+{
+    int changed = 0;
+    if (s == NULL || slot < 0 || slot >= RNET_MAX_SLOTS)
     {
         return 0;
     }
-    if (op_out)
+    if (s->tx.active && (s->tx.expect_mask & (1u << slot)))
     {
-        *op_out = s->state_op;
+        s->tx.expect_mask &= ~(1u << slot);
+        changed = 1;
+        state_tx_mark_ready_if_complete(s);
     }
-    if (slot_out)
+    if (s->state_probe_active && s->state_probe_sender && (s->state_probe_expect_mask & (1u << slot)))
     {
-        *slot_out = s->state_slot;
+        s->state_probe_expect_mask &= ~(1u << slot);
+        changed = 1;
     }
-    if (data_out)
+    return changed;
+}
+
+int rnet_session_state_progress(const RNetSession *s, int slot, rnet_u32 *acked_out, rnet_u32 *total_out)
+{
+    if (s == NULL || !s->tx.active || slot < 0 || slot >= RNET_MAX_SLOTS || !(s->tx.expect_mask & (1u << slot)))
     {
-        *data_out = s->state_buf;
+        return 0;
     }
-    if (size_out)
+    if (acked_out)
     {
-        *size_out = s->state_total;
+        *acked_out = s->tx.ack[slot];
+    }
+    if (total_out)
+    {
+        *total_out = s->tx.total;
     }
     return 1;
+}
+
+rnet_u32 rnet_session_state_pending_receivers(const RNetSession *s)
+{
+    if (s == NULL || !s->tx.active)
+    {
+        return 0u;
+    }
+    return s->tx.expect_mask & ~state_tx_done_mask(s);
+}
+
+rnet_u32 rnet_session_state_inbound_mask(const RNetSession *s)
+{
+    rnet_u32 mask = 0;
+    int i;
+    if (s == NULL)
+    {
+        return 0u;
+    }
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        if (s->rx[i].active)
+        {
+            mask |= 1u << i;
+        }
+    }
+    return mask;
 }
 
 void rnet_session_hard_resync(RNetSession *s)
@@ -3022,19 +3702,80 @@ void rnet_session_prime_delay_inputs(RNetSession *s, const rnet_u8 *bytes, rnet_
     }
 }
 
-void rnet_session_state_finish(RNetSession *s, int hard_resync)
+/* Finish (ready) or abort (not ready) one inbound transfer. */
+static void state_finish_rx(RNetSession *s, int src)
 {
+    if (s->rx[src].active && s->rx[src].ready)
+    {
+        s->state_received[src].finished = 1;
+    }
+    state_rx_clear(s, src);
+}
+
+void rnet_session_state_finish_from(RNetSession *s, int from_slot, int hard_resync)
+{
+    int i;
     if (s == NULL)
     {
         return;
     }
-    if (s->state_active && !s->state_sender && s->state_ready && s->state_source_slot < RNET_MAX_SLOTS)
-        s->state_received[s->state_source_slot].finished = 1;
+    if (from_slot == RNET_STATE_FROM_ALL)
+    {
+        for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        {
+            state_finish_rx(s, i);
+        }
+        state_tx_clear(s);
+    }
+    else if (!s->is_observer && from_slot == (int)s->cfg.local_slot)
+    {
+        state_tx_clear(s);
+    }
+    else if (from_slot >= 0 && from_slot < RNET_MAX_SLOTS)
+    {
+        state_finish_rx(s, from_slot);
+    }
     if (hard_resync)
     {
         rnet_session_hard_resync(s);
     }
-    state_clear(s);
+    state_recompute_stall(s);
+}
+
+void rnet_session_state_finish(RNetSession *s, int hard_resync)
+{
+    int target;
+    if (s == NULL)
+    {
+        return;
+    }
+    /* The transfer the last take_ready reported, if it is still open; else
+     * whichever take_ready would report now; else (nothing ready) abort
+     * everything -- with one transfer open that is exactly the old call. */
+    target = s->state_taken;
+    if (target == RNET_STATE_TAKEN_TX ? !s->tx.active : (target < 0 || !s->rx[target].active))
+    {
+        target = state_pick_ready(s);
+    }
+    if (target < 0)
+    {
+        rnet_session_state_finish_from(s, RNET_STATE_FROM_ALL, hard_resync);
+        return;
+    }
+    if (target == RNET_STATE_TAKEN_TX)
+    {
+        state_tx_clear(s);
+    }
+    else
+    {
+        state_finish_rx(s, target);
+    }
+    s->state_taken = -1;
+    if (hard_resync)
+    {
+        rnet_session_hard_resync(s);
+    }
+    state_recompute_stall(s);
 }
 
 int rnet_session_send_rb_frame_commit(RNetSession *s, rnet_u32 through_tick,

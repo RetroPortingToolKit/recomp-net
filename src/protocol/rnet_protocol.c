@@ -280,6 +280,14 @@ int rnet_proto_encode_state_ack(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u
 int rnet_proto_encode_state_probe(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                                   rnet_u8 op, rnet_u8 slot, rnet_u32 total_size, rnet_u32 payload_crc)
 {
+    return rnet_proto_encode_state_probe_ex(out, cap, magic, session_id, local_slot, op, slot,
+                                            total_size, payload_crc, 0u);
+}
+
+int rnet_proto_encode_state_probe_ex(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                     rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot, rnet_u32 total_size,
+                                     rnet_u32 payload_crc, rnet_u8 replied_mask)
+{
     rnet_u8 *c = out;
     if (cap < 28)
     {
@@ -291,7 +299,7 @@ int rnet_proto_encode_state_probe(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet
     *c++ = local_slot;
     *c++ = op;
     *c++ = slot;
-    *c++ = 0;
+    *c++ = replied_mask; /* was pad (always 0): 0 = every receiver answers */
     write_u32(&c, total_size);
     write_u32(&c, payload_crc);
     return finish_packet(out, c, cap);
@@ -740,7 +748,7 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->local_slot = *c++;
         out->state_op = *c++;
         out->state_slot = *c++;
-        c++;
+        out->state_probe_replied = *c++;
         out->state_total_size = read_u32(&c);
         out->state_payload_crc = read_u32(&c);
         break;
