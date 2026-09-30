@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define RNET_DJ_MAGIC "RNETDJ1"
-#define RNET_DJ_MAX_PKT 1024
+#define RNET_DJ_MAX_PKT 2048
 
 /* Received chat, oldest at head. Sized so a burst between two pumps is kept
  * rather than dropped; when it does overflow the OLDEST goes, because losing
@@ -320,7 +320,8 @@ static int build_join_ok(char *buf, size_t cap, const RNetLanLobby *room)
         !append_line(buf, cap, &o, delay_line) ||
         !append_line(buf, cap, &o, rollback_line) ||
         !append_line(buf, cap, &o, pred_line) ||
-        !append_line(buf, cap, &o, variant_line))
+        !append_line(buf, cap, &o, variant_line) ||
+        !append_line(buf, cap, &o, room->mod_set))
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return RNET_LAN_DIRECT_OK;
 }
@@ -377,7 +378,8 @@ static int build_start(char *buf, size_t cap, const RNetLanLobby *room)
         !append_line(buf, cap, &o, rollback_line) ||
         !append_line(buf, cap, &o, pred_line) ||
         !append_line(buf, cap, &o, session_line) ||
-        !append_line(buf, cap, &o, variant_line))
+        !append_line(buf, cap, &o, variant_line) ||
+        !append_line(buf, cap, &o, room ? room->mod_set : ""))
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return RNET_LAN_DIRECT_OK;
 }
@@ -409,7 +411,8 @@ static int build_caps(char *buf, size_t cap, const RNetLanLobby *room)
         !append_line(buf, cap, &o, delay_line) ||
         !append_line(buf, cap, &o, rollback_line) ||
         !append_line(buf, cap, &o, pred_line) ||
-        !append_line(buf, cap, &o, variant_line))
+        !append_line(buf, cap, &o, variant_line) ||
+        !append_line(buf, cap, &o, room ? room->mod_set : ""))
         return RNET_LAN_DIRECT_ERR_ARGUMENT;
     return RNET_LAN_DIRECT_OK;
 }
@@ -738,7 +741,9 @@ static void guest_fill_room_from_join_ok(const RNetLanDirectGuest *g,
     const char *rollback_line = next_line(&cursor);
     const char *pred_line = next_line(&cursor);
     const char *variant_line = next_line(&cursor);
+    const char *mod_set = next_line(&cursor);
     memset(out_room, 0, sizeof(*out_room));
+    snprintf(out_room->mod_set, sizeof(out_room->mod_set), "%s", mod_set ? mod_set : "");
     snprintf(out_room->endpoint, sizeof(out_room->endpoint), "%s",
              endpoint && endpoint[0] ? endpoint : g->host_hostport);
     snprintf(out_room->host_name, sizeof(out_room->host_name), "%s",
@@ -1059,7 +1064,9 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
         const char *pred_line = next_line(&cursor);
         const char *session_line = next_line(&cursor);
         const char *variant_line = next_line(&cursor);
+        const char *mod_set = next_line(&cursor);
         if (room) {
+            snprintf(room->mod_set, sizeof(room->mod_set), "%s", mod_set ? mod_set : "");
             room->started = 1;
             room->session_variant = variant_line ? (int)strtol(variant_line, NULL, 10) : 0;
             /* 0 from a host that predates V4 (no line): the caller decides. */
@@ -1078,7 +1085,9 @@ int rnet_lan_direct_guest_pump(RNetLanDirectGuest *guest, RNetLanLobby *room,
         const char *rollback_line = next_line(&cursor);
         const char *pred_line = next_line(&cursor);
         const char *variant_line = next_line(&cursor);
+        const char *mod_set = next_line(&cursor);
         if (room) {
+            snprintf(room->mod_set, sizeof(room->mod_set), "%s", mod_set ? mod_set : "");
             room->session_variant = variant_line ? (int)strtol(variant_line, NULL, 10) : 0;
             room->input_delay = parse_direct_input_delay_line(delay_line, 2);
             room->rollback = parse_direct_bool_line(rollback_line, room->rollback);
