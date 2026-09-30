@@ -4168,6 +4168,8 @@ int rnet_rb_driver_episode_active(const RNetRbDriver *d)
 
 void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap)
 {
+    uint32_t mask;
+    int i;
     if (!out || cap == 0u)
         return;
     if (!d) {
@@ -4183,6 +4185,21 @@ void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap)
              d->rb ? rnet_rb_all_peer_seal_rows_complete(d->rb) : 0,
              (unsigned)d->answered_mask, (unsigned)d->peer_post_mask,
              (unsigned)d->peer_commit_mask, (unsigned)rb_expect_mask(d), d->defer_valid);
+    mask = rb_expect_mask(d);
+    for (i = 0; i < RB_MAX_SLOTS; ++i) {
+        uint32_t through, next;
+        size_t used;
+        if (!(mask & (1u << i)))
+            continue;
+        through = rnet_hc_resolved_through(&d->hc[i]);
+        next = through + 1u;
+        used = strlen(out);
+        if (used < cap)
+            snprintf(out + used, cap - used, " hc%d=%u:%u%u", i,
+                     (unsigned)through,
+                     (unsigned)rnet_hc_local_digest(&d->hc[i], next, NULL),
+                     (unsigned)rnet_hc_peer_digest(&d->hc[i], next, NULL));
+    }
 }
 
 int rnet_rb_driver_in_resim(const RNetRbDriver *d)
