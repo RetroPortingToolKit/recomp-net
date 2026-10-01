@@ -257,6 +257,13 @@ if(RNET_BUILD_TESTS)
   target_include_directories(hostport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME hostport_test COMMAND hostport_test)
 
+  # Two-process end-to-end check of the host relay against a real lobby
+  # server (tools/host_relay_e2e.c says how to run it). Built, not a ctest:
+  # it needs the server.
+  add_executable(host_relay_e2e tools/host_relay_e2e.c)
+  target_link_libraries(host_relay_e2e PRIVATE recomp_net)
+  target_include_directories(host_relay_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
   add_executable(host_relay_test tests/host_relay_test.c)
   target_link_libraries(host_relay_test PRIVATE recomp_net)
   target_include_directories(host_relay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
