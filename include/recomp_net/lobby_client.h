@@ -139,6 +139,11 @@ typedef struct RNetLobbyMember {
     int  is_spectator;
     /* Country (alpha-2) from the server's GeoIP; "" unknown. */
     char country[4];
+    /* Host-relay room: this guest's latest path_report ("direct" | "fail" |
+     * "relay"), "" when none, and whether the server still trusts it at start
+     * (WS_LOBBY.md "Host relay"). From a server that publishes it; else "". */
+    char path[8];
+    int  path_fresh;
 } RNetLobbyMember;
 
 /* One package on the lobby wire -- a row of the host's required plan, or of a
@@ -217,6 +222,11 @@ typedef struct RNetLobbyMatchCaps {
     int  input_prediction;
     int  force_turn;       /* 0/1 — host: ICE relay-only (TURN) for all peers */
     int  force_input_relay; /* 0/1 — lobby-server UDP input relay */
+    /* 0/1 -- host: ask the server for the HOST RELAY (match_caps.relay =
+     * "host"): the host carries the match on its own UDP port and guests dial
+     * it; the server falls back to its relay unless every guest proved the
+     * path (recomp_net/host_relay.h). Guests read it to know the room asks. */
+    int  relay_host;
     int  rollback;         /* 0/1 — session mode; lobby default ON */
     /* The host's required mod plan, one row per PACKAGE.
      *
@@ -358,6 +368,12 @@ typedef struct RNetLobbyJoinInfo {
      * the launch and the start silently reverted a relayed match to p2p. It is
      * recorded here, once per launch, by the only message that knows. */
     int      force_input_relay;
+    /* The launch said transport "host": no relay_endpoint, the host carries
+     * the match on host_endpoint (its advertised public port) and every guest
+     * dials it. The host binds its own port (bind_hostport) and accepts the
+     * guest (2 seats) or hubs (3+). 0 on an SFU launch and from a server that
+     * predates the host relay. */
+    int      transport_host;
     /* The launch said the host runs the match from the gallery (session slot
      * 0, pad muted, players at lobby seat + 1). 0 from a server that predates
      * it and on every launch where the host holds a player seat. */
@@ -534,6 +550,26 @@ int  rnet_lobby_is_host(void);
 const char *rnet_lobby_host_player_id(void);
 /* Filled after create/join/lobby_update; peer endpoints for PsxNetplayConfig. */
 const RNetLobbyJoinInfo *rnet_lobby_join_info(void);
+
+/*
+ * Host relay (recomp_net/host_relay.h), driven from rnet_lobby_pump while
+ * seated online. The host's preference: 1 publishes match_caps.relay =
+ * "host", holds the game port while the room waits (UPnP / NAT-PMP / STUN),
+ * advertises it with set_host_endpoint and answers probes; every guest in a
+ * room that asks probes the advertised endpoint and sends path_report. The
+ * default is ON: the lobby server's relay carries a match only when a guest
+ * cannot reach the host. Applies to rooms this client creates from now on.
+ */
+void rnet_lobby_set_relay_host_pref(int on);
+int  rnet_lobby_relay_host_pref(void);
+/* Live state for the waiting room (see RNetHostRelayStatus). Returns 1 when
+ * the orchestration is doing anything (host or guest role), 0 when idle. */
+struct RNetHostRelayStatus;
+int  rnet_lobby_host_relay_status(struct RNetHostRelayStatus *out);
+/* The game is about to bind the host port: close the waiting-room socket and
+ * keep the router mapping. Called by the client itself on `launch`; exposed
+ * for a host layer that binds earlier. */
+void rnet_lobby_host_relay_release_port(void);
 
 /* Latest host match_caps (valid==0 until create/join/launch delivers one). */
 const RNetLobbyMatchCaps *rnet_lobby_match_caps(void);

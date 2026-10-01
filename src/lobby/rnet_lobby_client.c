@@ -22,6 +22,7 @@
 #include "recomp_net/rnet_ws.h"
 #include "recomp_net/rnet_sha1.h"
 #include "recomp_net/address.h"
+#include "recomp_net/host_relay.h"
 
 /* The fallback release pin, for a build that never said what it is. The
  * server normalises an empty version to the same word. */
@@ -999,6 +1000,75 @@ static void match_caps_clear(RNetLobbyMatchCaps *c)
     c->input_delay = 6;
 }
 
+/* ---- host relay (recomp_net/host_relay.h) -------------------------------
+ * The orchestration object lives here so every consumer of this client gets
+ * the flow by pumping the lobby. `relay_host_pref` is the HOST's setting,
+ * default on, published into the caps of rooms it creates / republishes. */
+static RNetHostRelay *g_host_relay;
+static int g_relay_host_pref = 1;
+
+void rnet_lobby_set_relay_host_pref(int on) { g_relay_host_pref = on ? 1 : 0; }
+int  rnet_lobby_relay_host_pref(void) { return g_relay_host_pref; }
+
+static int host_relay_send(const char *json, void *ctx)
+{
+    (void)ctx;
+    if (!rnet_lobby_connected() || !g_lc.in_lobby) return -1;
+    queue_send(json);
+    flush_pending();
+    return 0;
+}
+
+static int lobby_bind_port(void)
+{
+    const char *colon = strrchr(g_lc.my_bind, ':');
+    const int port = colon ? atoi(colon + 1) : 0;
+    return port > 0 && port < 65536 ? port : 0;
+}
+
+/* Every pump: the view of the room decides what the orchestration holds.
+ * Active only while seated in an online room whose published caps ask for
+ * the host relay (the host's caps are echoed back to it, so one rule serves
+ * both roles) and before the launch, which releases the port for the game. A spectator is
+ * not on the relay's path and reports nothing. */
+static void host_relay_step(void)
+{
+    RNetHostRelayView v;
+    if (!g_host_relay) {
+        g_host_relay = rnet_host_relay_create();
+        if (!g_host_relay) return;
+    }
+    memset(&v, 0, sizeof(v));
+    v.is_host = g_lc.is_host ? 1 : 0;
+    v.active = rnet_lobby_connected() && g_lc.in_lobby && !g_lc.launch_pending &&
+               !g_lc.join.local_is_spectator &&
+               g_lc.match_caps.valid && g_lc.match_caps.relay_host;
+    v.bind_port = (unsigned short)lobby_bind_port();
+    if (v.is_host && !v.bind_port) v.active = 0;
+    v.host_endpoint = g_lc.join.host_endpoint;
+    v.send_json = host_relay_send;
+    rnet_host_relay_update(g_host_relay, &v);
+}
+
+int rnet_lobby_host_relay_status(struct RNetHostRelayStatus *out)
+{
+    RNetHostRelayStatus st;
+    if (!out) return 0;
+    rnet_host_relay_status(g_host_relay, &st);
+    *out = st;
+    return st.role != 0;
+}
+
+void rnet_lobby_host_relay_release_port(void)
+{
+    rnet_host_relay_release_port(g_host_relay);
+}
+
+static void host_relay_leave(void)
+{
+    rnet_host_relay_leave(g_host_relay);
+}
+
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
 static void send_set_ready(int ready);
 static void mod_xfer_on_request(const char *from, const char *text);
@@ -1503,6 +1573,12 @@ static void parse_match_caps_object(const char *obj, RNetLobbyMatchCaps *out)
     if (out->input_prediction > 16) out->input_prediction = 16;
     out->force_turn = json_get_bool(obj, "force_turn", 0) ? 1 : 0;
     out->force_input_relay = json_get_bool(obj, "force_input_relay", 0) ? 1 : 0;
+    {
+        char relay[12];
+        relay[0] = '\0';
+        json_get_str(obj, "relay", relay, sizeof(relay));
+        out->relay_host = strcmp(relay, "host") == 0 ? 1 : 0;
+    }
     out->rollback = json_get_bool(obj, "rollback", 1) ? 1 : 0;
     /* The engine's own keys last, into an ext that match_caps_clear zeroed. */
     if (g_codec.parse_extra) g_codec.parse_extra(obj, out, g_codec.ctx);
@@ -1559,14 +1635,18 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const RNetLobbyMatc
                  caps->input_prediction);
     json_escape(caps->mod_set, set_esc, sizeof(set_esc));
     json_escape(caps->mod_cosmetic_allow, allow_esc, sizeof(allow_esc));
+    /* "relay":"host" only when asked: a blob without it is byte-identical to
+     * what a client from before the host relay sent, and the server reads
+     * its absence as "the SFU, as always". */
     n = snprintf(dst, dst_cap,
                  ",\"match_caps\":{\"v\":1,\"input_delay\":%d%s%s,"
-                 "\"force_turn\":%s,\"force_input_relay\":%s,"
+                 "\"force_turn\":%s,\"force_input_relay\":%s,%s"
                  "\"rollback\":%s%s,%s,\"mod_set\":\"%s\","
                  "\"mod_cosmetic_allow\":\"%s\"}",
                  caps->input_delay, pred, variant,
                  caps->force_turn ? "true" : "false",
                  caps->force_input_relay ? "true" : "false",
+                 caps->relay_host ? "\"relay\":\"host\"," : "",
                  caps->rollback ? "true" : "false",
                  extra, mods, set_esc, allow_esc);
     if (n < 0 || (size_t)n >= dst_cap) return 0;
@@ -1740,7 +1820,7 @@ static void fill_peer_bind_from_join(void)
 {
     RNetLobbyJoinInfo *j = &g_lc.join;
     const char *port;
-    const int force_relay = using_server_input_relay(j);
+    const int force_relay = !j->transport_host && using_server_input_relay(j);
     memset(j->bind_hostport, 0, sizeof(j->bind_hostport));
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
     if (force_relay) {
@@ -1760,8 +1840,11 @@ static void fill_peer_bind_from_join(void)
                     sizeof(j->bind_hostport) - 1);
         }
         /* guest_endpoint "ip:0" is unusable — leave peer empty so transport
-         * accept_first_peer learns the real source from the first UDP packet. */
-        if (endpoint_has_usable_port(j->guest_endpoint))
+         * accept_first_peer learns the real source from the first UDP packet.
+         * Host relay: the guest's advertised address is its LAN bind, which
+         * this host cannot dial across the guest's NAT; the guest dials us
+         * (it proved it can), so accept-first / hub always. */
+        if (!j->transport_host && endpoint_has_usable_port(j->guest_endpoint))
             strncpy(j->peer_hostport, j->guest_endpoint,
                     sizeof(j->peer_hostport) - 1);
     } else {
@@ -1836,6 +1919,10 @@ static int parse_seat_array(const char *json, const char *key, int is_spectator,
                 g_lc.members[n].slot = json_get_int(chunk, "slot", n);
                 json_get_str(chunk, "player_id", g_lc.members[n].player_id,
                              sizeof(g_lc.members[n].player_id));
+                g_lc.members[n].path[0] = '\0';
+                json_get_str(chunk, "path", g_lc.members[n].path,
+                             sizeof(g_lc.members[n].path));
+                g_lc.members[n].path_fresh = json_get_bool(chunk, "path_fresh", 0) ? 1 : 0;
                 /* mod_offer is an OBJECT -- {"pkgs":[...]} -- not a bare
                  * array. The server requires an object (sanitize_mod_offer
                  * rejects anything else) and echoes it back verbatim, so the
@@ -2328,10 +2415,19 @@ static void handle_server_json(const char *json)
     }
     if (strcmp(op, "launch") == 0) {
         char relay_endpoint[RNET_LOBBY_ENDPOINT_LEN];
+        char transport[16];
         json_get_str(json, "host_endpoint", g_lc.join.host_endpoint, sizeof(g_lc.join.host_endpoint));
         json_get_str(json, "guest_endpoint", g_lc.join.guest_endpoint, sizeof(g_lc.join.guest_endpoint));
         relay_endpoint[0] = '\0';
         json_get_str(json, "relay_endpoint", relay_endpoint, sizeof(relay_endpoint));
+        /* "host": the host carries the match (WS_LOBBY.md "Host relay"); the
+         * server sends no relay_endpoint and host_endpoint is the host's
+         * advertised port. The waiting-room socket on that port goes now, so
+         * the game can bind it; the router mapping stays for the game. */
+        transport[0] = '\0';
+        json_get_str(json, "transport", transport, sizeof(transport));
+        g_lc.join.transport_host = strcmp(transport, "host") == 0 ? 1 : 0;
+        rnet_host_relay_release_port(g_host_relay);
         g_lc.join.player_count = json_get_int(json, "player_count", g_lc.join.player_count);
         g_lc.join.max_slots = json_get_int(json, "max_slots", g_lc.join.max_slots);
         g_lc.join.session_id = (uint32_t)json_get_int(json, "session_id", (int)g_lc.join.session_id);
@@ -2363,7 +2459,9 @@ static void handle_server_json(const char *json)
          *
          * Restated on every launch, both ways, so a relayed match cannot leave
          * a 1 behind for the next p2p one. */
-        g_lc.join.force_input_relay = using_server_input_relay(&g_lc.join) ? 1 : 0;
+        g_lc.join.force_input_relay =
+            !g_lc.join.transport_host && using_server_input_relay(&g_lc.join) ? 1 : 0;
+        if (g_lc.join.transport_host) g_lc.match_caps.force_input_relay = 0;
         fill_peer_bind_from_join();
         parse_slots_array(json);
         /* Guest must know the host. Host may leave peer empty to learn the
@@ -2864,6 +2962,7 @@ int rnet_lobby_connect(const char *ws_url)
 
 void rnet_lobby_disconnect(void)
 {
+    host_relay_leave();
     if (g_lc.fd >= 0) {
         close(g_lc.fd);
     }
@@ -2952,6 +3051,9 @@ void rnet_lobby_pump(void)
 #else
     ssize_t n;
 #endif
+    /* Host relay: hold / probe / report to match the room. Before the
+     * connected() check so a dropped WS releases the port the same pump. */
+    host_relay_step();
     /* Driven from the lobby pump so a transfer runs while the player sits in
      * the waiting room -- which is the only time one happens. Deliberately
      * before the connected() check: an agent mid-handshake still has to be
@@ -3352,6 +3454,7 @@ int rnet_lobby_join(const char *lobby_id, const char *password, const char *gues
 
 int rnet_lobby_leave(void)
 {
+    host_relay_leave(); /* unmap the router, close the port, forget reports */
     queue_send("{\"op\":\"leave\"}");
     flush_pending();
     g_lc.in_lobby = 0;

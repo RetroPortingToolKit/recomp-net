@@ -33,6 +33,10 @@ set(RNET_CORE_SOURCES
   src/lobby/rnet_lan_direct.c
   src/lobby/rnet_lan_beacon.c
   src/lobby/rnet_rtt_probe.c
+  # Host relay: the host's reachable port (UPnP / NAT-PMP / STUN), the
+  # guest's probe, and the waiting-room orchestration every lobby client
+  # drives (recomp_net/host_relay.h). One copy, for recomp-ui and the engines.
+  src/nat/rnet_host_relay.c
   src/lobby/rnet_ice_rtt.c
   src/lobby/rnet_ice_xfer.c
   src/transport/rnet_netsim.c
@@ -253,6 +257,11 @@ if(RNET_BUILD_TESTS)
   target_include_directories(hostport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME hostport_test COMMAND hostport_test)
 
+  add_executable(host_relay_test tests/host_relay_test.c)
+  target_link_libraries(host_relay_test PRIVATE recomp_net)
+  target_include_directories(host_relay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME host_relay_test COMMAND host_relay_test)
+
   add_executable(lan_chat_test tests/lan_chat_test.c)
   target_link_libraries(lan_chat_test PRIVATE recomp_net)
   find_package(Threads REQUIRED)
@@ -350,7 +359,9 @@ if(RNET_BUILD_TESTS)
       tests/lobby_client_test.c
       src/chat/rnet_chat_filter.c
       src/chat/rnet_chat_report.c
-      src/platform/rnet_platform.c)
+      src/platform/rnet_platform.c
+      src/platform/rnet_stun.c
+      src/nat/rnet_host_relay.c)
     target_include_directories(lobby_client_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_client_test PRIVATE
@@ -365,7 +376,9 @@ if(RNET_BUILD_TESTS)
       src/lobby_ws/rnet_sha1.c
       src/chat/rnet_chat_filter.c
       src/chat/rnet_chat_report.c
-      src/platform/rnet_platform.c)
+      src/platform/rnet_platform.c
+      src/platform/rnet_stun.c
+      src/nat/rnet_host_relay.c)
     target_include_directories(lobby_ws_backlog_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_ws_backlog_test PRIVATE
