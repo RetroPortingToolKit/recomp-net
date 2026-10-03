@@ -348,15 +348,16 @@ static void scenario_a(void)
             /* the guest's offer arrives again at the host's seat-1 agent */
             dup = as_pushed(&r.guest[1].first_sdp);
             (void)rnet_session_push_signal_from(r.host.s, 1, &dup);
-            /* Only the host side is asserted: the hub freezes a seat's agent
-             * at COMPLETED. A 1:1 guest agent has no freeze, so a repeated
-             * answer at a guest is a legitimate ICE restart, not a bug. */
+            /* and the host's answer arrives again at guest 1's 1:1 agent,
+             * which is already COMPLETED: it must freeze, not restart */
+            dup = as_pushed(&r.host.seat_sdp[1]);
+            rnet_session_push_signal(r.guest[1].s, &dup);
         }
         pump_ms(&r, 1500);
         check(rnet_session_ice_state(r.guest[1].s) == RNET_ICE_STATE_COMPLETED &&
               rnet_session_ice_state(r.guest[2].s) == RNET_ICE_STATE_COMPLETED &&
               rnet_session_ice_state(r.host.s) == RNET_ICE_STATE_COMPLETED,
-              "A(c): duplicate REMOTE_SDP leaves every ICE state COMPLETED");
+              "A(c): duplicate REMOTE_SDP (host seat and guest 1) leaves every ICE state COMPLETED");
         check(ack_arrives(&r, r.guest[2].s, r.guest[1].s, 2, "g2-to-g1-after-dup"),
               "A(c): delivery guest 2 -> guest 1 still works after the duplicate SDP");
         check(ack_arrives(&r, r.guest[1].s, r.guest[2].s, 1, "g1-to-g2-after-dup"),

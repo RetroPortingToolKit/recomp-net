@@ -2660,6 +2660,15 @@ void rnet_session_pump(RNetSession *s)
         session_maybe_ice_relay_fallback(s);
 #endif
         rnet_ice_agent_poll(s->ice);
+        if (rnet_ice_agent_state(s->ice) == RNET_ICE_STATE_COMPLETED &&
+            (!rnet_ice_agent_has_turn(s->ice) || s->last_peer_rx_ms != 0ULL))
+        {
+            /* Negotiation is over: a repeated REMOTE_SDP/CANDIDATE must not
+             * rebuild the live agent. With TURN configured and no session
+             * traffic yet, the dead-path fallback may still restart ICE (and
+             * the peer's restart offer must be honoured), so freeze later. */
+            rnet_ice_agent_freeze(s->ice);
+        }
         if (s->phase == RNET_PHASE_IDLE && rnet_ice_agent_state(s->ice) == RNET_ICE_STATE_COMPLETED)
         {
             s->phase = RNET_PHASE_LINKING;

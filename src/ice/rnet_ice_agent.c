@@ -606,6 +606,7 @@ int rnet_ice_agent_restart_force_relay(RNetIceAgent *agent)
             "rnet_ice: auto TURN fallback — restarting ICE with force_relay "
             "(STUN/host path failed or stalled)\n");
     ice_reset_runtime(agent);
+    agent->frozen = 0; /* a local restart must accept the peer's new offer */
     if (ice_create_juice(agent) != 0)
         return -1;
     return rnet_ice_agent_start_gathering(agent);
