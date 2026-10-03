@@ -779,6 +779,16 @@ void rnet_ice_agent_push_signal(RNetIceAgent *agent, const RNetSignal *msg)
     }
 }
 
+void rnet_ice_agent_set_emit(RNetIceAgent *agent, RNetIceSignalEmitFn emit, void *user)
+{
+    if (agent == NULL)
+        return;
+    /* emit is only ever called from rnet_ice_agent_poll / push_signal on the
+     * caller's thread, never from libjuice's, so no lock is needed. */
+    agent->emit = emit;
+    agent->user = user;
+}
+
 void rnet_ice_agent_freeze(RNetIceAgent *agent)
 {
     if (agent != NULL)

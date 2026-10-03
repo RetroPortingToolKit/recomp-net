@@ -7,6 +7,11 @@
 extern "C" {
 #endif
 
+/* Opaque libjuice-backed ICE agent. Obtained from the lobby client's
+ * waiting-room handover (rnet_lobby_ice_take_*) and passed to
+ * rnet_session_adopt_ice_agent / rnet_session_start_ice_hub_adopt. */
+typedef struct RNetIceAgent RNetIceAgent;
+
 typedef enum RNetIceState
 {
     RNET_ICE_STATE_IDLE = 0,

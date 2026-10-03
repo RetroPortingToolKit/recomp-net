@@ -58,6 +58,28 @@ int rnet_session_start_ice(RNetSession *s, const RNetIceConfig *ice);
  */
 int rnet_session_start_ice_hub(RNetSession *s, const RNetIceConfig *ice, rnet_u32 guest_slot_mask);
 
+/*
+ * Handover from the waiting room (recomp_net/host_ice.h): the agents are
+ * ALREADY COMPLETED, so nothing is renegotiated. The session takes ownership
+ * of every agent on success (destroying them in rnet_session_destroy) and the
+ * caller must forget them; on -1 nothing was taken and the caller still owns
+ * them. Dead-path timers (ICE attempt / completion / peer-rx) measure from the
+ * moment of adoption, not from when the agent connected.
+ *
+ * rnet_session_start_ice_hub_adopt (HOST): seats[i].slot is the SESSION slot
+ * (1..RNET_MAX_SLOTS-1) the agent serves; the hub mask is built from exactly
+ * these seats. Fails (-1) if any agent is NULL, duplicated, out of range, or
+ * not COMPLETED -- a seat that is not connected never yields a smaller room.
+ * rnet_session_adopt_ice_agent (GUEST): the one agent connected to the host.
+ */
+typedef struct RNetIceAdoptSeat
+{
+    int slot;
+    RNetIceAgent *agent;
+} RNetIceAdoptSeat;
+int rnet_session_start_ice_hub_adopt(RNetSession *s, const RNetIceAdoptSeat *seats, int n);
+int rnet_session_adopt_ice_agent(RNetSession *s, RNetIceAgent *agent);
+
 /* Recv datagrams, poll ICE, send pending INPUT, drive bootstrap. */
 void rnet_session_pump(RNetSession *s);
 

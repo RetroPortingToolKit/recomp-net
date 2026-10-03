@@ -2509,6 +2509,113 @@ fail:
 #endif
 }
 
+/* Tear down whatever transport the session had, so an adopted agent starts
+ * from a clean slate. */
+static void session_ice_reset_transport(RNetSession *s)
+{
+    int i;
+    if (s->ice != NULL)
+    {
+        rnet_ice_agent_destroy(s->ice);
+        s->ice = NULL;
+    }
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        rnet_ice_agent_destroy(s->ice_hub[i]);
+        s->ice_hub[i] = NULL;
+    }
+    s->ice_hub_mask = 0;
+    rnet_transport_shutdown(&s->transport);
+    rnet_transport_init(&s->transport);
+}
+
+int rnet_session_start_ice_hub_adopt(RNetSession *s, const RNetIceAdoptSeat *seats, int n)
+{
+#if !defined(RNET_ENABLE_ICE)
+    (void)s;
+    (void)seats;
+    (void)n;
+    return -1;
+#else
+    void *ctx[RNET_MAX_SLOTS];
+    rnet_u32 mask = 0;
+    int i;
+
+    if ((s == NULL) || (seats == NULL) || n < 1 || n >= RNET_MAX_SLOTS)
+    {
+        return -1;
+    }
+    /* Validate everything before taking anything: on -1 the caller still owns
+     * every agent. The mask is built only from agents that are COMPLETED -- a
+     * seat that is not connected fails the start instead of shrinking the room. */
+    for (i = 0; i < n; ++i)
+    {
+        const int slot = seats[i].slot;
+        if (seats[i].agent == NULL || slot < 1 || slot >= RNET_MAX_SLOTS ||
+            (mask & (1u << slot)) != 0u ||
+            rnet_ice_agent_state(seats[i].agent) != RNET_ICE_STATE_COMPLETED)
+        {
+            return -1;
+        }
+        mask |= (1u << slot);
+    }
+    memset(ctx, 0, sizeof(ctx));
+    session_ice_reset_transport(s);
+    for (i = 0; i < n; ++i)
+    {
+        const int slot = seats[i].slot;
+        s->ice_hub[slot] = seats[i].agent;
+        s->ice_hub_bridge[slot].s = s;
+        s->ice_hub_bridge[slot].slot = slot;
+        rnet_ice_agent_set_emit(seats[i].agent, ice_hub_emit_bridge, &s->ice_hub_bridge[slot]);
+        rnet_ice_agent_freeze(seats[i].agent);
+        ctx[slot] = seats[i].agent;
+    }
+    if (rnet_transport_start_ice_hub(&s->transport, ice_send_bridge, ice_recv_bridge, ctx) != 0)
+    {
+        /* Not reachable for a non-empty ctx; still, hand ownership back. */
+        for (i = 0; i < n; ++i)
+            s->ice_hub[seats[i].slot] = NULL;
+        return -1;
+    }
+    s->ice_hub_mask = mask;
+    /* Dead-path timers measure from adoption, not from the waiting room. */
+    s->ice_attempt_ms = session_now(s);
+    s->ice_completed_ms = 0;
+    s->last_peer_rx_ms = 0ULL;
+    s->phase = RNET_PHASE_IDLE;
+    return 0;
+#endif
+}
+
+int rnet_session_adopt_ice_agent(RNetSession *s, RNetIceAgent *agent)
+{
+#if !defined(RNET_ENABLE_ICE)
+    (void)s;
+    (void)agent;
+    return -1;
+#else
+    if ((s == NULL) || (agent == NULL) ||
+        rnet_ice_agent_state(agent) != RNET_ICE_STATE_COMPLETED)
+    {
+        return -1;
+    }
+    session_ice_reset_transport(s);
+    s->ice = agent;
+    rnet_ice_agent_set_emit(agent, ice_emit_bridge, s);
+    rnet_ice_agent_freeze(agent);
+    s->transport.mode = RNET_TRANSPORT_ICE;
+    s->transport.ice_send = ice_send_bridge;
+    s->transport.ice_recv = ice_recv_bridge;
+    s->transport.ice_ctx = agent;
+    s->ice_attempt_ms = session_now(s);
+    s->ice_completed_ms = 0;
+    s->last_peer_rx_ms = 0ULL;
+    s->phase = RNET_PHASE_IDLE;
+    return 0;
+#endif
+}
+
 #if defined(RNET_ENABLE_ICE)
 /* After STUN/host ICE fails or stalls, one automatic gather with force_relay
  * when TURN credentials are present. Opt out: RNET_ICE_NO_RELAY_FALLBACK=1.
