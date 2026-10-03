@@ -27,7 +27,7 @@ int rnet_ih_set_neutral(RNetInputHist *h, int slot, const RNetRbFrame *neutral)
     h->neutral[slot].buttons = neutral->buttons;
     h->neutral[slot].stick_x = neutral->stick_x;
     h->neutral[slot].stick_y = neutral->stick_y;
-    h->neutral[slot].analog = neutral->analog ? 1u : 0u;
+    h->neutral[slot].analog = neutral->analog;
     return 1;
 }
 
@@ -97,7 +97,7 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
             invented.buttons = prev.buttons;
             invented.stick_x = prev.stick_x;
             invented.stick_y = prev.stick_y;
-            invented.analog = prev.analog ? 1u : 0u;
+            invented.analog = prev.analog;
             break;
         }
     }
