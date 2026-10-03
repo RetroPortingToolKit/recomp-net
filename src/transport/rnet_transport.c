@@ -36,6 +36,8 @@ void rnet_transport_shutdown(RNetTransport *t)
     t->pending_peer_known = 0;
     t->accept_first_peer = 0;
     t->hub_mode = 0;
+    memset(t->hub_ice_ctx, 0, sizeof(t->hub_ice_ctx));
+    t->hub_rr = 0;
     memset(t->hub_slot_known, 0, sizeof(t->hub_slot_known));
     memset(t->hub_slot_addr, 0, sizeof(t->hub_slot_addr));
     rnet_netsim_destroy(t->netsim);
@@ -123,6 +125,40 @@ int rnet_transport_start_lan(RNetTransport *t, const char *bind_hostport, const 
         t->peer_known = 0;
         t->accept_first_peer = 1;
     }
+    return 0;
+}
+
+int rnet_transport_start_ice_hub(RNetTransport *t,
+                                 int (*send_fn)(void *, const rnet_u8 *, size_t),
+                                 int (*recv_fn)(void *, rnet_u8 *, size_t, size_t *),
+                                 void *const ctx[RNET_MAX_SLOTS])
+{
+    int i;
+    int any = 0;
+
+    if (t == NULL || send_fn == NULL || recv_fn == NULL || ctx == NULL)
+    {
+        return -1;
+    }
+    rnet_transport_shutdown(t);
+    for (i = 1; i < RNET_MAX_SLOTS; ++i)
+    {
+        t->hub_ice_ctx[i] = ctx[i];
+        if (ctx[i] != NULL)
+        {
+            any = 1;
+        }
+    }
+    if (!any)
+    {
+        return -1;
+    }
+    t->mode = RNET_TRANSPORT_ICE_HUB;
+    t->ice_send = send_fn;
+    t->ice_recv = recv_fn;
+    t->hub_mode = 1;
+    t->peer_known = 0;
+    t->accept_first_peer = 0;
     return 0;
 }
 
@@ -247,6 +283,32 @@ int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len)
         }
         return rnet_os_sendto(t->sock, buf, len, &t->peer);
     }
+    if (t->mode == RNET_TRANSPORT_ICE_HUB)
+    {
+        int i;
+        int sent = 0;
+        int any = 0;
+
+        if (t->ice_send == NULL)
+        {
+            return -1;
+        }
+        for (i = 1; i < RNET_MAX_SLOTS; ++i)
+        {
+            int r;
+            if (t->hub_ice_ctx[i] == NULL)
+            {
+                continue;
+            }
+            r = t->ice_send(t->hub_ice_ctx[i], buf, len);
+            if (r >= 0)
+            {
+                sent = r;
+                any = 1;
+            }
+        }
+        return any ? sent : 0;
+    }
     if (t->mode == RNET_TRANSPORT_ICE)
     {
         if (t->ice_send == NULL)
@@ -302,6 +364,49 @@ static int transport_recv_raw(RNetTransport *t, rnet_u8 *buf, size_t cap,
             }
         }
     }
+    if (t->mode == RNET_TRANSPORT_ICE_HUB)
+    {
+        int k;
+
+        if (t->ice_recv == NULL)
+        {
+            return -1;
+        }
+        /* Round-robin over seats so one chatty guest cannot starve the rest.
+         * The source seat is the agent the datagram arrived on; the packet
+         * body is never consulted, so a guest cannot claim another seat. */
+        for (k = 0; k < RNET_MAX_SLOTS; ++k)
+        {
+            int i = (t->hub_rr + k) % RNET_MAX_SLOTS;
+            size_t out_len = 0;
+            int j;
+
+            if (i == 0 || t->hub_ice_ctx[i] == NULL)
+            {
+                continue;
+            }
+            while (t->ice_recv(t->hub_ice_ctx[i], buf, cap, &out_len) == 0)
+            {
+                if (out_len < RNET_HUB_MIN_PACKET)
+                {
+                    continue;
+                }
+                t->hub_slot_known[i] = 1;
+                t->peer_known = 1;
+                for (j = 1; j < RNET_MAX_SLOTS; ++j)
+                {
+                    if (j == i || t->hub_ice_ctx[j] == NULL)
+                    {
+                        continue;
+                    }
+                    (void)t->ice_send(t->hub_ice_ctx[j], buf, out_len);
+                }
+                t->hub_rr = (i + 1) % RNET_MAX_SLOTS;
+                return (int)out_len;
+            }
+        }
+        return 0;
+    }
     if (t->mode == RNET_TRANSPORT_ICE)
     {
         size_t out_len = 0;
@@ -341,6 +446,11 @@ int rnet_transport_recv(RNetTransport *t, rnet_u8 *buf, size_t cap)
     if ((t == NULL) || (buf == NULL) || (cap == 0))
     {
         return -1;
+    }
+    if (t->mode == RNET_TRANSPORT_ICE_HUB)
+    {
+        /* Link simulator is not applied to the ICE hub. */
+        return transport_recv_raw(t, buf, cap, &src, &have_src);
     }
     if (!t->netsim_probed)
     {

@@ -79,12 +79,22 @@ typedef struct RNetStateRx
 
 #define RNET_STATE_TAKEN_TX RNET_MAX_SLOTS
 
+typedef struct RNetIceHubBridge
+{
+    struct RNetSession *s;
+    int slot;
+} RNetIceHubBridge;
+
 struct RNetSession
 {
     RNetConfig cfg;
     RNetHostVTable host;
     RNetTransport transport;
     RNetIceAgent *ice;
+    /* ICE hub (host-as-relay): one agent per guest seat in ice_hub_mask. */
+    RNetIceAgent *ice_hub[RNET_MAX_SLOTS];
+    RNetIceHubBridge ice_hub_bridge[RNET_MAX_SLOTS];
+    rnet_u32 ice_hub_mask;
     RNetSessionPhase phase;
     RNetInputRing local_ring;
     RNetInputRing remote_rings[RNET_MAX_SLOTS];
@@ -387,6 +397,17 @@ static void ice_emit_bridge(const RNetSignal *msg, void *user)
     if ((s != NULL) && (s->host.on_signal != NULL) && (msg != NULL))
     {
         s->host.on_signal(msg, s->host.ctx);
+    }
+}
+
+static void ice_hub_emit_bridge(const RNetSignal *msg, void *user)
+{
+    RNetIceHubBridge *b = (RNetIceHubBridge *)user;
+    if ((b != NULL) && (b->s != NULL) && (b->s->host.on_signal != NULL) && (msg != NULL))
+    {
+        RNetSignal out = *msg;
+        out.peer_slot = (rnet_u8)b->slot;
+        b->s->host.on_signal(&out, b->s->host.ctx);
     }
 }
 
@@ -1107,7 +1128,7 @@ static void state_probe_clear(RNetSession *s)
 
 static int state_transport_is_ice(const RNetSession *s)
 {
-    return s != NULL && s->transport.mode == RNET_TRANSPORT_ICE;
+    return s != NULL && (s->transport.mode == RNET_TRANSPORT_ICE || s->transport.mode == RNET_TRANSPORT_ICE_HUB);
 }
 
 static void state_pacing_reset(RNetSession *s)
@@ -2316,6 +2337,14 @@ void rnet_session_destroy(RNetSession *s)
     rnet_transport_shutdown(&s->transport);
     rnet_ice_agent_destroy(s->ice);
     s->ice = NULL;
+    {
+        int i;
+        for (i = 0; i < RNET_MAX_SLOTS; ++i)
+        {
+            rnet_ice_agent_destroy(s->ice_hub[i]);
+            s->ice_hub[i] = NULL;
+        }
+    }
     free(s);
 }
 
@@ -2389,6 +2418,94 @@ int rnet_session_start_ice(RNetSession *s, const RNetIceConfig *ice)
     /* Stay IDLE until ICE completes; pump will promote to LINKING. */
     s->phase = RNET_PHASE_IDLE;
     return 0;
+#endif
+}
+
+int rnet_session_start_ice_hub(RNetSession *s, const RNetIceConfig *ice, rnet_u32 guest_slot_mask)
+{
+#if !defined(RNET_ENABLE_ICE)
+    (void)s;
+    (void)ice;
+    (void)guest_slot_mask;
+    return -1;
+#else
+    RNetIceConfig local;
+    void *ctx[RNET_MAX_SLOTS];
+    int i;
+    int any = 0;
+
+    if ((s == NULL) || (ice == NULL))
+    {
+        return -1;
+    }
+    /* Guest seats are 1..RNET_MAX_SLOTS-1; bit 0 and out-of-range bits invalid. */
+    if ((guest_slot_mask & 1u) != 0u || (guest_slot_mask >> RNET_MAX_SLOTS) != 0u ||
+        guest_slot_mask == 0u)
+    {
+        return -1;
+    }
+    local = *ice;
+    local.bind_port = 0;   /* never a fixed port: N agents on one port collide */
+    local.controlling = 0; /* host answers; guests offer */
+
+    if (s->ice != NULL)
+    {
+        rnet_ice_agent_destroy(s->ice);
+        s->ice = NULL;
+    }
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        rnet_ice_agent_destroy(s->ice_hub[i]);
+        s->ice_hub[i] = NULL;
+        ctx[i] = NULL;
+    }
+    s->ice_hub_mask = 0;
+    rnet_transport_shutdown(&s->transport);
+    rnet_transport_init(&s->transport);
+
+    for (i = 1; i < RNET_MAX_SLOTS; ++i)
+    {
+        if ((guest_slot_mask & (1u << i)) == 0u)
+        {
+            continue;
+        }
+        s->ice_hub_bridge[i].s = s;
+        s->ice_hub_bridge[i].slot = i;
+        s->ice_hub[i] = rnet_ice_agent_create(&local, ice_hub_emit_bridge, &s->ice_hub_bridge[i]);
+        if (s->ice_hub[i] == NULL)
+        {
+            goto fail;
+        }
+        ctx[i] = s->ice_hub[i];
+        any = 1;
+    }
+    if (!any || rnet_transport_start_ice_hub(&s->transport, ice_send_bridge, ice_recv_bridge, ctx) != 0)
+    {
+        goto fail;
+    }
+    s->ice_hub_mask = guest_slot_mask;
+    s->ice_attempt_ms = session_now(s);
+    s->ice_completed_ms = 0;
+    for (i = 1; i < RNET_MAX_SLOTS; ++i)
+    {
+        /* Answerer: records gather_pending; gathers on the guest's offer. */
+        if (s->ice_hub[i] != NULL && rnet_ice_agent_start_gathering(s->ice_hub[i]) != 0)
+        {
+            goto fail;
+        }
+    }
+    s->phase = RNET_PHASE_IDLE;
+    return 0;
+fail:
+    for (i = 0; i < RNET_MAX_SLOTS; ++i)
+    {
+        rnet_ice_agent_destroy(s->ice_hub[i]);
+        s->ice_hub[i] = NULL;
+    }
+    s->ice_hub_mask = 0;
+    rnet_transport_shutdown(&s->transport);
+    rnet_transport_init(&s->transport);
+    return -1;
 #endif
 }
 
@@ -2508,6 +2625,34 @@ void rnet_session_pump(RNetSession *s)
     if (s == NULL)
     {
         return;
+    }
+    if (s->ice_hub_mask != 0u)
+    {
+        int i;
+        int all_completed = 1;
+        for (i = 1; i < RNET_MAX_SLOTS; ++i)
+        {
+            if (s->ice_hub[i] == NULL)
+            {
+                continue;
+            }
+            rnet_ice_agent_poll(s->ice_hub[i]);
+            if (rnet_ice_agent_state(s->ice_hub[i]) == RNET_ICE_STATE_COMPLETED)
+            {
+                /* Negotiation is over: no later signal may rebuild this seat. */
+                rnet_ice_agent_freeze(s->ice_hub[i]);
+            }
+            else
+            {
+                all_completed = 0;
+            }
+        }
+        if (s->phase == RNET_PHASE_IDLE && all_completed)
+        {
+            s->phase = RNET_PHASE_LINKING;
+            if (s->ice_completed_ms == 0ULL)
+                s->ice_completed_ms = session_now(s);
+        }
     }
     if (s->ice != NULL)
     {
@@ -3066,6 +3211,17 @@ void rnet_session_push_signal(RNetSession *s, const RNetSignal *msg)
     rnet_ice_agent_push_signal(s->ice, msg);
 }
 
+int rnet_session_push_signal_from(RNetSession *s, int slot, const RNetSignal *sig)
+{
+    if ((s == NULL) || (sig == NULL) || slot < 1 || slot >= RNET_MAX_SLOTS ||
+        s->ice_hub[slot] == NULL)
+    {
+        return -1;
+    }
+    rnet_ice_agent_push_signal(s->ice_hub[slot], sig);
+    return 0;
+}
+
 rnet_u8 rnet_session_committed_delay(const RNetSession *s)
 {
     return (s != NULL) ? s->delay : 0;
@@ -3131,7 +3287,30 @@ int rnet_session_is_running(const RNetSession *s)
 
 RNetIceState rnet_session_ice_state(const RNetSession *s)
 {
-    if ((s == NULL) || (s->ice == NULL))
+    if (s == NULL)
+    {
+        return RNET_ICE_STATE_IDLE;
+    }
+    if (s->ice_hub_mask != 0u)
+    {
+        /* Minimum over seats (enum order IDLE < ... < COMPLETED); FAILED is
+         * the highest value but dominates, so report it if any seat failed. */
+        int i;
+        RNetIceState min = RNET_ICE_STATE_COMPLETED;
+        for (i = 1; i < RNET_MAX_SLOTS; ++i)
+        {
+            RNetIceState st;
+            if (s->ice_hub[i] == NULL)
+                continue;
+            st = rnet_ice_agent_state(s->ice_hub[i]);
+            if (st == RNET_ICE_STATE_FAILED)
+                return RNET_ICE_STATE_FAILED;
+            if (st < min)
+                min = st;
+        }
+        return min;
+    }
+    if (s->ice == NULL)
     {
         return RNET_ICE_STATE_IDLE;
     }
@@ -3238,7 +3417,20 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     out->remote_lead = have_remote ? (int)highest_remote - (int)s->sim_tick : 0;
 
 #if defined(RNET_ENABLE_ICE)
-    if (s->ice != NULL) {
+    if (s->ice_hub_mask != 0u) {
+        int i;
+        rnet_u32 drops = 0;
+        for (i = 1; i < RNET_MAX_SLOTS; ++i)
+            drops += rnet_ice_agent_recv_drops(s->ice_hub[i]);
+        out->ice_recv_drops = drops;
+        if (out->ice_state == RNET_ICE_STATE_FAILED)
+            snprintf(out->ice_path, sizeof(out->ice_path), "failed");
+        else if (out->ice_state == RNET_ICE_STATE_COMPLETED)
+            snprintf(out->ice_path, sizeof(out->ice_path), "hub");
+        else
+            snprintf(out->ice_path, sizeof(out->ice_path), "pending");
+    } else if (s->ice != NULL) {
+        out->ice_recv_drops = rnet_ice_agent_recv_drops(s->ice);
         rnet_ice_agent_selected_info(s->ice, out->ice_path, sizeof(out->ice_path),
                                      out->ice_local, sizeof(out->ice_local),
                                      out->ice_remote, sizeof(out->ice_remote));

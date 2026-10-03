@@ -269,6 +269,16 @@ if(RNET_BUILD_TESTS)
   target_include_directories(host_relay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME host_relay_test COMMAND host_relay_test)
 
+  if(RNET_ENABLE_ICE)
+    # Host-as-relay over ICE: host + two guests through real libjuice agents
+    # on loopback (no STUN). Single process is deliberate; see the test header.
+    add_executable(ice_hub_test tests/ice_hub_test.c)
+    target_link_libraries(ice_hub_test PRIVATE recomp_net)
+    target_include_directories(ice_hub_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ice_hub_test COMMAND ice_hub_test)
+    set_tests_properties(ice_hub_test PROPERTIES TIMEOUT 120)
+  endif()
+
   add_executable(lan_chat_test tests/lan_chat_test.c)
   target_link_libraries(lan_chat_test PRIVATE recomp_net)
   find_package(Threads REQUIRED)

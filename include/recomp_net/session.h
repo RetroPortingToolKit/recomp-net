@@ -48,6 +48,16 @@ int rnet_session_start_lan_hub(RNetSession *s, const char *bind_hostport);
  */
 int rnet_session_start_ice(RNetSession *s, const RNetIceConfig *ice);
 
+/*
+ * Host-as-relay over ICE: one libjuice agent per guest seat (host answers,
+ * guests offer) and the host fans each guest's datagrams out to the other
+ * guests. guest_slot_mask bit i (1..RNET_MAX_SLOTS-1) = seat i gets an agent.
+ * ice->bind_port is ignored (always 0); there is no TURN/force-relay fallback
+ * in hub mode. on_signal delivers RNetSignal with peer_slot = the seat; feed
+ * guest signals back with rnet_session_push_signal_from. Returns 0 / -1.
+ */
+int rnet_session_start_ice_hub(RNetSession *s, const RNetIceConfig *ice, rnet_u32 guest_slot_mask);
+
 /* Recv datagrams, poll ICE, send pending INPUT, drive bootstrap. */
 void rnet_session_pump(RNetSession *s);
 
@@ -124,6 +134,8 @@ rnet_u32 rnet_session_disconnected_peers(const RNetSession *s, rnet_u64 timeout_
 
 /* Deliver an inbound signaling message from the lobby. */
 void rnet_session_push_signal(RNetSession *s, const RNetSignal *msg);
+/* Hub mode: route an inbound signal to seat `slot`'s agent. 0 ok, -1 if no such agent. */
+int rnet_session_push_signal_from(RNetSession *s, int slot, const RNetSignal *sig);
 
 rnet_u8 rnet_session_committed_delay(const RNetSession *s);
 /*
@@ -184,6 +196,7 @@ typedef struct RNetSessionStats
     char ice_path[16];   /* host|srflx|prflx|relay|lan|pending|failed|unknown */
     char ice_local[96];
     char ice_remote[96];
+    rnet_u32 ice_recv_drops; /* datagrams lost to ICE recv-queue overflow (all agents) */
     int state_busy;
     rnet_u8 state_op;
     int state_sender;          /* 1 while local peer is the STATE sender */

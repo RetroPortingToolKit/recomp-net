@@ -2595,6 +2595,7 @@ static void handle_server_json(const char *json)
             memset(&sig, 0, sizeof(sig));
             sig.type = (RNetSignalType)t;
             sig.flag = (rnet_u8)flag;
+            sig.peer_slot = 0xFF;
             snprintf(sig.text, sizeof(sig.text), "%s", text);
             if (g_lc.xfer && from[0] && !strcmp(from, g_lc.xfer_peer)) {
                 rnet_ice_xfer_push_signal(g_lc.xfer, &sig);

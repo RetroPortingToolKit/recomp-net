@@ -36,6 +36,9 @@ typedef struct RNetSignal
     RNetSignalType type;
     /* For SET_CONTROLLING: non-zero = controlling (gather-order hint; libjuice has no set_role API). */
     rnet_u8 flag;
+    /* Host ICE hub: guest seat this signal is from/for. 0xFF = unaddressed
+     * (legacy single-peer sessions). */
+    rnet_u8 peer_slot;
     /* NUL-terminated SDP or candidate line (truncated if longer). */
     char text[2048];
 } RNetSignal;
