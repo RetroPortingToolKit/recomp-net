@@ -24,9 +24,10 @@
  *       count by about B (positive control: the burst really crossed the
  *       fan-out) and guest 1's by far less than B;
  *   (c) a late duplicate REMOTE_SDP for a seat, pushed to the host's agent for
- *       that seat, does not tear down the link: states stay
- *       COMPLETED and an ack in the other direction (guest 2 -> guest 1)
- *       still arrives.
+ *       that seat AND the host's answer pushed again to that guest's 1:1
+ *       agent (both already COMPLETED), does not tear down the link: states
+ *       stay COMPLETED and acks in both directions between the guests still
+ *       arrive (the 1:1 agent freezes at COMPLETED just as the hub's does).
  * Scenario D (4-seat room, guest seat 3 is in the mask and never signals):
  *   the host's min-state never becomes COMPLETED, while guests 1 and 2 still
  *   complete and still exchange a datagram.

@@ -37,6 +37,9 @@ set(RNET_CORE_SOURCES
   # guest's probe, and the waiting-room orchestration every lobby client
   # drives (recomp_net/host_relay.h). One copy, for recomp-ui and the engines.
   src/nat/rnet_host_relay.c
+  # Host relay over ICE: the waiting-room agents (recomp_net/host_ice.h).
+  src/nat/rnet_host_ice.c
+  src/nat/rnet_sig_hold.c
   src/lobby/rnet_ice_rtt.c
   src/lobby/rnet_ice_xfer.c
   src/transport/rnet_netsim.c
@@ -277,6 +280,24 @@ if(RNET_BUILD_TESTS)
     target_include_directories(ice_hub_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ice_hub_test COMMAND ice_hub_test)
     set_tests_properties(ice_hub_test PROPERTIES TIMEOUT 120)
+
+    # Waiting-room agents (host_ice.h) and the handover into sessions.
+    add_executable(host_ice_test tests/host_ice_test.c)
+    target_link_libraries(host_ice_test PRIVATE recomp_net)
+    target_include_directories(host_ice_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME host_ice_test COMMAND host_ice_test)
+    set_tests_properties(host_ice_test PROPERTIES TIMEOUT 180)
+
+    # The real lobby client (singleton, so this process is the host) driving
+    # waiting-room agents through a launch into adopting sessions.
+    if(UNIX)
+      add_executable(lobby_ice_launch_test tests/lobby_ice_launch_test.c)
+      target_link_libraries(lobby_ice_launch_test PRIVATE recomp_net)
+      target_include_directories(lobby_ice_launch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      target_compile_definitions(lobby_ice_launch_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+      add_test(NAME lobby_ice_launch_test COMMAND lobby_ice_launch_test)
+      set_tests_properties(lobby_ice_launch_test PROPERTIES TIMEOUT 120)
+    endif()
   endif()
 
   add_executable(lan_chat_test tests/lan_chat_test.c)
@@ -378,7 +399,9 @@ if(RNET_BUILD_TESTS)
       src/chat/rnet_chat_report.c
       src/platform/rnet_platform.c
       src/platform/rnet_stun.c
-      src/nat/rnet_host_relay.c)
+      src/nat/rnet_host_relay.c
+      src/nat/rnet_host_ice.c
+      src/nat/rnet_sig_hold.c)
     target_include_directories(lobby_client_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_client_test PRIVATE
@@ -395,7 +418,9 @@ if(RNET_BUILD_TESTS)
       src/chat/rnet_chat_report.c
       src/platform/rnet_platform.c
       src/platform/rnet_stun.c
-      src/nat/rnet_host_relay.c)
+      src/nat/rnet_host_relay.c
+      src/nat/rnet_host_ice.c
+      src/nat/rnet_sig_hold.c)
     target_include_directories(lobby_ws_backlog_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_ws_backlog_test PRIVATE

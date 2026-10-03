@@ -227,6 +227,12 @@ typedef struct RNetLobbyMatchCaps {
      * it; the server falls back to its relay unless every guest proved the
      * path (recomp_net/host_relay.h). Guests read it to know the room asks. */
     int  relay_host;
+    /* 0/1 -- match_caps.relay_via = "ice": with relay_host, the host carries
+     * the match over ICE agents the waiting room connects (one per guest;
+     * recomp_net/host_ice.h) instead of a UDP port it advertises. Published by
+     * a host whose rnet_lobby_relay_via_ice() is on and whose build has ICE;
+     * read by everyone. */
+    int  relay_via_ice;
     int  rollback;         /* 0/1 — session mode; lobby default ON */
     /* The host's required mod plan, one row per PACKAGE.
      *
@@ -374,6 +380,14 @@ typedef struct RNetLobbyJoinInfo {
      * guest (2 seats) or hubs (3+). 0 on an SFU launch and from a server that
      * predates the host relay. */
     int      transport_host;
+    /* The launch said transport "host" AND relay_via "ice": the match rides the
+     * ICE agents the waiting room already connected. host_endpoint is empty,
+     * bind_hostport / peer_hostport are not to be used (the transport_host UDP
+     * path must NOT be taken). Obtain the agents with rnet_lobby_ice_take_hub
+     * (host) or rnet_lobby_ice_take_guest_agent (guest) and give them to the
+     * session (rnet_session_start_ice_hub_adopt / rnet_session_adopt_ice_agent).
+     * transport_host is also 1 in this case; test transport_ice_hub first. */
+    int      transport_ice_hub;
     /* The launch said the host runs the match from the gallery (session slot
      * 0, pad muted, players at lobby seat + 1). 0 from a server that predates
      * it and on every launch where the host holds a player seat. */
@@ -562,6 +576,51 @@ const RNetLobbyJoinInfo *rnet_lobby_join_info(void);
  */
 void rnet_lobby_set_relay_host_pref(int on);
 int  rnet_lobby_relay_host_pref(void);
+/*
+ * Host relay over ICE (recomp_net/host_ice.h). The host's preference, default
+ * ON: with relay_host, publish match_caps.relay_via = "ice" (only when this
+ * build has ICE; otherwise the legacy advertised-port relay is used). In that
+ * room the host holds NO port (no set_host_endpoint, no UPnP / NAT-PMP / STUN):
+ * every seated guest proves the path with an ICE agent pair and reports
+ * path_report direct. Also sent as "ice_relay": true in automatch_queue.
+ */
+void rnet_lobby_set_relay_via_ice(int on);
+int  rnet_lobby_relay_via_ice(void);
+/* Live state of the waiting-room agents (RNetHostIceStatus, host_ice.h).
+ * Returns 1 when the room runs them, 0 when idle. */
+struct RNetHostIceStatus;
+int  rnet_lobby_host_ice_status(struct RNetHostIceStatus *out);
+
+/*
+ * Launch handover for transport_ice_hub (see RNetLobbyJoinInfo). The agents
+ * are captured by the client when `launch` arrives, and are the engine's to
+ * take once -- BEFORE rnet_lobby_clear_launch_pending(), though an untaken
+ * bundle is kept for 60 s, until the next launch, or until leave/disconnect.
+ *
+ * HOST: fills out[0..n) and returns n >= 1; ownership of each agent passes to
+ * the caller, who must pass it to rnet_session_start_ice_hub_adopt with the
+ * SESSION slot it maps lobby_slot to (this library does not know the engine's
+ * slot mapping, host_spectates offset, etc.). Returns -1 when no handover is
+ * pending or max is too small; see rnet_lobby_ice_launch_error.
+ * GUEST: returns the one agent connected to the host (ownership to the
+ * caller: rnet_session_adopt_ice_agent), or NULL.
+ * A launch in which any seated guest (or the guest's own link to the host) is
+ * not COMPLETED is refused by the client itself: launch_pending stays 0,
+ * join.last_error = "ice_not_connected" and rnet_lobby_ice_launch_error()
+ * names the seat -- never a silently smaller room.
+ */
+typedef struct RNetLobbyIceSeat {
+    int  lobby_slot;                       /* the guest's seat in the lobby */
+    char player_id[RNET_LOBBY_ID_LEN];
+    struct RNetIceAgent *agent;            /* COMPLETED, opaque, owned by caller */
+} RNetLobbyIceSeat;
+int  rnet_lobby_ice_take_hub(RNetLobbyIceSeat *out, int max);
+struct RNetIceAgent *rnet_lobby_ice_take_guest_agent(void);
+/* Why the last ICE launch was refused or a take failed ("" when none). */
+const char *rnet_lobby_ice_launch_error(void);
+/* Destroy an untaken bundle now (the engine will not start this match). */
+void rnet_lobby_ice_discard(void);
+
 /* Live state for the waiting room (see RNetHostRelayStatus). Returns 1 when
  * the orchestration is doing anything (host or guest role), 0 when idle. */
 struct RNetHostRelayStatus;
