@@ -379,6 +379,11 @@ typedef struct RNetLobbyJoinInfo {
      * it and on every launch where the host holds a player seat. */
     int      host_spectates;
     char     last_error[64]; /* need_password | bad_password | … */
+    /* The launch said transport "ice": the host relay could not carry the
+     * match, so the two players connect peer-to-peer with ICE (STUN, then
+     * TURN). Neither the host's port nor a server relay is involved, so
+     * force_input_relay stays 0. 0 on every other launch. */
+    int      transport_ice;
 } RNetLobbyJoinInfo;
 
 /* RNET_LOBBY_URL (or <legacy_env_prefix>LOBBY_URL), else

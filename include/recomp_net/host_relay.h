@@ -8,8 +8,9 @@
  * advertises a reachable UDP endpoint with set_host_endpoint; each guest
  * probes it and reports path_report direct|fail; at start the server
  * launches transport "host" only when every guest's report is a fresh
- * "direct", otherwise its relay carries the match, so a match always
- * connects. In the match the host runs rnet_session_start_lan_hub (3+
+ * "direct". Otherwise a two-player room with no spectators launches
+ * transport "ice" (peer-to-peer ICE with STUN, then TURN), so no port has to
+ * be reachable; the server's own UDP relay is retired. In a host launch the host runs rnet_session_start_lan_hub (3+
  * seats) or accepts the one guest (2 seats); guests dial host_endpoint.
  *
  * This file is the client half, in three layers, all pump-driven from the

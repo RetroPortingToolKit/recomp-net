@@ -972,6 +972,49 @@ static void case_launch_transport_survives_a_lobby_update(void)
 }
 
 
+/* The server's fallback when the host relay cannot carry a two-player match:
+ * transport "ice". Two players behind one NAT advertise the same public
+ * address, which the relay heuristic (both endpoints equal) would read as a
+ * server relay and send both to dial it; the launch's word wins. */
+static void case_ice_launch_is_never_a_relay(void)
+{
+    RNetLobbyJoinInfo out;
+
+    printf("  ice launch is never a relay\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    snprintf(g_lc.my_bind, sizeof(g_lc.my_bind), "%s", "0.0.0.0:7777");
+    g_lc.connected = 1;
+
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":10,"
+        "\"host_endpoint\":\"203.0.113.5:7777\","
+        "\"guest_endpoint\":\"203.0.113.5:7777\","
+        "\"transport\":\"ice\",\"player_count\":2,\"max_slots\":2,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.transport_ice == 1, "the launch said ice");
+    ck(g_lc.join.transport_host == 0, "not the host relay");
+    ck(g_lc.join.force_input_relay == 0,
+       "equal endpoints behind one NAT are not a server relay");
+    ck(strcmp(g_lc.join.bind_hostport, "0.0.0.0:0") != 0,
+       "no ephemeral relay bind");
+    ck(rnet_lobby_try_fill_launch(&out) == 1, "the launch fills");
+    ck(out.force_input_relay == 0 && out.transport_host == 0,
+       "so the session resolves to ICE");
+
+    /* The next launch restates it. */
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":11,"
+        "\"host_endpoint\":\"203.0.113.5:7777\",\"guest_endpoint\":\"198.51.100.7:7777\","
+        "\"transport\":\"host\",\"relay_host_slot\":0,\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.transport_ice == 0 && g_lc.join.transport_host == 1,
+       "a host-relay launch clears ice");
+}
+
 /* ---- what the lift added ------------------------------------------------ */
 
 /* A stand-in engine codec: three keys in ext, one of them free text. */
@@ -1392,6 +1435,7 @@ int main(void)
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
+    case_ice_launch_is_never_a_relay();
     case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();

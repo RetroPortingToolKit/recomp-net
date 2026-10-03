@@ -1820,7 +1820,8 @@ static void fill_peer_bind_from_join(void)
 {
     RNetLobbyJoinInfo *j = &g_lc.join;
     const char *port;
-    const int force_relay = !j->transport_host && using_server_input_relay(j);
+    const int force_relay =
+        !j->transport_host && !j->transport_ice && using_server_input_relay(j);
     memset(j->bind_hostport, 0, sizeof(j->bind_hostport));
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
     if (force_relay) {
@@ -2427,6 +2428,9 @@ static void handle_server_json(const char *json)
         transport[0] = '\0';
         json_get_str(json, "transport", transport, sizeof(transport));
         g_lc.join.transport_host = strcmp(transport, "host") == 0 ? 1 : 0;
+        /* "ice": the server's fallback when the host relay cannot carry a
+         * two-player match (WS_LOBBY.md "Host relay"). */
+        g_lc.join.transport_ice = strcmp(transport, "ice") == 0 ? 1 : 0;
         rnet_host_relay_release_port(g_host_relay);
         g_lc.join.player_count = json_get_int(json, "player_count", g_lc.join.player_count);
         g_lc.join.max_slots = json_get_int(json, "max_slots", g_lc.join.max_slots);
@@ -2460,8 +2464,10 @@ static void handle_server_json(const char *json)
          * Restated on every launch, both ways, so a relayed match cannot leave
          * a 1 behind for the next p2p one. */
         g_lc.join.force_input_relay =
-            !g_lc.join.transport_host && using_server_input_relay(&g_lc.join) ? 1 : 0;
-        if (g_lc.join.transport_host) g_lc.match_caps.force_input_relay = 0;
+            !g_lc.join.transport_host && !g_lc.join.transport_ice &&
+            using_server_input_relay(&g_lc.join) ? 1 : 0;
+        if (g_lc.join.transport_host || g_lc.join.transport_ice)
+            g_lc.match_caps.force_input_relay = 0;
         fill_peer_bind_from_join();
         parse_slots_array(json);
         /* Guest must know the host. Host may leave peer empty to learn the
