@@ -312,6 +312,13 @@ if(RNET_BUILD_TESTS)
   endif()
   add_test(NAME session_state_test COMMAND session_state_test)
 
+  add_executable(session_state_multipeer_test tests/session_state_multipeer_test.c)
+  target_link_libraries(session_state_multipeer_test PRIVATE recomp_net)
+  if(UNIX)
+    target_compile_definitions(session_state_multipeer_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
+  add_test(NAME session_state_multipeer_test COMMAND session_state_multipeer_test)
+
   add_executable(state_replay_test tests/state_replay_test.c)
   target_include_directories(state_replay_test PRIVATE src)
   target_link_libraries(state_replay_test PRIVATE recomp_net)

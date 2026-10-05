@@ -24,6 +24,7 @@ extern "C" {
 #define RNET_PKT_STATE_PROBE_REPLY 12 /* guest→host: match (skip xfer) or not */
 /* GBA Multi transfer barrier (0-delay SEND exchange; not pad INPUT). */
 #define RNET_PKT_SIO_MULTI_XFER 13
+#define RNET_PKT_STATE_PROBE_DONE 14 /* host→guest: every seat matched; release parked guests */
 
 /*
  * Rollback control range (reserved, additive). Delay-sync hosts never emit or
@@ -149,6 +150,10 @@ int rnet_proto_encode_state_probe_ex(rnet_u8 *out, size_t cap, rnet_u32 magic, r
 int rnet_proto_encode_state_probe_reply(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
                                         rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot, rnet_u8 match,
                                         rnet_u32 total_size, rnet_u32 payload_crc);
+/* Host releases matching guests only after every expected seat replied "match". */
+int rnet_proto_encode_state_probe_done(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                       rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot,
+                                       rnet_u32 total_size, rnet_u32 payload_crc);
 
 /* GBA Multi: one peer's SIOMLT_SEND for transfer seq (mGBA-style barrier).
  * `confirm_pad` u16: lo = Confirm IRQ watermark (0..2+); hi = local VBlank
