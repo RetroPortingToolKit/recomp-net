@@ -95,8 +95,10 @@ typedef struct RNetRbCorrection
 /* Opaque per-slot input row the library seals and replays. The library never
  * interprets the payload beyond the stick-replace contract view.
  * analog: host pad type (0 = digital / poll 0x41, 1 = DualShock / 0x73,
- * 2 = JogCon / 0xE3). Carried unchanged on the seal wire in
- * RNetRbWireFrame.source (was always 0). */
+ * 2 = JogCon / 0xE3, 3 = NeGcon / 0x23). The library treats it as an opaque
+ * byte: carried unchanged through input history and on the seal wire in
+ * RNetRbWireFrame.source (was always 0). The host decides what stick_x /
+ * stick_y mean for each type (e.g. NeGcon twist and L pressure). */
 typedef struct RNetRbFrame
 {
     uint32_t tick;

@@ -48,7 +48,7 @@ int main(void)
         rows[i].buttons = (rnet_u16)(0x300u + i);
         rows[i].stick_x = (rnet_s8)(20 + i);
         rows[i].stick_y = (rnet_s8)-15;
-        rows[i].source = (i == 2) ? 2u : 1u;
+        rows[i].source = (i == 2) ? 2u : (i == 0 ? 3u : 1u);
         rows[i].is_predicted = 0u;
         rows[i].is_valid = 1u;
     }
@@ -60,6 +60,8 @@ int main(void)
     expect_true(dec.rb_rows[0].buttons == 0x300u && dec.rb_rows[2].buttons == 0x302u, "rb_seal_rows payload");
     expect_true(dec.rb_rows[1].stick_x == 21 && dec.rb_rows[1].is_valid == 1u, "rb_seal_rows sticks");
     expect_true(dec.rb_rows[2].source == 2u, "rb_seal_rows preserves JogCon source");
+    expect_true(dec.rb_rows[0].source == 3u, "rb_seal_rows preserves NeGcon source");
+    expect_true(dec.rb_rows[1].source == 1u, "rb_seal_rows preserves DualShock source");
 
     /* Truncated seal rows rejected */
     expect_true(rnet_proto_decode(buf, 12u, MAGIC, &dec) != 0, "truncated packet rejected");

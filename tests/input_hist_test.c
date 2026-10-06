@@ -63,6 +63,23 @@ int main(void)
     CHECK(rnet_ih_invent_idle(&jog, 0, 30, &got) && got.analog == 2u,
           "idle prediction preserves JogCon type");
 
+    /* NeGcon (3) is just another type byte: no clamp to the 0..2 range. */
+    rnet_ih_reset(&jog, 1);
+    f.tick = 40;
+    f.analog = 3u;
+    f.stick_x = -100;
+    f.stick_y = -128;
+    f.is_valid = 1u;
+    CHECK(rnet_ih_put(&jog, 0, &f), "put NeGcon row");
+    CHECK(rnet_ih_get(&jog, 0, 40, &got) && got.analog == 3u &&
+          got.stick_x == -100 && got.stick_y == -128,
+          "history preserves NeGcon type and axes");
+    CHECK(rnet_ih_invent_hold_last(&jog, 0, 41, &got) && got.analog == 3u,
+          "hold-last preserves NeGcon type");
+    CHECK(rnet_ih_set_neutral(&jog, 0, &f), "set NeGcon neutral");
+    CHECK(rnet_ih_invent_idle(&jog, 0, 50, &got) && got.analog == 3u,
+          "idle prediction preserves NeGcon type");
+
     CHECK(rnet_ih_invent_hold_last(&h, 1, 11, &got), "invent neutral");
     CHECK(got.is_predicted && got.buttons == 0xFFFFu, "invent predicted neutral");
     CHECK(got.stick_x == 0 && got.analog == 0u, "invent sticks");

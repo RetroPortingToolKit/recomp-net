@@ -82,8 +82,8 @@ typedef struct RNetWireFrame
 
 /* Rollback seal-row wire frame: fixed 7 bytes (buttons 2 + sticks 2 + source +
  * predicted + valid), tick carried by packet row_begin + index.
- * source: host pad type — 0 digital, 1 DualShock, 2 JogCon
- * (RNetRbFrame.analog). */
+ * source: host pad type — 0 digital, 1 DualShock, 2 JogCon, 3 NeGcon
+ * (RNetRbFrame.analog), copied verbatim. */
 typedef struct RNetRbWireFrame
 {
     rnet_u16 buttons;
