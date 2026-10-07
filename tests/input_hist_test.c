@@ -56,6 +56,11 @@ int main(void)
     CHECK(rnet_ih_put(&jog, 0, &f), "put JogCon row");
     CHECK(rnet_ih_invent_hold_last(&jog, 0, 22, &got), "invent JogCon hold-last");
     CHECK(got.analog == 2u, "hold-last preserves JogCon type");
+    f.tick = 23; f.analog = 3u; f.rx = 0xC0u; f.ry = 0x20u;  /* NeGcon I / II */
+    CHECK(rnet_ih_put(&jog, 0, &f), "put NeGcon row");
+    CHECK(rnet_ih_invent_hold_last(&jog, 0, 24, &got) && got.rx == 0xC0u &&
+          got.ry == 0x20u, "hold-last keeps the rest of the pad (rx/ry)");
+    f.analog = 2u; f.rx = f.ry = 0u;
     CHECK(rnet_ih_get(&jog, 0, 22, &got) && got.analog == 2u,
           "history preserves JogCon type");
     f.analog = 2u;

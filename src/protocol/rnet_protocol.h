@@ -80,8 +80,9 @@ typedef struct RNetWireFrame
     rnet_u8 bytes[RNET_INPUT_MAX];
 } RNetWireFrame;
 
-/* Rollback seal-row wire frame: fixed 7 bytes (buttons 2 + sticks 2 + source +
- * predicted + valid), tick carried by packet row_begin + index.
+/* Rollback seal-row wire frame: fixed 9 bytes (buttons 2 + sticks 2 + source +
+ * predicted + valid + rx + ry; wire version 2), tick carried by packet
+ * row_begin + index.
  * source: host pad type — 0 digital, 1 DualShock, 2 JogCon, 3 NeGcon
  * (RNetRbFrame.analog), copied verbatim. */
 typedef struct RNetRbWireFrame
@@ -92,9 +93,15 @@ typedef struct RNetRbWireFrame
     rnet_u8 source;
     rnet_u8 is_predicted;
     rnet_u8 is_valid;
+    rnet_u8 rx;
+    rnet_u8 ry;
 } RNetRbWireFrame;
 
-#define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 7u
+#define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 9u
+/* Wire version, sent in HELLO's former reserved byte (0 from a peer that
+ * predates it). Peers of different versions refuse to link: version 2 widened
+ * the seal-row frame, which an older peer would misparse. */
+#define RNET_WIRE_VERSION 2u
 /* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
  * chunks its own seal rows has to know the bound the send path enforces. */
 
@@ -195,6 +202,7 @@ typedef struct RNetDecodedPacket
     rnet_u8 local_slot;
     rnet_u8 slot_count;
     rnet_u8 delay;
+    rnet_u8 wire_version; /* HELLO: RNET_WIRE_VERSION of the sender, 0 = older */
     rnet_u32 start_tick;
     rnet_u32 ack_tick;
     rnet_u8 ack_count;

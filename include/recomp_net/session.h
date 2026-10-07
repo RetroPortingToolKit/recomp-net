@@ -484,6 +484,10 @@ int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *targ
  * only let a stale set win a race against the current one.
  */
 int rnet_session_send_modset(RNetSession *s, const char *text);
+/* Nonzero once a peer's HELLO carried another wire version (RNET_WIRE_VERSION
+ * in src/protocol): that peer's version, or -1 for a peer that predates the
+ * field. The session never links with it; a host can say why it stalled. */
+int rnet_session_peer_wire_version_mismatch(const RNetSession *s);
 /* 1 and fills `out` when a set has arrived since the last take, else 0. */
 int rnet_session_take_modset(RNetSession *s, char *out, rnet_u32 cap);
 int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,

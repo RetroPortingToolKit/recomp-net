@@ -269,6 +269,7 @@ struct RNetSession
      * host, and a single slot let the second answer overwrite the first --
      * the host then waited out its bound for a guest that had already
      * confirmed, and refused the match. */
+    rnet_u8 peer_wire_version_mismatch; /* a HELLO of another wire version (0xFF = 0) */
     char modset_text[RNET_MODSET_TEXT_MAX];
     rnet_u8 modset_pending;
     char modset_ack_reason[RNET_MAX_SLOTS][RNET_MODSET_REASON_MAX];
@@ -553,6 +554,19 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     case RNET_PKT_HELLO:
         if (pkt->slot_count != s->cfg.slot_count)
         {
+            break;
+        }
+        if (pkt->wire_version != RNET_WIRE_VERSION)
+        {
+            /* A different wire (e.g. the 7-byte seal row) would misparse
+             * mid-match: never link with it. */
+            if (s->peer_wire_version_mismatch == 0)
+                fprintf(stderr,
+                        "recomp-net: peer slot %u speaks wire version %u, this "
+                        "build %u — not linking (update both to the same build)\n",
+                        (unsigned)pkt->local_slot, (unsigned)pkt->wire_version,
+                        (unsigned)RNET_WIRE_VERSION);
+            s->peer_wire_version_mismatch = pkt->wire_version ? pkt->wire_version : 0xFFu;
             break;
         }
         /* Peer is alive; move toward READY once we have exchanged HELLO. */
@@ -4134,6 +4148,8 @@ int rnet_session_send_rb_seal_rows(RNetSession *s, rnet_u32 epoch_id, rnet_u32 m
         wire[i].source = rows[i].analog;
         wire[i].is_predicted = rows[i].is_predicted;
         wire[i].is_valid = rows[i].is_valid;
+        wire[i].rx = rows[i].rx;
+        wire[i].ry = rows[i].ry;
     }
     enc = rnet_proto_encode_rb_seal_rows(buf, sizeof(buf), s->cfg.protocol_magic,
                                          s->cfg.session_id, s->wire_slot, epoch_id,
@@ -4173,6 +4189,8 @@ int rnet_session_take_rb_seal_rows(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 
             rows[i].analog = s->rb_seal_q[s->rb_seal_tail].rows[i].source;
             rows[i].is_predicted = s->rb_seal_q[s->rb_seal_tail].rows[i].is_predicted;
             rows[i].is_valid = s->rb_seal_q[s->rb_seal_tail].rows[i].is_valid;
+            rows[i].rx = s->rb_seal_q[s->rb_seal_tail].rows[i].rx;
+            rows[i].ry = s->rb_seal_q[s->rb_seal_tail].rows[i].ry;
         }
     }
     if (row_count)
@@ -4307,6 +4325,13 @@ int rnet_session_poll_sio_multi_xfer(RNetSession *s, rnet_u8 *unit_id, rnet_u32 
     s->sio_xfer_tail = (s->sio_xfer_tail + 1) % RNET_SIO_XFER_QUEUE;
     s->sio_xfer_count--;
     return 1;
+}
+
+int rnet_session_peer_wire_version_mismatch(const RNetSession *s)
+{
+    if (s == NULL || s->peer_wire_version_mismatch == 0u)
+        return 0;
+    return s->peer_wire_version_mismatch == 0xFFu ? -1 : (int)s->peer_wire_version_mismatch;
 }
 
 int rnet_session_send_modset(RNetSession *s, const char *text)
