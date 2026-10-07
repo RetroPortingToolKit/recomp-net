@@ -27,7 +27,7 @@ static uint8_t hc_no(void *ctx)
 
 int main(void)
 {
-    RNetInputHist h;
+    RNetInputHist h, jog;
     RNetRbFrame f, got;
     RNetInputContractFrame pub, wire;
     RNetInputContractParams params;
@@ -46,6 +46,22 @@ int main(void)
     CHECK(rnet_ih_put(&h, 0, &f), "put local");
     CHECK(rnet_ih_get(&h, 0, 10, &got), "get local");
     CHECK(got.stick_x == 40 && got.analog == 1u, "get fields");
+
+    /* The source byte is a controller type, so JogCon must survive neutral,
+     * hold-last prediction, and history retrieval without bool conversion. */
+    rnet_ih_reset(&jog, 1);
+    f.tick = 21;
+    f.analog = 2u;
+    f.is_valid = 1u;
+    CHECK(rnet_ih_put(&jog, 0, &f), "put JogCon row");
+    CHECK(rnet_ih_invent_hold_last(&jog, 0, 22, &got), "invent JogCon hold-last");
+    CHECK(got.analog == 2u, "hold-last preserves JogCon type");
+    CHECK(rnet_ih_get(&jog, 0, 22, &got) && got.analog == 2u,
+          "history preserves JogCon type");
+    f.analog = 2u;
+    CHECK(rnet_ih_set_neutral(&jog, 0, &f), "set JogCon neutral");
+    CHECK(rnet_ih_invent_idle(&jog, 0, 30, &got) && got.analog == 2u,
+          "idle prediction preserves JogCon type");
 
     CHECK(rnet_ih_invent_hold_last(&h, 1, 11, &got), "invent neutral");
     CHECK(got.is_predicted && got.buttons == 0xFFFFu, "invent predicted neutral");

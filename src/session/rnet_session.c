@@ -4131,7 +4131,7 @@ int rnet_session_send_rb_seal_rows(RNetSession *s, rnet_u32 epoch_id, rnet_u32 m
         wire[i].buttons = rows[i].buttons;
         wire[i].stick_x = (rnet_s8)rows[i].stick_x;
         wire[i].stick_y = (rnet_s8)rows[i].stick_y;
-        wire[i].source = rows[i].analog ? 1u : 0u;
+        wire[i].source = rows[i].analog;
         wire[i].is_predicted = rows[i].is_predicted;
         wire[i].is_valid = rows[i].is_valid;
     }
@@ -4170,7 +4170,7 @@ int rnet_session_take_rb_seal_rows(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 
             rows[i].buttons = s->rb_seal_q[s->rb_seal_tail].rows[i].buttons;
             rows[i].stick_x = (int8_t)s->rb_seal_q[s->rb_seal_tail].rows[i].stick_x;
             rows[i].stick_y = (int8_t)s->rb_seal_q[s->rb_seal_tail].rows[i].stick_y;
-            rows[i].analog = s->rb_seal_q[s->rb_seal_tail].rows[i].source ? 1u : 0u;
+            rows[i].analog = s->rb_seal_q[s->rb_seal_tail].rows[i].source;
             rows[i].is_predicted = s->rb_seal_q[s->rb_seal_tail].rows[i].is_predicted;
             rows[i].is_valid = s->rb_seal_q[s->rb_seal_tail].rows[i].is_valid;
         }
