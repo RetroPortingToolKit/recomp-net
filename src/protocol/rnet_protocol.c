@@ -58,6 +58,22 @@ static int finish_packet(rnet_u8 *out, rnet_u8 *cursor, size_t cap)
     return (int)(cursor - out);
 }
 
+int rnet_proto_is_rb_control(rnet_u16 type)
+{
+    return type == RNET_PKT_RB_SYNC || type == RNET_PKT_RB_SEAL_ROWS ||
+           type == RNET_PKT_RB_BASELINE || type == RNET_PKT_RB_POST ||
+           type == RNET_PKT_RB_FRAME_COMMIT || type == RNET_PKT_RB_RESOLVED;
+}
+
+int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch)
+{
+    rnet_u8 *c;
+    if (size < 14 || size + 2 > cap) return -1;
+    c = buf + size - 4;
+    write_u16(&c, epoch);
+    return finish_packet(buf, c, cap);
+}
+
 int rnet_proto_encode_hello(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                             rnet_u8 slot_count, rnet_u8 delay)
 {
@@ -932,6 +948,11 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         break;
     default:
         return -1;
+    }
+    if (rnet_proto_is_rb_control(out->type)) {
+        /* Legacy packets are generation zero. A post-load session rejects them. */
+        if (end - c == 2) out->input_epoch = read_u16(&c);
+        else if (end != c) return -1;
     }
     return 0;
 }

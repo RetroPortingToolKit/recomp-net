@@ -210,6 +210,7 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
 #define RNET_STATE_OP_LOAD 1 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_SRAM 2 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_RB_KF 3 /* rollback FMV media keyframe (raw boot_state snap) */
+#define RNET_STATE_OP_MENU 6 /* host-authoritative paused snapshot */
 #define RNET_STATE_OP_BOOT 4 /* post-BIOS host snap barrier (boot_state blob) */
 /* Guest-owned memory card upload. The ONLY peer→host op: a seated guest sends
  * its card to the host before the host's SRAM broadcast, so the host can fold

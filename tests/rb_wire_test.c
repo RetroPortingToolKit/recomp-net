@@ -93,6 +93,18 @@ int main(void)
     expect_true(rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0, "rb_resolved decodes");
     expect_true(dec.type == RNET_PKT_RB_RESOLVED && dec.rb_resolved_through == 61u, "rb_resolved payload");
 
+    /* Generation trailer survives transport and is checksummed. */
+    expect_true(dec.input_epoch == 0, "legacy rollback packet is generation zero");
+    n = rnet_proto_tag_rb_epoch(buf, (size_t)n, sizeof(buf), 513);
+    expect_true(n > 0 && rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0,
+                "tagged rollback packet decodes");
+    expect_true(dec.input_epoch == 513 && dec.rb_resolved_through == 61u,
+                "generation and payload survive");
+    buf[n - 6] ^= 1;
+    expect_true(rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) != 0,
+                "generation corruption rejected");
+    buf[n - 6] ^= 1;
+
     /* Bad magic rejected */
     expect_true(rnet_proto_decode(buf, (size_t)n, 0xBADu, &dec) != 0, "bad magic rejected");
 

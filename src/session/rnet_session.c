@@ -542,6 +542,8 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     {
         return;
     }
+    if (rnet_proto_is_rb_control(pkt->type) && pkt->input_epoch != s->input_epoch)
+        return;
     if (pkt->session_id != s->cfg.session_id)
     {
         return;
@@ -920,6 +922,15 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
 
 static void send_raw(RNetSession *s, const rnet_u8 *buf, int len)
 {
+    rnet_u8 tagged[RNET_MAX_PACKET];
+    if (len >= 14 && rnet_proto_is_rb_control((rnet_u16)(buf[4] | (buf[5] << 8)))) {
+        if ((size_t)len + 2 > sizeof(tagged)) return;
+        memcpy(tagged, buf, (size_t)len);
+        len = rnet_proto_tag_rb_epoch(tagged, (size_t)len, sizeof(tagged), s->input_epoch);
+        if (len <= 0) return;
+        buf = tagged;
+    }
+
     if ((s == NULL) || (buf == NULL) || (len <= 0))
     {
         return;
@@ -3267,7 +3278,7 @@ int rnet_session_state_probe(RNetSession *s, rnet_u8 op, rnet_u8 slot, rnet_u32 
         return -1;
     }
     if (op != RNET_STATE_OP_SAVE && op != RNET_STATE_OP_LOAD && op != RNET_STATE_OP_SRAM &&
-        op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT)
+        op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT && op != RNET_STATE_OP_MENU)
     {
         return -1;
     }
@@ -3452,7 +3463,7 @@ int rnet_session_state_begin(RNetSession *s, rnet_u8 op, rnet_u8 slot, const voi
         return -1;
     }
     else if (op != RNET_STATE_OP_SAVE && op != RNET_STATE_OP_LOAD && op != RNET_STATE_OP_SRAM &&
-             op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT)
+             op != RNET_STATE_OP_RB_KF && op != RNET_STATE_OP_BOOT && op != RNET_STATE_OP_MENU)
     {
         return -1;
     }
@@ -3715,6 +3726,14 @@ void rnet_session_hard_resync(RNetSession *s)
     /* Invalidate in-flight INPUT/CONFIRM from the previous era (same low ticks
      * would otherwise first-wins into this window — spam rematch + stick mash). */
     s->input_epoch = (rnet_u16)(s->input_epoch + 1u);
+    s->rb_fc_q_head = s->rb_fc_q_tail = s->rb_fc_q_count = 0;
+    s->rb_sync_head = s->rb_sync_tail = s->rb_sync_count = 0;
+    s->rb_seal_head = s->rb_seal_tail = s->rb_seal_count = 0;
+    s->rb_base_head = s->rb_base_tail = s->rb_base_count = 0;
+    s->rb_post_head = s->rb_post_tail = s->rb_post_count = 0;
+    s->rb_resolved_head = s->rb_resolved_tail = s->rb_resolved_count = 0;
+    s->rb_last_from = -1;
+
     /* Keep suppress until prime_delay_inputs — avoids emitting an empty tip. */
     s->input_send_suppress = 1;
     s->delay_pending = 0;

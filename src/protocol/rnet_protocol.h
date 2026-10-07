@@ -202,7 +202,7 @@ typedef struct RNetDecodedPacket
     rnet_u32 effective_tick;
     rnet_u32 confirm_sim_tick;
     rnet_u32 confirm_hash;
-    rnet_u16 input_epoch; /* INPUT / INPUT_CONFIRM generation (hard_resync) */
+    rnet_u16 input_epoch; /* Input and rollback generation (hard_resync). */
     int frame_count;
     RNetWireFrame frames[RNET_MAX_BUNDLE];
     /* STATE_* */
@@ -252,6 +252,10 @@ typedef struct RNetDecodedPacket
     rnet_u8 sio_confirm; /* Confirm IRQ watermark (pad lo byte) */
     rnet_u8 sio_vblank;  /* local VBlank mod 256 (pad hi byte) */
 } RNetDecodedPacket;
+
+/* Add a generation trailer to rollback control packets. */
+int rnet_proto_is_rb_control(rnet_u16 type);
+int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch);
 
 /* Returns 0 on success. */
 int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RNetDecodedPacket *out);
