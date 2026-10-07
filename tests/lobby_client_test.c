@@ -320,6 +320,59 @@ static void case_gate_matches_on_id_only(void)
        "a peer announcing nothing is missing everything");
 }
 
+/* A peer can hold a package and still be unable to run one of its features:
+ * the feature needs a file only the player can supply (another game's ROM).
+ * The offer says which features those are, for every feature of the package;
+ * the files gate counts only the ones the host's plan enables. */
+static void case_gate_holds_for_missing_files(void)
+{
+    RNetLobbyModPkg plan[1];
+    RNetLobbyModPkg peer[1];
+    RNetLobbyModPkg back[RNET_LOBBY_MAX_MODS];
+    char who[64], what[160], files[256], json[1024];
+    int mods_missing = -1, files_missing = -1;
+
+    plan[0] = row("megaman-x.character.zero", "0.0.1");
+    snprintf(plan[0].feats, sizeof(plan[0].feats), "zero");
+    peer[0] = row("megaman-x.character.zero", "0.0.1");
+    snprintf(peer[0].nf, sizeof(peer[0].nf), "other,zero");
+
+    ck(append_mod_pkg_array(json, sizeof(json), "pkgs", peer, 1) > 0,
+       "an offer row with missing files encodes");
+    ck(strstr(json, "\"nf\":\"other,zero\"") != NULL, "nf is on the wire");
+    ck(parse_mod_pkg_array(json, "pkgs", back, RNET_LOBBY_MAX_MODS) == 1 &&
+           !strcmp(back[0].nf, "other,zero"),
+       "nf round-trips");
+    ck(append_mod_pkg_array(json, sizeof(json), "pkgs", plan, 1) > 0 &&
+           strstr(json, "\"nf\"") == NULL,
+       "a row with nothing missing does not carry nf");
+
+    ck(gate_with(plan, 1, peer, 1, who, sizeof(who), what, sizeof(what)) == 0,
+       "having the package satisfies the mods gate");
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 1,
+       "a plan feature without its files blocks the match");
+    ck(!strcmp(who, "Bob"), "the player choosing a file is named");
+    ck(!strcmp(what, "megaman-x.character.zero/zero"),
+       "the feature needing files is named");
+    ck(rnet_lobby_member_mod_readiness(1, &mods_missing, &files_missing, files,
+                                       sizeof(files)) == 1 &&
+           mods_missing == 0 && files_missing == 1 &&
+           !strcmp(files, "megaman-x.character.zero/zero"),
+       "member readiness reports the missing files");
+
+    snprintf(peer[0].nf, sizeof(peer[0].nf), "other");
+    (void)gate_with(plan, 1, peer, 1, who, sizeof(who), what, sizeof(what));
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 0,
+       "files missing for a feature the host did not enable do not block");
+
+    (void)gate_with(plan, 1, peer, 0, who, sizeof(who), what, sizeof(what));
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 0,
+       "a missing package is the mods gate's business, not the files gate's");
+}
+
 /* The transfer hooks must outlive a lobby reconnect.
  *
  * They used to live in LobbyClient, which rnet_lobby_disconnect() memsets --
@@ -911,6 +964,68 @@ static void case_gallery_does_not_rearm_ready(void)
     g_lc.fd = -1;
 }
 
+/* A peer with no game image to boot holds the match by staying not ready.
+ * Every set_ready says false while blocked -- the lobby_update auto re-arm
+ * included, which used to flip it straight back -- and the host's start gate
+ * names that peer. Lifting the block announces ready again. */
+static void case_launch_blocked_holds_ready(void)
+{
+    const char *json =
+        "{\"op\":\"lobby_update\",\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\",\"ready\":true},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\",\"ready\":false}]}";
+    char who[64];
+    printf("  a blocked launch holds ready\n");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    rnet_lobby_set_launch_blocked(1);
+    ck(g_lc.pending_n == 1 &&
+           strstr(g_lc.pending_tx[0], "\"ready\":false") != NULL,
+       "blocking announces not ready");
+    handle_server_json(json);
+    ck(g_lc.pending_n == 1, "a lobby_update does not re-arm a blocked peer");
+    (void)rnet_lobby_set_ready(1);
+    ck(g_lc.pending_n == 2 &&
+           strstr(g_lc.pending_tx[1], "\"ready\":false") != NULL,
+       "an explicit set_ready(1) still says false while blocked");
+    rnet_lobby_set_launch_blocked(0);
+    ck(g_lc.pending_n == 3 &&
+           strstr(g_lc.pending_tx[2], "\"ready\":true") != NULL,
+       "lifting the block announces ready");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "h");
+    handle_server_json(json);
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 1 &&
+           !strcmp(who, "Guest"),
+       "the host's gate names the peer that is not ready");
+    g_lc.members[1].ready = 1;
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 0,
+       "a ready peer does not block");
+    g_lc.members[1].ready = 0;
+    g_lc.members[1].is_spectator = 1;
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 0,
+       "a spectator never blocks a start");
+
+    g_lc.members[1].is_spectator = 0;
+    g_lc.members[1].ready = 1;
+    g_lc.is_host = 1;
+    g_launch_blocked = 1;
+    ck(rnet_lobby_request_start(NULL) == -1 &&
+           !strcmp(g_lc.join.last_error, "local_not_ready"),
+       "a host with nothing to boot does not start");
+    g_launch_blocked = 0;
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 static void case_launch_transport_survives_a_lobby_update(void)
 {
     const char *launch =
@@ -1375,6 +1490,8 @@ int main(void)
     case_partial_rows_dropped();
     case_overflow_refuses();
     case_gate_matches_on_id_only();
+    case_gate_holds_for_missing_files();
+    case_launch_blocked_holds_ready();
     case_hooks_survive_disconnect();
     case_ice_local_becomes_remote();
     case_offer_round_trips_through_a_slot_row();

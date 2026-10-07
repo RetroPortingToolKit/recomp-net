@@ -165,6 +165,14 @@ typedef struct RNetLobbyModPkg {
      * row, which claims possession only. Never part of the seat decision --
      * the server matches on (id, ver). */
     char feats[RNET_LOBBY_MOD_FEATS_LEN];
+    /* Offer rows only: comma-separated ids of this package's features whose
+     * required owner files (a source ROM, say) this peer has not provided.
+     * Every such feature, not just the ones the host enabled, so the claim
+     * stays true when the host changes the plan and the host intersects it
+     * with its own. Empty on a plan row, and on the wire only when non-empty:
+     * an offer without it reads as "nothing missing", which is what an older
+     * peer that cannot tell would have said. */
+    char nf[RNET_LOBBY_MOD_FEATS_LEN];
 } RNetLobbyModPkg;
 
 /* Fills `out` with the packages this peer already has, returning the count.
@@ -198,6 +206,23 @@ int rnet_lobby_match_blocked_by_mods(char *who, size_t who_cap,
 /* How many plan packages THIS peer is missing, as the host's published plan
  * and our own announced offer see it. */
 int rnet_lobby_local_missing_mods(void);
+
+/* The second half of the launch gate: plan features whose required owner files
+ * a seated peer says it has not provided (RNetLobbyModPkg.nf), counted over the
+ * OTHER seated players. Names the first offender and its first "package/feature"
+ * pair. A package the peer does not have at all is the mods gate's business
+ * and is not counted here. */
+int rnet_lobby_match_blocked_by_files(char *who, size_t who_cap,
+                                      char *what, size_t what_cap);
+
+/* Mod readiness of member `index` (as rnet_lobby_member_get indexes it)
+ * against the published plan: plan packages it does not have, and plan
+ * features it has the package for but lacks required files for. `files`, when
+ * given, receives those features as ';'-separated "package/feature" pairs.
+ * Returns 1 when filled, 0 for a bad index or no plan. */
+int rnet_lobby_member_mod_readiness(int index, int *mods_missing,
+                                    int *files_missing, char *files,
+                                    size_t files_cap);
 
 /*
  * Host-authoritative sim settings negotiated over the lobby.
@@ -597,6 +622,20 @@ int  rnet_lobby_all_ready(void);
 
 /* Toggle ready in the current lobby. */
 int  rnet_lobby_set_ready(int ready);
+
+/* This peer cannot launch at all right now -- it has no verified copy of the
+ * game to boot. While blocked, every set_ready this client sends says false
+ * (the join and lobby_update auto-arm included), so the host's launch gate
+ * holds the match and names this player until the block lifts; lifting it
+ * re-announces ready. A local fact, not per-connection state: it survives a
+ * disconnect. The launcher sets it from the same check that enables PLAY. */
+#define RNET_HAS_LAUNCH_BLOCKED 1
+void rnet_lobby_set_launch_blocked(int blocked);
+
+/* Seated players, other than this one, whose last set_ready said false. Names
+ * the first. The host's start gate: a peer that cannot boot the game must not
+ * be launched into a match it would never join. */
+int  rnet_lobby_match_blocked_by_unready(char *who, size_t who_cap);
 
 /*
  * Host: ask server to broadcast launch. When match_caps is non-NULL and valid,
