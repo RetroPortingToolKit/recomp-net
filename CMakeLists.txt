@@ -27,6 +27,7 @@ set(RNET_CORE_SOURCES
   src/input/rnet_input_hist.c
   src/rollback/rnet_rollback.c
   src/rollback/rnet_hash_confirm.c
+  src/rollback/rnet_rb_quorum.c
   src/rollback/rnet_rb_driver.c
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
@@ -347,6 +348,10 @@ if(RNET_BUILD_TESTS)
   add_executable(hash_confirm_test tests/hash_confirm_test.c)
   target_link_libraries(hash_confirm_test PRIVATE recomp_net)
   add_test(NAME hash_confirm_test COMMAND hash_confirm_test)
+
+  add_executable(rb_quorum_test tests/rb_quorum_test.c)
+  target_link_libraries(rb_quorum_test PRIVATE recomp_net)
+  add_test(NAME rb_quorum_test COMMAND rb_quorum_test)
 
   add_executable(input_hist_test tests/input_hist_test.c)
   target_link_libraries(input_hist_test PRIVATE recomp_net)
