@@ -51,6 +51,8 @@ int main(void)
         rows[i].source = (i == 2) ? 2u : (i == 0 ? 3u : 1u);
         rows[i].is_predicted = 0u;
         rows[i].is_valid = 1u;
+        rows[i].rx = (rnet_u8)(0x10u + i);   /* NeGcon I / right stick */
+        rows[i].ry = (rnet_u8)(0xF0u - i);   /* NeGcon II */
     }
     n = rnet_proto_encode_rb_seal_rows(buf, sizeof(buf), MAGIC, 0xABCD, 1, 7u, 50u, 56u, 1u, 0u, rows, 3u);
     expect_true(n > 0, "rb_seal_rows encodes");
@@ -62,6 +64,17 @@ int main(void)
     expect_true(dec.rb_rows[2].source == 2u, "rb_seal_rows preserves JogCon source");
     expect_true(dec.rb_rows[0].source == 3u, "rb_seal_rows preserves NeGcon source");
     expect_true(dec.rb_rows[1].source == 1u, "rb_seal_rows preserves DualShock source");
+    expect_true(dec.rb_rows[0].rx == 0x10u && dec.rb_rows[2].rx == 0x12u &&
+                    dec.rb_rows[1].ry == 0xEFu,
+                "rb_seal_rows carries the rest of the pad (rx/ry)");
+    expect_true(rnet_proto_decode(buf, (size_t)n - 2u, MAGIC, &dec) != 0,
+                "a seal row short of its 9 bytes is rejected");
+
+    /* HELLO carries the wire version */
+    n = rnet_proto_encode_hello(buf, sizeof(buf), MAGIC, 0xABCD, 1, 2, 4);
+    expect_true(n > 0 && rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0 &&
+                    dec.wire_version == RNET_WIRE_VERSION && dec.delay == 4u,
+                "hello carries the wire version");
 
     /* Truncated seal rows rejected */
     expect_true(rnet_proto_decode(buf, 12u, MAGIC, &dec) != 0, "truncated packet rejected");

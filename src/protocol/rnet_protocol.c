@@ -72,7 +72,7 @@ int rnet_proto_encode_hello(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 s
     *c++ = local_slot;
     *c++ = slot_count;
     *c++ = delay;
-    *c++ = 0;
+    *c++ = (rnet_u8)RNET_WIRE_VERSION;
     return finish_packet(out, c, cap);
 }
 
@@ -400,7 +400,9 @@ static void write_rb_frame(rnet_u8 **cursor, const RNetRbWireFrame *f)
     (*cursor)[2] = f->source;
     (*cursor)[3] = f->is_predicted;
     (*cursor)[4] = f->is_valid;
-    *cursor += 5;
+    (*cursor)[5] = f->rx;
+    (*cursor)[6] = f->ry;
+    *cursor += 7;
 }
 
 static void read_rb_frame(const rnet_u8 **cursor, RNetRbWireFrame *f)
@@ -411,7 +413,9 @@ static void read_rb_frame(const rnet_u8 **cursor, RNetRbWireFrame *f)
     f->source = (*cursor)[2];
     f->is_predicted = (*cursor)[3];
     f->is_valid = (*cursor)[4];
-    *cursor += 5;
+    f->rx = (*cursor)[5];
+    f->ry = (*cursor)[6];
+    *cursor += 7;
 }
 
 int rnet_proto_encode_rb_seal_rows(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
@@ -638,7 +642,7 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->local_slot = *c++;
         out->slot_count = *c++;
         out->delay = *c++;
-        (void)*c++;
+        out->wire_version = *c++;
         break;
     case RNET_PKT_READY:
         if ((size_t)(end - c) < 4)
@@ -842,7 +846,8 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         {
             return -1;
         }
-        if ((size_t)(end - c) < ((size_t)out->rb_row_count * 5u))
+        if ((size_t)(end - c) <
+            ((size_t)out->rb_row_count * RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES))
         {
             return -1;
         }

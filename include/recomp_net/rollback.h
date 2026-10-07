@@ -108,6 +108,12 @@ typedef struct RNetRbFrame
     uint8_t is_predicted;
     uint8_t is_valid;
     uint8_t analog;
+    /* The rest of the presented pad (host-defined, opaque like stick_x/y):
+     * e.g. DualShock right stick, NeGcon analog I / II. Carried through input
+     * history, invention and the seal wire (wire version 2), so a replayed
+     * row is the whole pad every peer simulated. */
+    uint8_t rx;
+    uint8_t ry;
 } RNetRbFrame;
 
 typedef struct RNetRbEvent

@@ -28,6 +28,8 @@ int rnet_ih_set_neutral(RNetInputHist *h, int slot, const RNetRbFrame *neutral)
     h->neutral[slot].stick_x = neutral->stick_x;
     h->neutral[slot].stick_y = neutral->stick_y;
     h->neutral[slot].analog = neutral->analog;
+    h->neutral[slot].rx = neutral->rx;
+    h->neutral[slot].ry = neutral->ry;
     return 1;
 }
 
@@ -87,6 +89,8 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
     invented.stick_x = h->neutral[slot].stick_x;
     invented.stick_y = h->neutral[slot].stick_y;
     invented.analog = h->neutral[slot].analog;
+    invented.rx = h->neutral[slot].rx;
+    invented.ry = h->neutral[slot].ry;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
 
@@ -98,6 +102,8 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
             invented.stick_x = prev.stick_x;
             invented.stick_y = prev.stick_y;
             invented.analog = prev.analog;
+            invented.rx = prev.rx;
+            invented.ry = prev.ry;
             break;
         }
     }
@@ -123,6 +129,8 @@ int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *
     invented.stick_x = h->neutral[slot].stick_x;
     invented.stick_y = h->neutral[slot].stick_y;
     invented.analog = h->neutral[slot].analog;
+    invented.rx = h->neutral[slot].rx;
+    invented.ry = h->neutral[slot].ry;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
 
