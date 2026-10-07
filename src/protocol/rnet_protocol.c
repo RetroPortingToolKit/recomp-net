@@ -363,6 +363,27 @@ int rnet_proto_encode_state_probe_reply(rnet_u8 *out, size_t cap, rnet_u32 magic
     return finish_packet(out, c, cap);
 }
 
+int rnet_proto_encode_state_probe_done(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                       rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot,
+                                       rnet_u32 total_size, rnet_u32 payload_crc)
+{
+    rnet_u8 *c = out;
+    if (cap < 28)
+    {
+        return -1;
+    }
+    write_u32(&c, magic);
+    write_u16(&c, RNET_PKT_STATE_PROBE_DONE);
+    write_u32(&c, session_id);
+    *c++ = local_slot;
+    *c++ = op;
+    *c++ = slot;
+    *c++ = 0;
+    write_u32(&c, total_size);
+    write_u32(&c, payload_crc);
+    return finish_packet(out, c, cap);
+}
+
 /* ---- Rollback control packets (reserved range; rollback-mode only) ---- */
 
 int rnet_proto_encode_sio_multi_xfer(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
@@ -812,6 +833,18 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->state_op = *c++;
         out->state_slot = *c++;
         out->state_probe_match = *c++;
+        out->state_total_size = read_u32(&c);
+        out->state_payload_crc = read_u32(&c);
+        break;
+    case RNET_PKT_STATE_PROBE_DONE:
+        if ((size_t)(end - c) < 12)
+        {
+            return -1;
+        }
+        out->local_slot = *c++;
+        out->state_op = *c++;
+        out->state_slot = *c++;
+        c++;
         out->state_total_size = read_u32(&c);
         out->state_payload_crc = read_u32(&c);
         break;
