@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
-        with: { repository: RetroPortingToolKit/retcomm-rbengine, path: rbengine }
+        with: { repository: RetroPortingToolKit/rbengine, path: rbengine }
       - run: sudo apt-get update && sudo apt-get install -y ninja-build
         if: startsWith(matrix.os, 'ubuntu')
       - run: brew install ninja

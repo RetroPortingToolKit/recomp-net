@@ -30,14 +30,15 @@ ctest --test-dir "$B" -R module_test --output-on-failure >/dev/null
 archive="recomp-net-module-$ver-$KEY.tar.gz"
 X=$(mktemp -d); cp "$B/$LIB" "$X/"; cp "$here/LICENSE" "$X/"
 tar -C "$X" -czf "$OUT/$archive" "$LIB" LICENSE
-sha=$(sha256sum "$OUT/$archive" | cut -d' ' -f1); echo "$sha  $archive" > "$OUT/$archive.sha256"
+if command -v sha256sum >/dev/null; then sum() { sha256sum "$@"; }; else sum() { shasum -a 256 "$@"; }; fi
+sha=$(sum "$OUT/$archive" | cut -d' ' -f1); echo "$sha  $archive" > "$OUT/$archive.sha256"
 # What the shipped file says about itself.
 V=$(mktemp -d); tar -C "$V" -xzf "$OUT/$archive"
 info=$("$B/module_test" "$V/$LIB" --info)
 abi=$(sed -n 's/.*abi=\([0-9]*\).*/\1/p' <<<"$info"); wire=$(sed -n 's/.*wire=\([0-9]*\).*/\1/p' <<<"$info")
 built=$(sed -n 's/.*build=\([0-9a-f]*\).*/\1/p' <<<"$info")
 [ "$built" = "$commit" ] || { echo "library reports build $built, not $commit" >&2; exit 1; }
-glibc=$(objdump -T "$V/$LIB" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 | sed 's/GLIBC_//')
+glibc=$(objdump -T "$V/$LIB" 2>/dev/null | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 | sed 's/GLIBC_//' || true)
 python3 - "$OUT/$KEY.manifest.json" "$ver" "$commit" "$abi" "$wire" "$KEY" "$archive" "$sha" \
   "$(stat -c %s "$OUT/$archive" 2>/dev/null || stat -f %z "$OUT/$archive")" "$LIB" "${glibc:-}" <<'PY'
 import json,sys
