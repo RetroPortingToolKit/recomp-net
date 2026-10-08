@@ -32,6 +32,10 @@ struct RNetTransport
     int (*ice_send)(void *ice_ctx, const rnet_u8 *buf, size_t len);
     int (*ice_recv)(void *ice_ctx, rnet_u8 *buf, size_t cap, size_t *out_len);
     void *ice_ctx;
+    /* RNET_TRANSPORT_ICE_HUB: one agent per guest seat. ice_send/ice_recv are
+     * shared; the per-seat context is hub_ice_ctx[slot] (NULL = no agent). */
+    void *hub_ice_ctx[RNET_MAX_SLOTS];
+    int hub_rr; /* round-robin recv cursor */
     /* Test-only link simulator; NULL unless RNET_SIM_LATENCY_MS is set.
      * Probed once on first receive rather than at init, because init runs
      * before the process has finished reading its own configuration. */
@@ -42,6 +46,12 @@ struct RNetTransport
 void rnet_transport_init(RNetTransport *t);
 void rnet_transport_shutdown(RNetTransport *t);
 int rnet_transport_start_lan(RNetTransport *t, const char *bind_hostport, const char *peer_hostport);
+/* ICE hub: per-seat agent contexts (non-NULL = seat has an agent), shared
+ * send/recv callbacks. Source seat == agent index. */
+int rnet_transport_start_ice_hub(RNetTransport *t,
+                                 int (*send_fn)(void *, const rnet_u8 *, size_t),
+                                 int (*recv_fn)(void *, rnet_u8 *, size_t, size_t *),
+                                 void *const ctx[RNET_MAX_SLOTS]);
 /* Bind-only LAN hub for host-as-relay (multi-seat fan-out). */
 int rnet_transport_start_lan_hub(RNetTransport *t, const char *bind_hostport);
 int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len);

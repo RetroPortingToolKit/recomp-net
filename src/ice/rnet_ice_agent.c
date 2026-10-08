@@ -23,7 +23,7 @@ static void ice_mutex_lock(RNetIceMutex *mutex) { (void)pthread_mutex_lock(mutex
 static void ice_mutex_unlock(RNetIceMutex *mutex) { (void)pthread_mutex_unlock(mutex); }
 #endif
 
-#define RNET_ICE_RECV_QUEUE 64
+#define RNET_ICE_RECV_QUEUE 256
 #define RNET_ICE_RECV_MAX 2048
 #define RNET_ICE_CAND_QUEUE 32
 #define RNET_ICE_CAND_MAX 280
@@ -47,6 +47,8 @@ struct RNetIceAgent
     RNetIceSignalEmitFn emit;
     void *user;
     int gathering_done_posted;
+    int frozen;
+    rnet_u32 recv_drops;
     int remote_desc_set;
     RNetIceRecvSlot recv_q[RNET_ICE_RECV_QUEUE];
     unsigned recv_head;
@@ -104,6 +106,7 @@ static void queue_recv(RNetIceAgent *a, const char *data, size_t size)
     {
         a->recv_head = (a->recv_head + 1U) % RNET_ICE_RECV_QUEUE;
         a->recv_count--;
+        a->recv_drops++;
     }
     memcpy(a->recv_q[a->recv_tail].data, data, size);
     a->recv_q[a->recv_tail].len = size;
@@ -345,6 +348,7 @@ static void emit_signal(RNetIceAgent *a, RNetSignalType type, const char *text, 
     memset(&msg, 0, sizeof(msg));
     msg.type = type;
     msg.flag = flag;
+    msg.peer_slot = 0xFF;
     if (text != NULL)
     {
         snprintf(msg.text, sizeof(msg.text), "%s", text);
@@ -602,6 +606,7 @@ int rnet_ice_agent_restart_force_relay(RNetIceAgent *agent)
             "rnet_ice: auto TURN fallback — restarting ICE with force_relay "
             "(STUN/host path failed or stalled)\n");
     ice_reset_runtime(agent);
+    agent->frozen = 0; /* a local restart must accept the peer's new offer */
     if (ice_create_juice(agent) != 0)
         return -1;
     return rnet_ice_agent_start_gathering(agent);
@@ -708,6 +713,8 @@ void rnet_ice_agent_push_signal(RNetIceAgent *agent, const RNetSignal *msg)
     switch (msg->type)
     {
     case RNET_SIGNAL_REMOTE_SDP:
+        if (agent->frozen)
+            break;
         if (msg->text[0] != '\0')
         {
             /* Peer ICE restart (e.g. their TURN fallback): rebuild local
@@ -748,7 +755,7 @@ void rnet_ice_agent_push_signal(RNetIceAgent *agent, const RNetSignal *msg)
         }
         break;
     case RNET_SIGNAL_REMOTE_CANDIDATE:
-        if (agent->agent == NULL || msg->text[0] == '\0')
+        if (agent->frozen || agent->agent == NULL || msg->text[0] == '\0')
             break;
         if (agent->force_relay && !ice_candidate_is_relay(msg->text))
             break;
@@ -770,6 +777,39 @@ void rnet_ice_agent_push_signal(RNetIceAgent *agent, const RNetSignal *msg)
     default:
         break;
     }
+}
+
+void rnet_ice_agent_set_emit(RNetIceAgent *agent, RNetIceSignalEmitFn emit, void *user)
+{
+    if (agent == NULL)
+        return;
+    /* emit is only ever called from rnet_ice_agent_poll / push_signal on the
+     * caller's thread, never from libjuice's, so no lock is needed. */
+    agent->emit = emit;
+    agent->user = user;
+}
+
+void rnet_ice_agent_freeze(RNetIceAgent *agent)
+{
+    if (agent != NULL)
+        agent->frozen = 1;
+}
+
+int rnet_ice_agent_is_frozen(const RNetIceAgent *agent)
+{
+    return agent != NULL && agent->frozen != 0;
+}
+
+rnet_u32 rnet_ice_agent_recv_drops(const RNetIceAgent *agent)
+{
+    rnet_u32 n;
+    if (agent == NULL)
+        return 0;
+    /* Counter is written under the mutex by the juice thread. */
+    ice_mutex_lock((RNetIceMutex *)&agent->mutex);
+    n = agent->recv_drops;
+    ice_mutex_unlock((RNetIceMutex *)&agent->mutex);
+    return n;
 }
 
 RNetIceState rnet_ice_agent_state(const RNetIceAgent *agent)

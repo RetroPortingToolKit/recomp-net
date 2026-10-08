@@ -11,6 +11,7 @@
 extern "C" {
 #endif
 
+/* Also declared (identically) in the public recomp_net/ice.h. */
 typedef struct RNetIceAgent RNetIceAgent;
 
 typedef void (*RNetIceSignalEmitFn)(const RNetSignal *msg, void *user);
@@ -38,6 +39,14 @@ int rnet_ice_agent_relay_fallback_done(const RNetIceAgent *agent);
 void rnet_ice_agent_mark_relay_fallback_done(RNetIceAgent *agent);
 /* Destroy/recreate juice with force_relay=1 and restart gathering. */
 int rnet_ice_agent_restart_force_relay(RNetIceAgent *agent);
+/* After freeze, REMOTE_SDP / REMOTE_CANDIDATE signals are no-ops (a second
+ * REMOTE_SDP would otherwise rebuild a live agent). */
+void rnet_ice_agent_freeze(RNetIceAgent *agent);
+int rnet_ice_agent_is_frozen(const RNetIceAgent *agent);
+/* Re-point where an agent's outbound signals go (handover to a session). */
+void rnet_ice_agent_set_emit(RNetIceAgent *agent, RNetIceSignalEmitFn emit, void *user);
+/* Datagrams discarded by overwrite-on-overflow of the recv queue. */
+rnet_u32 rnet_ice_agent_recv_drops(const RNetIceAgent *agent);
 
 #else
 
@@ -127,6 +136,26 @@ static inline int rnet_ice_agent_restart_force_relay(RNetIceAgent *agent)
 {
     (void)agent;
     return -1;
+}
+static inline void rnet_ice_agent_freeze(RNetIceAgent *agent)
+{
+    (void)agent;
+}
+static inline int rnet_ice_agent_is_frozen(const RNetIceAgent *agent)
+{
+    (void)agent;
+    return 0;
+}
+static inline void rnet_ice_agent_set_emit(RNetIceAgent *agent, RNetIceSignalEmitFn emit, void *user)
+{
+    (void)agent;
+    (void)emit;
+    (void)user;
+}
+static inline rnet_u32 rnet_ice_agent_recv_drops(const RNetIceAgent *agent)
+{
+    (void)agent;
+    return 0;
 }
 
 #endif

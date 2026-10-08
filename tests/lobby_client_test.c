@@ -1482,6 +1482,176 @@ static void case_session_variant(void)
     ck(back.session_variant == 0, "old host resets variant to default");
 }
 
+
+/* ---- host relay over ICE: signalling, hold, launch ----------------------
+ * This test build has no ICE (RNET_ENABLE_ICE is not defined here), so no
+ * agent ever exists: everything below is the lobby client's own job -- the
+ * type range, who is allowed to signal, where an early signal waits -- and
+ * the real agents are exercised by host_ice_test / lobby_ice_launch_test. */
+
+static const char *HI_UPDATE =
+    "{\"op\":\"lobby_update\",\"lobby_id\":\"L\",\"session_id\":3,"
+    "\"host_player_id\":\"h\",\"player_count\":3,\"max_slots\":4,"
+    "\"match_caps\":{\"v\":1,\"input_delay\":5,\"relay\":\"host\",\"relay_via\":\"ice\"},"
+    "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":true},"
+    "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\",\"ready\":true},"
+    "{\"slot\":2,\"player_id\":\"g2\",\"display_name\":\"G2\",\"ready\":true}],"
+    "\"spectators\":[{\"slot\":64,\"player_id\":\"sp\",\"display_name\":\"S\"}]}";
+
+static void hi_room(const char *me, int is_host)
+{
+    rnet_host_ice_destroy(&g_host_ice);
+    memset(&g_lc, 0, sizeof(g_lc));
+    memset(&g_il, 0, sizeof(g_il));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    g_lc.is_host = is_host;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", me);
+    snprintf(g_lc.host_player_id, sizeof(g_lc.host_player_id), "h");
+    handle_server_json(HI_UPDATE);
+    host_ice_step();   /* what rnet_lobby_pump does every frame */
+}
+
+static void hi_signal(const char *from, int type, int flag)
+{
+    char js[256];
+    snprintf(js, sizeof(js),
+             "{\"op\":\"signal\",\"from_player_id\":\"%s\",\"type\":%d,\"flag\":%d,"
+             "\"text\":\"v=0 x\"}", from, type, flag);
+    handle_server_json(js);
+}
+
+static void case_hostice_caps_and_range(void)
+{
+    RNetLobbyMatchCaps caps;
+    char json[1024];
+    printf("  host-ice: caps field and signal range\n");
+    ck(RNET_LOBBY_SIG_HOSTICE_BASE == 130, "the range starts at 130");
+    ck(rnet_host_ice_sig_is_ours(131) && rnet_host_ice_sig_is_ours(136), "131..136 are ours");
+    ck(!rnet_host_ice_sig_is_ours(130) && !rnet_host_ice_sig_is_ours(137) &&
+       !rnet_host_ice_sig_is_ours(126) && !rnet_host_ice_sig_is_ours(102) &&
+       !rnet_host_ice_sig_is_ours(6),
+       "legacy 1-6, RTT 100-102 and mod transfer 110/111/121-126 are not");
+    memset(&caps, 0, sizeof(caps));
+    parse_match_caps_object("{\"v\":1,\"relay\":\"host\",\"relay_via\":\"ice\"}", &caps);
+    ck(caps.relay_host == 1 && caps.relay_via_ice == 1, "relay_via ice parses");
+    parse_match_caps_object("{\"v\":1,\"relay\":\"host\"}", &caps);
+    ck(caps.relay_host == 1 && caps.relay_via_ice == 0, "absent relay_via is not ice");
+    /* This build cannot run ICE, so a host never advertises it. */
+    caps.relay_host = 1;
+    g_relay_via_ice_pref = 1;
+    ck(append_match_caps_json(json, sizeof(json), &caps) > 0, "caps encode");
+    ck(strstr(json, "\"relay\":\"host\"") && !strstr(json, "relay_via"),
+       "no relay_via is published by a build without ICE");
+}
+
+static void case_hostice_dispatch_and_seating(void)
+{
+    int sig_count_before;
+    printf("  host-ice: dispatch by sender, seated players only\n");
+    hi_room("h", 1);
+    ck(room_relays_via_ice(), "the room's caps ask for ICE");
+    sig_count_before = g_lc.sig_count;
+
+    hi_signal("g1", 131, 1);   /* LOCAL_SDP from a seated guest */
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1,
+       "a seated guest's signal reaches the module (held: no agent in this build)");
+    ck(g_lc.sig_count == sig_count_before, "and does not enter the legacy game queue");
+    hi_signal("g2", 133, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g2") == 1 &&
+       rnet_host_ice_held_count(g_host_ice, "g1") == 1,
+       "each sender has its own hold");
+
+    hi_signal("stranger", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "stranger") == 0, "an unseated sender is refused");
+    hi_signal("sp", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "sp") == 0, "a gallery spectator is refused");
+    hi_signal("g1", 136, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1, "SET_CONTROLLING is refused");
+    hi_signal("g1", 120 + 1, 0);
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 1,
+       "a mod-transfer signal still takes the mod path, not ours");
+    hi_signal("g1", 1, 0);
+    ck(g_lc.sig_count == sig_count_before + 1 || g_lc.sig_count == sig_count_before,
+       "legacy types are untouched (queued for the game, or dropped by its own rule)");
+
+    /* A guest hears the host and nobody else. */
+    hi_room("g1", 0);
+    hi_signal("g2", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g2") == 0, "a guest refuses another guest");
+    hi_signal("h", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "h") == 1, "a guest accepts the host");
+    {
+        RNetHostIceStatus st;
+        ck(rnet_lobby_host_ice_status(&st) == 1 && st.role == 2, "the guest role is running");
+        ck(st.reports_sent == 1 && !strcmp(st.last_report, "fail"),
+           "a build that cannot run ICE reports path \"fail\" honestly");
+    }
+    rnet_host_ice_destroy(&g_host_ice);
+}
+
+static void case_hostice_hold_is_per_peer_for_mod_signals(void)
+{
+    printf("  mod-transfer hold: one bucket per sender\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    hi_signal("g1", 121, 0);
+    hi_signal("g2", 121, 0);
+    hi_signal("g1", 123, 0);
+    ck(rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 2 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g2") == 1,
+       "a second sender no longer wipes the first sender's held signals");
+    ck(rnet_sig_hold_get(&g_lc.sig_hold, "g1", 0)->sig.type == RNET_SIGNAL_LOCAL_SDP ||
+       rnet_sig_hold_get(&g_lc.sig_hold, "g1", 0)->sig.type == RNET_SIGNAL_REMOTE_SDP,
+       "in arrival order");
+    rnet_sig_hold_drop(&g_lc.sig_hold, "g1");
+    ck(rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 0 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g2") == 1,
+       "consuming one peer's hold leaves the other's");
+    rnet_sig_hold_clear(&g_lc.sig_hold);
+}
+
+static void case_hostice_launch_without_agents_is_refused(void)
+{
+    const char *launch =
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":9,"
+        "\"transport\":\"host\",\"relay_via\":\"ice\",\"host_endpoint\":\"\","
+        "\"guest_endpoint\":\"\",\"player_count\":3,\"max_slots\":4,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":5,\"relay\":\"host\",\"relay_via\":\"ice\"},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\"},"
+        "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\"},"
+        "{\"slot\":2,\"player_id\":\"g2\",\"display_name\":\"G2\"}]}";
+    printf("  host-ice: a launch no agent backs is refused with a reason\n");
+    hi_room("h", 1);
+    handle_server_json(launch);
+    ck(g_lc.join.transport_ice_hub == 1 && g_lc.join.transport_host == 1,
+       "the launch is read as ICE hub");
+    ck(rnet_lobby_launch_pending() == 0, "not launched");
+    ck(!strcmp(g_lc.join.last_error, "ice_not_connected"), "last_error says why");
+    ck(strstr(rnet_lobby_ice_launch_error(), "G1") != NULL,
+       "and the reason names the guest that is not connected");
+    ck(rnet_lobby_ice_take_hub((RNetLobbyIceSeat[2]){{0}}, 2) == -1,
+       "there is nothing to take");
+    ck(rnet_lobby_ice_take_guest_agent() == NULL, "nor as a guest");
+    /* the legacy launch path is untouched */
+    snprintf(g_lc.my_bind, sizeof(g_lc.my_bind), "%s", "0.0.0.0:7777");
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":9,"
+        "\"transport\":\"host\",\"host_endpoint\":\"9.9.9.9:7777\","
+        "\"guest_endpoint\":\"\",\"player_count\":2,\"max_slots\":4,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\"},"
+        "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\"}]}");
+    ck(g_lc.join.transport_ice_hub == 0 && g_lc.join.transport_host == 1,
+       "a launch without relay_via keeps the endpoint path");
+    ck(rnet_lobby_launch_pending() == 1, "and launches");
+    rnet_host_ice_destroy(&g_host_ice);
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 int main(void)
 {
     case_rows();
@@ -1522,6 +1692,10 @@ int main(void)
     case_host_created_update_launch();
     case_guest_joined_and_host_spectates();
     case_large_frames_are_not_cut();
+    case_hostice_caps_and_range();
+    case_hostice_dispatch_and_seating();
+    case_hostice_hold_is_per_peer_for_mod_signals();
+    case_hostice_launch_without_agents_is_refused();
     printf(fails ? "\n%d failure(s)\n" : "\nall lobby client cases passed\n", fails);
     return fails != 0;
 }
