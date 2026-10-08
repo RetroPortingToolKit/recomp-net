@@ -9,7 +9,7 @@
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "FAIL %s:%d %s\n", __FILE__, __LINE__, #c); return 1; } } while (0)
 
 int main(int argc, char **argv) {
-    CHECK(argc == 2);
+    CHECK(argc >= 2);
     void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
     size_t (*info)(RNetModuleInfo *, size_t) = (size_t (*)(RNetModuleInfo *, size_t))dlsym(h, "rnet_module_info");
@@ -30,6 +30,11 @@ int main(int argc, char **argv) {
     void *d = mk();
     CHECK(d);
     rm(d);
+    if (argc == 3 && !strcmp(argv[2], "--info")) {
+        /* what scripts/package-module.sh records in the manifest */
+        printf("abi=%u wire=%u build=%s\n", m.abi_version, m.wire_version, m.build_id);
+        return 0;
+    }
     printf("module_test ok: recomp-net %u.%u.%u abi %u.%u wire %u features 0x%x\n", m.version_major,
            m.version_minor, m.version_patch, m.abi_version, m.abi_minor, m.wire_version, m.features);
     return 0;

@@ -18,3 +18,19 @@ Contract: `include/recomp_net/module.h`.
   fold the wire version into the identity passed to
   `rnet_rb_driver_set_identity`.
 - Gate: `module_test` dlopens the built library and resolves the driver.
+
+## Shipping it
+
+`scripts/package-module.sh <rbengine> <out>` builds the module, runs
+`module_test`, archives the library and writes the platform's manifest fragment.
+It records what the shipped file says about itself (`module_test <lib> --info`),
+and refuses when its build id is not the commit. `scripts/merge-module-manifest.py`
+joins the platforms into `netplay-module-manifest.json` (refusing if they
+disagree on version, commit, ABI or wire version). `.github/workflows/module-release.yml`
+runs both on a tag. Linux x86_64 was built and installed by hand; the workflow
+and the arm64 / macOS legs have not run.
+
+Launchers read the manifest (retcomm-launcher `docs/NETPLAY_MODULE.md`): it
+needs `module_abi.version` to equal the one their runners were built for, checks
+size and SHA-256, and installs only if the extracted library reports the
+manifest's version, commit, ABI and wire version.
