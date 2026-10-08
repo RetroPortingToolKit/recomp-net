@@ -14,6 +14,10 @@ set(RNET_LIBJUICE_ROOT "" CACHE PATH
   "Optional path to libjuice sources (skip FetchContent when set)")
 option(RNET_BUILD_EXAMPLES "Build example programs" ON)
 option(RNET_BUILD_TESTS "Build unit tests" ON)
+option(RNET_BUILD_MODULE
+  "Also build recomp_net_module: one shared library (recomp-net + rbengine) an engine loads at run time (recomp_net/module.h)" OFF)
+set(RNET_RBENGINE_DIR "" CACHE PATH "retcomm-rbengine checkout folded into the module (RNET_BUILD_MODULE)")
+set(RNET_BUILD_ID "unknown" CACHE STRING "Source id reported by rnet_module_info (RNET_BUILD_MODULE)")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -218,6 +222,60 @@ if(MSVC)
   target_compile_options(recomp_net PRIVATE /W4)
 else()
   target_compile_options(recomp_net PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ---- Loadable module ----
+if(RNET_BUILD_MODULE)
+  if(NOT RNET_RBENGINE_DIR)
+    message(FATAL_ERROR "RNET_BUILD_MODULE=ON needs RNET_RBENGINE_DIR (the module exports rbe_*)")
+  endif()
+  add_library(recomp_net_module SHARED ${RNET_CORE_SOURCES} module/rnet_module.c
+    ${RNET_RBENGINE_DIR}/src/snap/rbe_snap_ring.c
+    ${RNET_RBENGINE_DIR}/src/util/rbe_mono_ms.c)
+  target_include_directories(recomp_net_module
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${RNET_RBENGINE_DIR}/include)
+  target_compile_definitions(recomp_net_module PRIVATE
+    RNET_MODULE_HAS_RBENGINE=1 "RNET_BUILD_ID=\"${RNET_BUILD_ID}\""
+    $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
+  if(UNIX)
+    target_compile_definitions(recomp_net_module PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    if(APPLE)
+      target_compile_definitions(recomp_net_module PRIVATE _DARWIN_C_SOURCE)
+    endif()
+  endif()
+  if(WIN32)
+    target_link_libraries(recomp_net_module PUBLIC ws2_32 iphlpapi bcrypt shell32)
+    set_target_properties(recomp_net_module PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  elseif(NOT APPLE)
+    target_link_options(recomp_net_module PRIVATE
+      "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/module/exports.map")
+  endif()
+  if(RNET_ENABLE_ICE)
+    target_compile_definitions(recomp_net_module PRIVATE RNET_ENABLE_ICE=1)
+    foreach(_j IN ITEMS juice-static juice)
+      if(TARGET ${_j})
+        set_target_properties(${_j} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      endif()
+    endforeach()
+    target_link_libraries(recomp_net_module PRIVATE Libjuice::Libjuice)
+  endif()
+  if(UNIX AND NOT APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(recomp_net_module PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(recomp_net_module PRIVATE /W4)
+  else()
+    target_compile_options(recomp_net_module PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  if(RNET_BUILD_TESTS AND UNIX)
+    add_executable(module_test tests/module_test.c)
+    target_include_directories(module_test PRIVATE include)
+    target_link_libraries(module_test PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME module_test COMMAND module_test $<TARGET_FILE:recomp_net_module>)
+  endif()
+  install(TARGETS recomp_net_module LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
 endif()
 
 # ---- Examples ----
