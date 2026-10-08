@@ -20,11 +20,11 @@ case "$(uname -s)-$(uname -m)" in
 esac
 KEY=${3:-$KEY}
 commit=$(git -C "$here" rev-parse HEAD)
-ver=$(sed -n 's/^project(recomp_net VERSION \([0-9.]*\).*/\1/p' "$here/CMakeLists.txt")
+ver=${VERSION:-$(sed -n 's/^project(recomp_net VERSION \([0-9.]*\).*/\1/p' "$here/CMakeLists.txt")}
 mkdir -p "$OUT"; B=$(mktemp -d)
 cmake -S "$here" -B "$B" -G Ninja -DCMAKE_BUILD_TYPE=Release -DRNET_BUILD_MODULE=ON \
   -DRNET_RBENGINE_DIR="$RBE" -DRNET_BUILD_EXAMPLES=OFF -DRNET_BUILD_TESTS=ON \
-  -DRNET_BUILD_ID="$commit" >/dev/null
+  -DRNET_BUILD_ID="$commit" -DRNET_BUILD_VERSION="$ver" >/dev/null
 ninja -C "$B" recomp_net_module module_test >/dev/null
 ctest --test-dir "$B" -R module_test --output-on-failure >/dev/null
 archive="recomp-net-module-$ver-$KEY.tar.gz"
@@ -35,6 +35,8 @@ sha=$(sum "$OUT/$archive" | cut -d' ' -f1); echo "$sha  $archive" > "$OUT/$archi
 # What the shipped file says about itself.
 V=$(mktemp -d); tar -C "$V" -xzf "$OUT/$archive"
 info=$("$B/module_test" "$V/$LIB" --info)
+got=$(sed -n 's/^version=\([0-9.]*\) .*/\1/p' <<<"$info")
+[ "$got" = "$ver" ] || { echo "library reports version $got, not $ver" >&2; exit 1; }
 abi=$(sed -n 's/.*abi=\([0-9]*\).*/\1/p' <<<"$info"); wire=$(sed -n 's/.*wire=\([0-9]*\).*/\1/p' <<<"$info")
 built=$(sed -n 's/.*build=\([0-9a-f]*\).*/\1/p' <<<"$info")
 [ "$built" = "$commit" ] || { echo "library reports build $built, not $commit" >&2; exit 1; }

@@ -26,7 +26,7 @@ Contract: `include/recomp_net/module.h`.
 It records what the shipped file says about itself (`module_test <lib> --info`),
 and refuses when its build id is not the commit. `scripts/merge-module-manifest.py`
 joins the platforms into `netplay-module-manifest.json` (refusing if they
-disagree on version, commit, ABI or wire version). `.github/workflows/module-release.yml`
+disagree on version, commit, ABI or wire version). `.github/workflows/release.yml`
 runs both on a tag. Linux x86_64 was built and installed by hand; the workflow
 and the arm64 / macOS legs have not run.
 
