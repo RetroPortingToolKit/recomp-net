@@ -1,5 +1,6 @@
 #include "recomp_net/module.h"
 #include "recomp_net/recomp_net.h"
+#include "protocol/rnet_protocol.h"
 
 #include <string.h>
 
@@ -13,7 +14,7 @@ size_t rnet_module_info(RNetModuleInfo *out, size_t out_size) {
     m.struct_size = (rnet_u32)sizeof m;
     m.abi_version = RNET_MODULE_ABI_VERSION;
     m.abi_minor = RNET_MODULE_ABI_MINOR;
-    m.wire_version = RNET_MODULE_WIRE_VERSION;
+    m.wire_version = RNET_WIRE_VERSION;
 #ifdef RNET_ENABLE_ICE
     m.features |= RNET_MODULE_FEATURE_ICE;
 #endif

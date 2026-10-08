@@ -18,12 +18,14 @@
  *                 needs. The version moves only when a layout or signature
  *                 changes, and then every older loader refuses.
  *   abi_minor     Bumped when symbols or trailing struct fields are added.
- *   wire_version  The peer-to-peer protocol. Two peers can play only when
- *                 their wire_versions are equal. It is independent of the
- *                 ABI: a wire change that keeps the ABI still must bump this.
- *                 Engines fold it into the identity they advertise to peers
- *                 (rnet_rb_driver_set_identity), so a module update can never
- *                 silently pair two peers that cannot agree.
+ *   wire_version  The peer-to-peer protocol: RNET_WIRE_VERSION, the byte HELLO
+ *                 carries (src/protocol/rnet_protocol.h). A session never
+ *                 links with a peer of another wire version, so this is
+ *                 already enforced on the wire; it is reported so a launcher
+ *                 can say it beforehand. It is independent of the ABI: a wire
+ *                 change that keeps the ABI still bumps it. Engines also fold
+ *                 it into the identity they advertise
+ *                 (rnet_rb_driver_set_identity), so the refusal is named.
  *
  * The module exports every public rnet_* and rbe_* function under its own
  * name, so a loader resolves them with dlsym/GetProcAddress. A loader that
@@ -39,7 +41,6 @@ extern "C" {
 
 #define RNET_MODULE_ABI_VERSION 1u
 #define RNET_MODULE_ABI_MINOR 0u
-#define RNET_MODULE_WIRE_VERSION 1u
 
 #define RNET_MODULE_FEATURE_ICE (1u << 0)      /* built with libjuice */
 #define RNET_MODULE_FEATURE_RBENGINE (1u << 1) /* exports rbe_* */

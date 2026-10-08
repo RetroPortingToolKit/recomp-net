@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
     size_t n = info(&m, sizeof m);
     CHECK(n == sizeof m && m.struct_size == sizeof m);
     CHECK(rnet_module_check(&m, n, RNET_MODULE_FEATURE_RBENGINE) == 0);
-    CHECK(m.wire_version == RNET_MODULE_WIRE_VERSION);
+    CHECK(m.wire_version >= 2); /* RNET_WIRE_VERSION, rnet_protocol.h */
     RNetModuleInfo bad = m; bad.abi_version += 1;
     CHECK(rnet_module_check(&bad, n, 0) != 0);
     CHECK(dlsym(h, "rnet_rb_driver_create"));

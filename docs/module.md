@@ -14,7 +14,7 @@ Contract: `include/recomp_net/module.h`.
   (Linux: `module/exports.map`; Windows: export-all). Nothing else is.
 - **Bump `RNET_MODULE_ABI_VERSION`** when a struct layout or signature changes;
   **`ABI_MINOR`** when symbols or trailing fields are added;
-  **`RNET_MODULE_WIRE_VERSION`** on any change two peers must agree on. Engines
+  the wire version is `RNET_WIRE_VERSION` (rnet_protocol.h): bump it on any change two peers must agree on, and the module reports it. Engines
   fold the wire version into the identity passed to
   `rnet_rb_driver_set_identity`.
 - Gate: `module_test` dlopens the built library and resolves the driver.
