@@ -245,6 +245,7 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
 #define RNET_STATE_OP_LOAD 1 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_SRAM 2 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_RB_KF 3 /* rollback FMV media keyframe (raw boot_state snap) */
+#define RNET_STATE_OP_MENU 6 /* host-authoritative paused snapshot */
 #define RNET_STATE_OP_BOOT 4 /* post-BIOS host snap barrier (boot_state blob) */
 /* Guest-owned memory card upload. The ONLY peer→host op: a seated guest sends
  * its card to the host before the host's SRAM broadcast, so the host can fold
@@ -518,6 +519,10 @@ int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *targ
  * only let a stale set win a race against the current one.
  */
 int rnet_session_send_modset(RNetSession *s, const char *text);
+/* Nonzero once a peer's HELLO carried another wire version (RNET_WIRE_VERSION
+ * in src/protocol): that peer's version, or -1 for a peer that predates the
+ * field. The session never links with it; a host can say why it stalled. */
+int rnet_session_peer_wire_version_mismatch(const RNetSession *s);
 /* 1 and fills `out` when a set has arrived since the last take, else 0. */
 int rnet_session_take_modset(RNetSession *s, char *out, rnet_u32 cap);
 int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,

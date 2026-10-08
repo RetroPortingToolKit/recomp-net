@@ -31,6 +31,7 @@ set(RNET_CORE_SOURCES
   src/input/rnet_input_hist.c
   src/rollback/rnet_rollback.c
   src/rollback/rnet_hash_confirm.c
+  src/rollback/rnet_rb_quorum.c
   src/rollback/rnet_rb_driver.c
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
@@ -401,6 +402,13 @@ if(RNET_BUILD_TESTS)
   endif()
   add_test(NAME session_state_test COMMAND session_state_test)
 
+  add_executable(session_state_multipeer_test tests/session_state_multipeer_test.c)
+  target_link_libraries(session_state_multipeer_test PRIVATE recomp_net)
+  if(UNIX)
+    target_compile_definitions(session_state_multipeer_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
+  add_test(NAME session_state_multipeer_test COMMAND session_state_multipeer_test)
+
   add_executable(state_replay_test tests/state_replay_test.c)
   target_include_directories(state_replay_test PRIVATE src)
   target_link_libraries(state_replay_test PRIVATE recomp_net)
@@ -436,6 +444,10 @@ if(RNET_BUILD_TESTS)
   add_executable(hash_confirm_test tests/hash_confirm_test.c)
   target_link_libraries(hash_confirm_test PRIVATE recomp_net)
   add_test(NAME hash_confirm_test COMMAND hash_confirm_test)
+
+  add_executable(rb_quorum_test tests/rb_quorum_test.c)
+  target_link_libraries(rb_quorum_test PRIVATE recomp_net)
+  add_test(NAME rb_quorum_test COMMAND rb_quorum_test)
 
   add_executable(input_hist_test tests/input_hist_test.c)
   target_link_libraries(input_hist_test PRIVATE recomp_net)

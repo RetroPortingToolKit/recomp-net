@@ -94,8 +94,11 @@ typedef struct RNetRbCorrection
 
 /* Opaque per-slot input row the library seals and replays. The library never
  * interprets the payload beyond the stick-replace contract view.
- * analog: host pad type (0 = digital / poll 0x41, 1 = DualShock / 0x73).
- * Carried on the seal wire in RNetRbWireFrame.source (was always 0). */
+ * analog: host pad type (0 = digital / poll 0x41, 1 = DualShock / 0x73,
+ * 2 = JogCon / 0xE3, 3 = NeGcon / 0x23). The library treats it as an opaque
+ * byte: carried unchanged through input history and on the seal wire in
+ * RNetRbWireFrame.source (was always 0). The host decides what stick_x /
+ * stick_y mean for each type (e.g. NeGcon twist and L pressure). */
 typedef struct RNetRbFrame
 {
     uint32_t tick;
@@ -105,6 +108,12 @@ typedef struct RNetRbFrame
     uint8_t is_predicted;
     uint8_t is_valid;
     uint8_t analog;
+    /* The rest of the presented pad (host-defined, opaque like stick_x/y):
+     * e.g. DualShock right stick, NeGcon analog I / II. Carried through input
+     * history, invention and the seal wire (wire version 2), so a replayed
+     * row is the whole pad every peer simulated. */
+    uint8_t rx;
+    uint8_t ry;
 } RNetRbFrame;
 
 typedef struct RNetRbEvent

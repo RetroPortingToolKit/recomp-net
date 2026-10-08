@@ -1515,7 +1515,7 @@ static int parse_mod_pkg_array(const char *json, const char *key,
     p++;
 
     while (*p && n < max) {
-        char obj[512];
+        char obj[1024];
         const char *start;
         int depth = 0;
         int in_str = 0;
@@ -1548,6 +1548,7 @@ static int parse_mod_pkg_array(const char *json, const char *key,
         json_get_str(obj, "ver", row.ver, sizeof(row.ver));
         json_get_str(obj, "n", row.name, sizeof(row.name));
         json_get_str(obj, "f", row.feats, sizeof(row.feats));
+        json_get_str(obj, "nf", row.nf, sizeof(row.nf));
         if (!row.id[0] || !row.ver[0])
             continue;
         out[n++] = row;
@@ -1575,6 +1576,7 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
         char ver_esc[JSON_ESC_CAP(RNET_LOBBY_MOD_VER_LEN)];
         char name_esc[RNET_LOBBY_MOD_NAME_LEN * 2 + 4];
         char feats_esc[RNET_LOBBY_MOD_FEATS_LEN * 2 + 4];
+        char nf_esc[RNET_LOBBY_MOD_FEATS_LEN * 2 + 4];
         if (!pkgs[i].id[0] || !pkgs[i].ver[0]) continue;
         /* id and ver are escaped for the same reason n and f already were:
          * they come from package metadata, which a crafted package -- or an
@@ -1583,10 +1585,15 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
         json_escape(pkgs[i].ver, ver_esc, sizeof(ver_esc));
         json_escape(pkgs[i].name, name_esc, sizeof(name_esc));
         json_escape(pkgs[i].feats, feats_esc, sizeof(feats_esc));
+        json_escape(pkgs[i].nf, nf_esc, sizeof(nf_esc));
+        /* "nf" only when there is something to say: it is an offer-row field,
+         * and an absent key already reads as "nothing missing". */
         n = snprintf(dst + used, cap - used,
-                     "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"}",
+                     "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"%s%s%s}",
                      wrote ? "," : "",
-                     id_esc, ver_esc, name_esc, feats_esc);
+                     id_esc, ver_esc, name_esc, feats_esc,
+                     nf_esc[0] ? ",\"nf\":\"" : "", nf_esc,
+                     nf_esc[0] ? "\"" : "");
         if (n < 0 || (size_t)n >= cap - used) return 0;
         used += (size_t)n;
         wrote++;
@@ -1611,6 +1618,9 @@ static void *g_mod_offer_ctx;
  * rnet_lobby_disconnect memsets g_lc, and a setting made before a reconnect
  * must still be there when the create goes out. */
 static int g_allow_spectators_pref;
+/* rnet_lobby_set_launch_blocked: file scope for the same reason -- whether
+ * this peer has a game image to boot does not change on a reconnect. */
+static int g_launch_blocked;
 
 static RNetLobbyModExportFn  g_mod_export_fn;
 static RNetLobbyModFreeFn    g_mod_free_fn;
@@ -2552,7 +2562,8 @@ static void handle_server_json(const char *json)
          * thousands of frames per second across the room, behind which the
          * rematch's op:launch was never read (Genesis, 4 players + 1
          * spectator, round 2: no peer launched). */
-        if (g_lc.in_lobby && !g_lc.local_ready && !g_lc.join.local_is_spectator) {
+        if (g_lc.in_lobby && !g_lc.local_ready && !g_lc.join.local_is_spectator &&
+            !g_launch_blocked) {
             send_set_ready(1);
             flush_pending();
         }
@@ -4046,6 +4057,9 @@ static void send_set_ready(int ready)
     char offer[RNET_LOBBY_MAX_MODS * 256 + 64];
     int n;
 
+    /* Every caller, the auto-arms included: a peer with nothing to boot is
+     * not ready, whoever asks. */
+    if (g_launch_blocked) ready = 0;
     offer[0] = '\0';
     if (g_mod_offer_fn && !append_mod_offer(offer, sizeof(offer))) {
         /* Ready without the offer rather than not ready at all: the host's
@@ -4074,6 +4088,42 @@ int rnet_lobby_set_ready(int ready)
     send_set_ready(ready);
     flush_pending();
     return 0;
+}
+
+void rnet_lobby_set_launch_blocked(int blocked)
+{
+    blocked = blocked ? 1 : 0;
+    if (blocked == g_launch_blocked) return;
+    g_launch_blocked = blocked;
+    fprintf(stderr, "rnet_lobby: %s\n",
+            blocked ? "no bootable game image; announcing not ready"
+                    : "game image ready; announcing ready");
+    /* A spectator's ready is never read back (see lobby_update). */
+    if (!rnet_lobby_connected() || !g_lc.in_lobby ||
+        g_lc.join.local_is_spectator)
+        return;
+    send_set_ready(!blocked);
+    flush_pending();
+}
+
+int rnet_lobby_match_blocked_by_unready(char *who, size_t who_cap)
+{
+    int n;
+    int blocked = 0;
+
+    if (who && who_cap) who[0] = '\0';
+    if (!g_lc.in_lobby)
+        return 0;
+    for (n = 0; n < g_lc.member_count; ++n) {
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            continue;              /* the host checks its own image locally */
+        if (g_lc.members[n].is_spectator || g_lc.members[n].ready)
+            continue;
+        ++blocked;
+        if (who && who_cap && !who[0])
+            snprintf(who, who_cap, "%s", g_lc.members[n].display_name);
+    }
+    return blocked;
 }
 
 /*
@@ -4235,12 +4285,120 @@ int rnet_lobby_local_missing_mods(void)
     return 0;
 }
 
+/* Is `item` one of the entries of the comma-separated `list`? */
+static int csv_has(const char *list, const char *item, size_t item_len)
+{
+    const char *p = list;
+    if (!list || !item || !item_len) return 0;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == item_len && !strncmp(p, item, len)) return 1;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+/* Plan features the member at `n` holds the package for but has not provided
+ * the required files for, by its own offer. Appends "package/feature" pairs,
+ * ';'-separated, to `what` when given. A package the peer lacks entirely is
+ * counted by member_missing_count instead -- it cannot have files for code it
+ * does not have, and the remedy (download it) is a different one. */
+static int member_files_missing_count(int n, char *what, size_t what_cap)
+{
+    const RNetLobbyMatchCaps *caps = &g_lc.match_caps;
+    int missing = 0;
+    int i;
+    int j;
+
+    if (what && what_cap) what[0] = '\0';
+    if (n < 0 || n >= RNET_LOBBY_MAX_MEMBERS)
+        return 0;
+    for (i = 0; i < caps->mod_count; ++i) {
+        const RNetLobbyModPkg *offer = NULL;
+        const char *p;
+        for (j = 0; j < g_lc.member_offer_count[n]; ++j)
+            if (!strcmp(g_lc.member_offer[n][j].id, caps->mods[i].id)) {
+                offer = &g_lc.member_offer[n][j];
+                break;
+            }
+        if (!offer || !offer->nf[0])
+            continue;
+        for (p = caps->mods[i].feats; *p;) {
+            const char *end = strchr(p, ',');
+            const size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (csv_has(offer->nf, p, len)) {
+                missing++;
+                if (what && what_cap) {
+                    const size_t used = strlen(what);
+                    snprintf(what + used, what_cap - used, "%s%s/%.*s",
+                             used ? ";" : "", caps->mods[i].id, (int)len, p);
+                }
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    return missing;
+}
+
+int rnet_lobby_match_blocked_by_files(char *who, size_t who_cap,
+                                      char *what, size_t what_cap)
+{
+    int n;
+    int blocked = 0;
+
+    if (who && who_cap) who[0] = '\0';
+    if (what && what_cap) what[0] = '\0';
+    if (!g_lc.in_lobby || g_lc.match_caps.mod_count <= 0)
+        return 0;
+    for (n = 0; n < g_lc.member_count; ++n) {
+        char pairs[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_FEATS_LEN + 2];
+        int missing;
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            continue;              /* the host checks its own files locally */
+        if (g_lc.members[n].is_spectator)
+            continue;
+        missing = member_files_missing_count(n, pairs, sizeof(pairs));
+        if (missing <= 0)
+            continue;
+        blocked += missing;
+        if (who && who_cap && !who[0])
+            snprintf(who, who_cap, "%s", g_lc.members[n].display_name);
+        if (what && what_cap && !what[0]) {
+            const char *semi = strchr(pairs, ';');
+            snprintf(what, what_cap, "%.*s",
+                     semi ? (int)(semi - pairs) : (int)strlen(pairs), pairs);
+        }
+    }
+    return blocked;
+}
+
+int rnet_lobby_member_mod_readiness(int index, int *mods_missing,
+                                    int *files_missing, char *files,
+                                    size_t files_cap)
+{
+    if (mods_missing) *mods_missing = 0;
+    if (files_missing) *files_missing = 0;
+    if (files && files_cap) files[0] = '\0';
+    if (!g_lc.in_lobby || index < 0 || index >= g_lc.member_count ||
+        g_lc.match_caps.mod_count <= 0)
+        return 0;
+    if (mods_missing) *mods_missing = member_missing_count(index);
+    if (files_missing)
+        *files_missing = member_files_missing_count(index, files, files_cap);
+    else
+        (void)member_files_missing_count(index, files, files_cap);
+    return 1;
+}
+
 int rnet_lobby_request_start(const RNetLobbyMatchCaps *match_caps)
 {
     char msg[RNET_LOBBY_MAX_MODS * 256 + 1024];
     char caps_json[RNET_LOBBY_MAX_MODS * 256 + 512];
     char who[RNET_LOBBY_NAME_LEN];
-    char what[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_VER_LEN + 2];
+    char what[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_FEATS_LEN + 2];
     int n;
     if (!rnet_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host) {
         return -1;
@@ -4259,6 +4417,38 @@ int rnet_lobby_request_start(const RNetLobbyMatchCaps *match_caps)
                 "rnet_lobby: not starting -- %s does not have %s (and possibly "
                 "more). They can download it from you in the lobby.\n",
                 who[0] ? who : "a player", what[0] ? what : "a required mod");
+        return -1;
+    }
+    /* Having the package is not enough when one of its enabled features runs
+     * on an owner-supplied file (another game's ROM, say): the peer's commit
+     * would refuse the plan at launch. Hold here instead, where the host can
+     * see who is still choosing a file. */
+    if (rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                          sizeof(what)) > 0) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "peer_needs_files");
+        fprintf(stderr,
+                "rnet_lobby: not starting -- %s has not selected the files %s "
+                "needs (and possibly more).\n",
+                who[0] ? who : "a player", what[0] ? what : "a required mod");
+        return -1;
+    }
+    /* Nothing above helps a peer that has no game to boot: it would be
+     * launched into a match it never joins. It says so by staying not ready
+     * (rnet_lobby_set_launch_blocked). */
+    if (g_launch_blocked) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "local_not_ready");
+        fprintf(stderr, "rnet_lobby: not starting -- this peer has no "
+                        "bootable game image.\n");
+        return -1;
+    }
+    if (rnet_lobby_match_blocked_by_unready(who, sizeof(who)) > 0) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "peer_not_ready");
+        fprintf(stderr, "rnet_lobby: not starting -- %s is not ready (no "
+                        "game image selected, or still settling).\n",
+                who[0] ? who : "a player");
         return -1;
     }
     if (match_caps && match_caps->valid) g_lc.match_caps = *match_caps;
