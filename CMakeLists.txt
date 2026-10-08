@@ -17,6 +17,8 @@ option(RNET_BUILD_TESTS "Build unit tests" ON)
 option(RNET_BUILD_MODULE
   "Also build recomp_net_module: one shared library (recomp-net + rbengine) an engine loads at run time (recomp_net/module.h)" OFF)
 set(RNET_RBENGINE_DIR "" CACHE PATH "retcomm-rbengine checkout folded into the module (RNET_BUILD_MODULE)")
+set(RNET_BUILD_VERSION "" CACHE STRING "Release version (x.y.z) the module reports; empty: the library version (RNET_BUILD_MODULE)")
+set(RNET_BUILD_VERSION "" CACHE STRING "Release version (x.y.z) the module reports; empty: the library version (RNET_BUILD_MODULE)")
 set(RNET_BUILD_ID "unknown" CACHE STRING "Source id reported by rnet_module_info (RNET_BUILD_MODULE)")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -238,6 +240,20 @@ if(RNET_BUILD_MODULE)
   target_compile_definitions(recomp_net_module PRIVATE
     RNET_MODULE_HAS_RBENGINE=1 "RNET_BUILD_ID=\"${RNET_BUILD_ID}\""
     $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
+  if(RNET_BUILD_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    target_compile_definitions(recomp_net_module PRIVATE
+      RNET_MODULE_VERSION_MAJOR=${CMAKE_MATCH_1} RNET_MODULE_VERSION_MINOR=${CMAKE_MATCH_2}
+      RNET_MODULE_VERSION_PATCH=${CMAKE_MATCH_3})
+  elseif(RNET_BUILD_VERSION)
+    message(FATAL_ERROR "RNET_BUILD_VERSION must be x.y.z, got '${RNET_BUILD_VERSION}'")
+  endif()
+  if(RNET_BUILD_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    target_compile_definitions(recomp_net_module PRIVATE
+      RNET_MODULE_VERSION_MAJOR=${CMAKE_MATCH_1} RNET_MODULE_VERSION_MINOR=${CMAKE_MATCH_2}
+      RNET_MODULE_VERSION_PATCH=${CMAKE_MATCH_3})
+  elseif(RNET_BUILD_VERSION)
+    message(FATAL_ERROR "RNET_BUILD_VERSION must be x.y.z, got '${RNET_BUILD_VERSION}'")
+  endif()
   if(UNIX)
     target_compile_definitions(recomp_net_module PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
     if(APPLE)

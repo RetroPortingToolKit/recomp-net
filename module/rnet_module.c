@@ -21,9 +21,21 @@ size_t rnet_module_info(RNetModuleInfo *out, size_t out_size) {
 #ifdef RNET_MODULE_HAS_RBENGINE
     m.features |= RNET_MODULE_FEATURE_RBENGINE;
 #endif
+#ifdef RNET_MODULE_VERSION_MAJOR /* a release build: the tag's version */
+    m.version_major = RNET_MODULE_VERSION_MAJOR;
+    m.version_minor = RNET_MODULE_VERSION_MINOR;
+    m.version_patch = RNET_MODULE_VERSION_PATCH;
+#else
+#ifdef RNET_MODULE_VERSION_MAJOR /* a release build: the tag's version */
+    m.version_major = RNET_MODULE_VERSION_MAJOR;
+    m.version_minor = RNET_MODULE_VERSION_MINOR;
+    m.version_patch = RNET_MODULE_VERSION_PATCH;
+#else
     m.version_major = RNET_VERSION_MAJOR;
     m.version_minor = RNET_VERSION_MINOR;
     m.version_patch = RNET_VERSION_PATCH;
+#endif
+#endif
     m.build_id = RNET_BUILD_ID;
     if (!out) return 0;
     size_t n = out_size < sizeof m ? out_size : sizeof m;

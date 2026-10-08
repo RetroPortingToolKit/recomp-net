@@ -32,7 +32,8 @@ int main(int argc, char **argv) {
     rm(d);
     if (argc == 3 && !strcmp(argv[2], "--info")) {
         /* what scripts/package-module.sh records in the manifest */
-        printf("abi=%u wire=%u build=%s\n", m.abi_version, m.wire_version, m.build_id);
+        printf("version=%u.%u.%u abi=%u wire=%u build=%s\n", m.version_major, m.version_minor,
+               m.version_patch, m.abi_version, m.wire_version, m.build_id);
         return 0;
     }
     printf("module_test ok: recomp-net %u.%u.%u abi %u.%u wire %u features 0x%x\n", m.version_major,
