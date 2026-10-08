@@ -2551,6 +2551,20 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
+        /* The server clears every guest's path report on a roster change and
+         * says so only by omitting `path` from the seat rows: prove ours again
+         * now (rnet_host_relay_path_cleared). */
+        {
+            int i;
+            for (i = 0; i < g_lc.member_count; ++i) {
+                const RNetLobbyMember *m = &g_lc.members[i];
+                if (m->is_spectator || !g_lc.player_id[0] ||
+                    strcmp(m->player_id, g_lc.player_id) != 0)
+                    continue;
+                if (!m->path[0]) rnet_host_relay_path_cleared(g_host_relay);
+                break;
+            }
+        }
         /* Kick/move/start clear ready; re-arm so host Play keeps working on
          * servers that still require all_ready.
          *
