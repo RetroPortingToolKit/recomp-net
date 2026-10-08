@@ -24,6 +24,7 @@ extern "C" {
 #define RNET_PKT_STATE_PROBE_REPLY 12 /* guest→host: match (skip xfer) or not */
 /* GBA Multi transfer barrier (0-delay SEND exchange; not pad INPUT). */
 #define RNET_PKT_SIO_MULTI_XFER 13
+#define RNET_PKT_STATE_PROBE_DONE 14 /* host→guest: every seat matched; release parked guests */
 
 /*
  * Rollback control range (reserved, additive). Delay-sync hosts never emit or
@@ -80,9 +81,11 @@ typedef struct RNetWireFrame
     rnet_u8 bytes[RNET_INPUT_MAX];
 } RNetWireFrame;
 
-/* Rollback seal-row wire frame: fixed 7 bytes (buttons 2 + sticks 2 + source +
- * predicted + valid), tick carried by packet row_begin + index.
- * source: host pad type — 0 digital, 1 DualShock (RNetRbFrame.analog). */
+/* Rollback seal-row wire frame: fixed 9 bytes (buttons 2 + sticks 2 + source +
+ * predicted + valid + rx + ry; wire version 2), tick carried by packet
+ * row_begin + index.
+ * source: host pad type — 0 digital, 1 DualShock, 2 JogCon, 3 NeGcon
+ * (RNetRbFrame.analog), copied verbatim. */
 typedef struct RNetRbWireFrame
 {
     rnet_u16 buttons;
@@ -91,9 +94,15 @@ typedef struct RNetRbWireFrame
     rnet_u8 source;
     rnet_u8 is_predicted;
     rnet_u8 is_valid;
+    rnet_u8 rx;
+    rnet_u8 ry;
 } RNetRbWireFrame;
 
-#define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 7u
+#define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 9u
+/* Wire version, sent in HELLO's former reserved byte (0 from a peer that
+ * predates it). Peers of different versions refuse to link: version 2 widened
+ * the seal-row frame, which an older peer would misparse. */
+#define RNET_WIRE_VERSION 2u
 /* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
  * chunks its own seal rows has to know the bound the send path enforces. */
 
@@ -149,6 +158,10 @@ int rnet_proto_encode_state_probe_ex(rnet_u8 *out, size_t cap, rnet_u32 magic, r
 int rnet_proto_encode_state_probe_reply(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
                                         rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot, rnet_u8 match,
                                         rnet_u32 total_size, rnet_u32 payload_crc);
+/* Host releases matching guests only after every expected seat replied "match". */
+int rnet_proto_encode_state_probe_done(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                       rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot,
+                                       rnet_u32 total_size, rnet_u32 payload_crc);
 
 /* GBA Multi: one peer's SIOMLT_SEND for transfer seq (mGBA-style barrier).
  * `confirm_pad` u16: lo = Confirm IRQ watermark (0..2+); hi = local VBlank
@@ -194,6 +207,7 @@ typedef struct RNetDecodedPacket
     rnet_u8 local_slot;
     rnet_u8 slot_count;
     rnet_u8 delay;
+    rnet_u8 wire_version; /* HELLO: RNET_WIRE_VERSION of the sender, 0 = older */
     rnet_u32 start_tick;
     rnet_u32 ack_tick;
     rnet_u8 ack_count;
@@ -202,7 +216,7 @@ typedef struct RNetDecodedPacket
     rnet_u32 effective_tick;
     rnet_u32 confirm_sim_tick;
     rnet_u32 confirm_hash;
-    rnet_u16 input_epoch; /* INPUT / INPUT_CONFIRM generation (hard_resync) */
+    rnet_u16 input_epoch; /* Input and rollback generation (hard_resync). */
     int frame_count;
     RNetWireFrame frames[RNET_MAX_BUNDLE];
     /* STATE_* */
@@ -252,6 +266,10 @@ typedef struct RNetDecodedPacket
     rnet_u8 sio_confirm; /* Confirm IRQ watermark (pad lo byte) */
     rnet_u8 sio_vblank;  /* local VBlank mod 256 (pad hi byte) */
 } RNetDecodedPacket;
+
+/* Add a generation trailer to rollback control packets. */
+int rnet_proto_is_rb_control(rnet_u16 type);
+int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch);
 
 /* Returns 0 on success. */
 int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RNetDecodedPacket *out);

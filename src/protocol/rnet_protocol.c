@@ -58,6 +58,22 @@ static int finish_packet(rnet_u8 *out, rnet_u8 *cursor, size_t cap)
     return (int)(cursor - out);
 }
 
+int rnet_proto_is_rb_control(rnet_u16 type)
+{
+    return type == RNET_PKT_RB_SYNC || type == RNET_PKT_RB_SEAL_ROWS ||
+           type == RNET_PKT_RB_BASELINE || type == RNET_PKT_RB_POST ||
+           type == RNET_PKT_RB_FRAME_COMMIT || type == RNET_PKT_RB_RESOLVED;
+}
+
+int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch)
+{
+    rnet_u8 *c;
+    if (size < 14 || size + 2 > cap) return -1;
+    c = buf + size - 4;
+    write_u16(&c, epoch);
+    return finish_packet(buf, c, cap);
+}
+
 int rnet_proto_encode_hello(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id, rnet_u8 local_slot,
                             rnet_u8 slot_count, rnet_u8 delay)
 {
@@ -72,7 +88,7 @@ int rnet_proto_encode_hello(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 s
     *c++ = local_slot;
     *c++ = slot_count;
     *c++ = delay;
-    *c++ = 0;
+    *c++ = (rnet_u8)RNET_WIRE_VERSION;
     return finish_packet(out, c, cap);
 }
 
@@ -347,6 +363,27 @@ int rnet_proto_encode_state_probe_reply(rnet_u8 *out, size_t cap, rnet_u32 magic
     return finish_packet(out, c, cap);
 }
 
+int rnet_proto_encode_state_probe_done(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
+                                       rnet_u8 local_slot, rnet_u8 op, rnet_u8 slot,
+                                       rnet_u32 total_size, rnet_u32 payload_crc)
+{
+    rnet_u8 *c = out;
+    if (cap < 28)
+    {
+        return -1;
+    }
+    write_u32(&c, magic);
+    write_u16(&c, RNET_PKT_STATE_PROBE_DONE);
+    write_u32(&c, session_id);
+    *c++ = local_slot;
+    *c++ = op;
+    *c++ = slot;
+    *c++ = 0;
+    write_u32(&c, total_size);
+    write_u32(&c, payload_crc);
+    return finish_packet(out, c, cap);
+}
+
 /* ---- Rollback control packets (reserved range; rollback-mode only) ---- */
 
 int rnet_proto_encode_sio_multi_xfer(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
@@ -400,7 +437,9 @@ static void write_rb_frame(rnet_u8 **cursor, const RNetRbWireFrame *f)
     (*cursor)[2] = f->source;
     (*cursor)[3] = f->is_predicted;
     (*cursor)[4] = f->is_valid;
-    *cursor += 5;
+    (*cursor)[5] = f->rx;
+    (*cursor)[6] = f->ry;
+    *cursor += 7;
 }
 
 static void read_rb_frame(const rnet_u8 **cursor, RNetRbWireFrame *f)
@@ -411,7 +450,9 @@ static void read_rb_frame(const rnet_u8 **cursor, RNetRbWireFrame *f)
     f->source = (*cursor)[2];
     f->is_predicted = (*cursor)[3];
     f->is_valid = (*cursor)[4];
-    *cursor += 5;
+    f->rx = (*cursor)[5];
+    f->ry = (*cursor)[6];
+    *cursor += 7;
 }
 
 int rnet_proto_encode_rb_seal_rows(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
@@ -638,7 +679,7 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->local_slot = *c++;
         out->slot_count = *c++;
         out->delay = *c++;
-        (void)*c++;
+        out->wire_version = *c++;
         break;
     case RNET_PKT_READY:
         if ((size_t)(end - c) < 4)
@@ -795,6 +836,18 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         out->state_total_size = read_u32(&c);
         out->state_payload_crc = read_u32(&c);
         break;
+    case RNET_PKT_STATE_PROBE_DONE:
+        if ((size_t)(end - c) < 12)
+        {
+            return -1;
+        }
+        out->local_slot = *c++;
+        out->state_op = *c++;
+        out->state_slot = *c++;
+        c++;
+        out->state_total_size = read_u32(&c);
+        out->state_payload_crc = read_u32(&c);
+        break;
     case RNET_PKT_SIO_MULTI_XFER:
         if ((size_t)(end - c) < 10)
         {
@@ -842,7 +895,8 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         {
             return -1;
         }
-        if ((size_t)(end - c) < ((size_t)out->rb_row_count * 5u))
+        if ((size_t)(end - c) <
+            ((size_t)out->rb_row_count * RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES))
         {
             return -1;
         }
@@ -932,6 +986,11 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         break;
     default:
         return -1;
+    }
+    if (rnet_proto_is_rb_control(out->type)) {
+        /* Legacy packets are generation zero. A post-load session rejects them. */
+        if (end - c == 2) out->input_epoch = read_u16(&c);
+        else if (end != c) return -1;
     }
     return 0;
 }
