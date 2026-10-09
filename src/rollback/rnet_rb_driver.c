@@ -4023,6 +4023,19 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
             rb_stats_seat_tip(d, s, slot, &st_seat);
             if (rnet_sched_on_remote_miss(slot, d->sim, wire, &st_seat,
                                           d->prediction_cap, &why)) {
+                /* Same wedge as lockstep above: outside a grace wait (which
+                 * times out into an invent) the scheduler is waiting for a
+                 * REAL row -- cushion_rebuild, boot_tip_wait -- and that is
+                 * the row the injector is hiding. Release it; the retry
+                 * admits the real row. */
+                size_t wl = why ? strlen(why) : 0;
+                if (d->force_invent_slot == slot &&
+                    !(wl > 6 && !strcmp(why + wl - 6, "_grace"))) {
+                    rb_log_raw(d, "rbe: injected mispredict cancelled slot=%d "
+                                  "sim=%u — scheduler stalled (%s)\n", slot,
+                               (unsigned)d->sim, why ? why : "remote_miss");
+                    d->force_invent_slot = -1;
+                }
                 d->stall_tag = why ? why : "remote_miss";
                 return RNET_RB_ADMIT_STALL;
             }
