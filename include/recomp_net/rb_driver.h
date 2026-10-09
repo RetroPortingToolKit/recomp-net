@@ -312,6 +312,26 @@ typedef enum RNetRbQuiesce
 void rnet_rb_driver_request_quiesce(RNetRbDriver *d);
 RNetRbQuiesce rnet_rb_driver_quiesce_state(const RNetRbDriver *d);
 
+/*
+ * Session hold: every peer stops on the same tick (a paused menu).
+ *
+ * set_hold(tick): Live admits no tick at or past `tick` and nothing is
+ * predicted while the hold is set, so the local pad is not sealed for any
+ * tick while held. Episodes, the wire and frame commits keep running. Set it
+ * on every peer with the same tick, far enough ahead (input delay plus the
+ * prediction window) that no peer has already passed it.
+ *
+ * hold_settled(): 1 once the sim stands at the hold tick, no episode is
+ * open and no remote row before it is predicted -- the state there is final
+ * and every peer that also settled holds the same one.
+ *
+ * clear_hold(): resume. Live continues from the hold tick with the rows the
+ * peers had already published, in the same epoch.
+ */
+void rnet_rb_driver_set_hold(RNetRbDriver *d, uint32_t tick);
+void rnet_rb_driver_clear_hold(RNetRbDriver *d);
+int rnet_rb_driver_hold_settled(const RNetRbDriver *d);
+
 /* Diagnostics. */
 uint32_t rnet_rb_driver_sim_tick(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_episode_count(const RNetRbDriver *d);
