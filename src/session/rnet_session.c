@@ -2158,6 +2158,15 @@ static void send_input_bundle(RNetSession *s)
         if (ack_lo < lo)
             lo = ack_lo;
     }
+    /* Gallery present: keep a fixed history in every bundle, because a
+     * spectator cannot ask for what it lost (see RNetConfig.observer_resend). */
+    if (s->cfg.observer_resend > 0u)
+    {
+        rnet_u32 back = s->cfg.observer_resend;
+        rnet_u32 obs_lo = (tip + 1u > back) ? (tip + 1u - back) : 0u;
+        if (obs_lo < lo)
+            lo = obs_lo;
+    }
     /* Which peer's progress to acknowledge. Seated peers point at the next
      * seat round; an observer has no "next" seat from a seat of its own, and
      * the sentinel would pick a ring by accident of arithmetic. Seat 0 is the

@@ -46,6 +46,16 @@ typedef struct RNetConfig
      * 4-max lobby) must clear empty bits so READY/admit do not wait forever
      * on a phantom remote. Empty seats use deterministic neutral samples. */
     rnet_u32 occupied_mask;
+    /* Seated peers only: ticks of input history to resend in every bundle
+     * when the room has a gallery. 0 = off (default).
+     *
+     * A spectator sends nothing the relay forwards, so no seated peer ever
+     * learns what it is missing: the ack-driven resend that repairs a lost
+     * packet for players does not exist for it, and one lost burst stalls it
+     * for good (WIRE_HOLE on the spectator while the players race on). With
+     * this set, every bundle also carries the last N ticks, so a spectator
+     * recovers from any loss shorter than N. */
+    rnet_u8 observer_resend;
 } RNetConfig;
 
 static inline void rnet_config_init_defaults(RNetConfig *cfg)
@@ -62,6 +72,7 @@ static inline void rnet_config_init_defaults(RNetConfig *cfg)
     cfg->session_id = 1;
     cfg->protocol_magic = 0x524E4554u; /* 'RNET' */
     cfg->occupied_mask = 0; /* all occupied */
+    cfg->observer_resend = 0;
 }
 
 /* 1 when this config describes a spectator: no seat, watches every slot. */
