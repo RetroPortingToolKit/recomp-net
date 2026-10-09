@@ -536,7 +536,7 @@ int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
 
 /* Sender slot (packet header) of the rb_* message most recently returned by
  * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post /
- * take_rb_frame_commit / take_modset_ack, or -1 before any. Call it right after the take it describes. With two seats there
+ * take_rb_frame_commit / take_modset_ack / take_rb_resolved, or -1 before any. Call it right after the take it describes. With two seats there
  * is one peer and this is redundant; with more, an episode needs a BASELINE
  * and a POST from EVERY peer, and without the sender the first reply to
  * arrive would answer for all of them. */
@@ -547,6 +547,9 @@ int rnet_session_rb_last_take_from(const RNetSession *s);
 rnet_u32 rnet_session_rb_ctrl_dropped(const RNetSession *s);
 
 int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through);
+/* One entry per sender (its highest advert since the last take);
+ * rnet_session_rb_last_take_from() names the seat. A receiver with more than
+ * one peer keeps a frontier per seat and trusts only the lowest. */
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through);
 
 #ifdef __cplusplus
