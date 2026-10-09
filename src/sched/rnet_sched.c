@@ -1777,6 +1777,26 @@ int rnet_sched_on_remote_miss(int slot, uint32_t sim, uint32_t wire,
 
     np_scorecard_note_miss(wire);
 
+    /* An observer never predicts. A wrong guess opens a rollback episode,
+     * and an episode needs every seat's answer -- but the relay forwards
+     * nothing a spectator sends, so the episode can never close and the
+     * spectator stalls for good (seen: rewind-request, then rb_seal wait,
+     * while the players race on). Nothing is latency-sensitive for a
+     * viewer: it waits for the real input, which seated peers resend
+     * (observer_resend). */
+    {
+        RNetSession *os = sched_session();
+        if (os && rnet_session_is_observer(os)) {
+            if (st->highest_remote_wire > wire)
+                np_diag_wire_hole(slot, sim, wire, st, "observer_wait");
+            else
+                rnet_sched_set_admit_stall("observer_wait");
+            if (reason_out)
+                *reason_out = "observer_wait";
+            return 1;
+        }
+    }
+
     /* FMV media + post-FMV settle: wait for remote wire (skip / title
      * Start). Invent idle opened tip episodes that hung. Tip-ahead with a
      * missing consumption wire is a ring hole — log before stalling. */
