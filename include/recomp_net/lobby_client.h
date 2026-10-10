@@ -472,6 +472,16 @@ int rnet_lobby_version_filter_strict(void);
 void rnet_lobby_request_list(void);
 int  rnet_lobby_list_count(void);
 int  rnet_lobby_list_get(int index, RNetLobbyRow *out);
+
+/* Room-list latency estimate in ms, before joining: our round trip to the
+ * lobby server (its ping/pong over the WebSocket) plus the room host's, which
+ * the server publishes per row as host_rtt_ms. Through-the-server, so it
+ * overstates a direct link, but there is no link to a room's host before
+ * joining. -1 when either half is unknown (or an older server). */
+int  rnet_lobby_list_latency_estimate_ms(int index);
+/* Our round trip to the lobby server, -1 until measured or when offline. */
+int  rnet_lobby_server_rtt_ms(void);
+#define RNET_LOBBY_HAS_LIST_LATENCY 1
 /* Players connected to the hub, refreshed with every lobby_list. */
 int  rnet_lobby_online_count(void);
 int  rnet_lobby_online_get(int index, RNetLobbyOnlinePlayer *out);

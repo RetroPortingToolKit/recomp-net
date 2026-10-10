@@ -26,6 +26,11 @@ void rnet_ice_agent_push_signal(RNetIceAgent *agent, const RNetSignal *msg);
 RNetIceState rnet_ice_agent_state(const RNetIceAgent *agent);
 int rnet_ice_agent_send(RNetIceAgent *agent, const rnet_u8 *buf, size_t len);
 int rnet_ice_agent_recv(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len);
+/* As rnet_ice_agent_recv, plus when the datagram arrived (monotonic ms, taken
+ * on libjuice's thread), so a latency probe can exclude how long it waited
+ * for the next pump. */
+int rnet_ice_agent_recv_at(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len,
+                           rnet_u64 *arrival_ms);
 /* path_out: host|srflx|prflx|relay|unknown. Addresses may be empty. */
 void rnet_ice_agent_selected_info(const RNetIceAgent *agent, char *path_out, size_t path_len,
                                   char *local_addr_out, size_t local_addr_len,
@@ -85,6 +90,16 @@ static inline int rnet_ice_agent_send(RNetIceAgent *agent, const rnet_u8 *buf, s
     (void)agent;
     (void)buf;
     (void)len;
+    return -1;
+}
+static inline int rnet_ice_agent_recv_at(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len,
+                                         rnet_u64 *arrival_ms)
+{
+    (void)agent;
+    (void)buf;
+    (void)cap;
+    (void)out_len;
+    (void)arrival_ms;
     return -1;
 }
 static inline int rnet_ice_agent_recv(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len)

@@ -326,6 +326,21 @@ typedef struct {
 
 static LobbyAutomatch g_am = { .rtt_ms = -1, .probe_socket = -1 };
 
+/* Round trip to the lobby server, timed with the server's own ping/pong over
+ * this WebSocket, and reported (op automatch_rtt) so the server can publish
+ * each room host's figure in lobby_list. A room's latency before joining is
+ * then estimated as ours + the host's: there is no direct link to a host yet,
+ * and with every online room on the ICE host relay there is no host UDP port
+ * to probe either. */
+#define SERVER_PING_EVERY_MS 5000u
+#define SERVER_PING_TIMEOUT_MS 10000u
+static int g_srv_rtt_ms = -1;
+static int g_srv_rtt_reported = -1;
+static uint64_t g_srv_ping_sent_ms;
+static uint64_t g_srv_ping_due_ms;
+/* lobby_list host_rtt_ms per row (parallel to g_lc.list), -1 unknown. */
+static int g_list_host_rtt[RNET_LOBBY_MAX_LIST];
+
 static void automatch_reset_queue_state(void)
 {
     g_am.state = RNET_LOBBY_AUTOMATCH_IDLE;
@@ -2454,6 +2469,7 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].allow_spectators = json_get_bool(chunk, "allow_spectators", 0);
                     g_lc.list[n].max_spectators = json_get_int(chunk, "max_spectators", 0);
                     g_lc.list[n].spectator_count = json_get_int(chunk, "spectator_count", 0);
+                    g_list_host_rtt[n] = json_get_int(chunk, "host_rtt_ms", -1);
                     ++n;
                     p = end;
                 }
@@ -3004,6 +3020,24 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "automatch_rtt_ok") == 0) {
         return;   /* acknowledgement only */
     }
+    if (strcmp(op, "pong") == 0) {
+        uint64_t now = lobby_mono_ms();
+        if (g_srv_ping_sent_ms && now >= g_srv_ping_sent_ms) {
+            int ms = (int)(now - g_srv_ping_sent_ms);
+            if (ms > 2000) ms = 2000; /* the server clamps reports here too */
+            g_srv_rtt_ms = g_srv_rtt_ms < 0 ? ms : (g_srv_rtt_ms * 3 + ms + 2) / 4;
+            g_srv_ping_sent_ms = 0;
+            /* Report the first figure, then only real changes. */
+            if (g_srv_rtt_reported < 0 || g_srv_rtt_ms > g_srv_rtt_reported + 5 ||
+                g_srv_rtt_ms + 5 < g_srv_rtt_reported) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "{\"op\":\"automatch_rtt\",\"rtt_ms\":%d}", g_srv_rtt_ms);
+                queue_send(msg);
+                g_srv_rtt_reported = g_srv_rtt_ms;
+            }
+        }
+        return;
+    }
     if (strcmp(op, "error") == 0) {
         json_get_str(json, "code", g_lc.join.last_error, sizeof(g_lc.join.last_error));
         /* An automatch refusal arrives as a plain error, so it has to be
@@ -3295,7 +3329,20 @@ void rnet_lobby_pump(void)
      * outstanding probe still times out cleanly if the WS drops. */
     automatch_probe_poll();
     if (!rnet_lobby_connected()) {
+        g_srv_ping_sent_ms = 0;
+        g_srv_rtt_reported = -1; /* a new connection is a new record */
         return;
+    }
+    {
+        uint64_t now = lobby_mono_ms();
+        if (g_srv_ping_sent_ms && now - g_srv_ping_sent_ms > SERVER_PING_TIMEOUT_MS)
+            g_srv_ping_sent_ms = 0; /* lost: send another */
+        if (!g_srv_ping_sent_ms && now >= g_srv_ping_due_ms) {
+            queue_send("{\"op\":\"ping\"}");
+            flush_pending();
+            g_srv_ping_sent_ms = now;
+            g_srv_ping_due_ms = now + SERVER_PING_EVERY_MS;
+        }
     }
     if (g_lc.tx_failed) {
         rnet_lobby_disconnect();
@@ -3508,6 +3555,22 @@ void rnet_lobby_request_list(void)
 int rnet_lobby_list_count(void)
 {
     return g_lc.list_count;
+}
+
+int rnet_lobby_server_rtt_ms(void)
+{
+    return rnet_lobby_connected() ? g_srv_rtt_ms : -1;
+}
+
+int rnet_lobby_list_latency_estimate_ms(int index)
+{
+    int host;
+    if (index < 0 || index >= g_lc.list_count)
+        return -1;
+    host = g_list_host_rtt[index];
+    if (host < 0 || rnet_lobby_server_rtt_ms() < 0)
+        return -1;
+    return g_srv_rtt_ms + host;
 }
 
 int rnet_lobby_list_get(int index, RNetLobbyRow *out)
@@ -4041,22 +4104,31 @@ int rnet_lobby_member_get(int index, RNetLobbyMember *out)
 int rnet_lobby_member_latency_ms(int slot)
 {
     const int idx = rtt_index_for_slot(slot);
-    if (idx < 0)
-        return -1;
+    const int me = local_member_slot();
+    int host_row = 0;
+    if (idx < 0 || slot == me)
+        return -1; /* our own row: no latency to ourselves */
     if (g_lc.host_player_id[0]) {
         int i;
         for (i = 0; i < g_lc.member_count; ++i) {
             if (g_lc.members[i].slot == slot &&
                 strcmp(g_lc.members[i].player_id, g_lc.host_player_id) == 0)
-                return -1; /* host row */
+                host_row = 1;
         }
     }
-    /* The direct link's round trip when the waiting room has one; the
-     * server-relayed ping only stands in until then. */
+    /* The direct link's round trip to that peer when the waiting room has
+     * one; the server-relayed ping only stands in until then. */
     {
         const int ice_ms = rnet_host_ice_peer_rtt_ms(g_host_ice, slot);
         if (ice_ms >= 0)
             return ice_ms;
+    }
+    /* A guest's row for the host used to read nothing at all: the only
+     * figure it had (its own ping to the host, through the server) was kept
+     * on the guest's own row. Show it where it belongs. */
+    if (host_row) {
+        const int mine = me >= 0 ? rtt_index_for_slot(me) : -1;
+        return mine >= 0 ? g_lc.member_rtt_ms[mine] : -1;
     }
     return g_lc.member_rtt_ms[idx];
 }
