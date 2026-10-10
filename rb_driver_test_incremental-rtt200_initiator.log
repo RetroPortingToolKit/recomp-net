@@ -1,0 +1,8 @@
+rbe: FORCE MISPREDICT every 45 remote row (validation only)
+rb_test: ROLLBACK start slot=0 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: RB replay shape: incremental (one replayed tick per host iteration)
+rb_test: RB boot digest agreed (a4a1963a)
+rbe: forced late row slot=1 sim=45 (invent + corrupt)
+rbe: RESIM episode #1 initiator slot=1 mismatch=45 load=45 target=45 (rewind 1 frames, replay 1) epoch=8
+rb_test: RB committed epoch=8 span=45..45 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=8 held=1 ticks (runway 12) — every peer committed
