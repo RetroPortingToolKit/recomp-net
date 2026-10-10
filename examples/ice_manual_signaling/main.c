@@ -122,6 +122,7 @@ static int consume_inbound(RNetSession *session, const char *path, long *offset)
         memset(&sig, 0, sizeof(sig));
         sig.type = (RNetSignalType)type;
         sig.flag = (rnet_u8)flag;
+        sig.peer_slot = 0xFF;
         snprintf(sig.text, sizeof(sig.text), "%s", text);
         rnet_session_push_signal(session, &sig);
         printf("push signal type=%d\n", type);

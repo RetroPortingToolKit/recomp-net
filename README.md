@@ -91,6 +91,25 @@ for (;;) {
 
 See [docs/host_integration.md](docs/host_integration.md).
 
+## Online topology and host relay
+
+The lobby server launches every online match on one of three paths and always
+falls back to its own UDP relay (the SFU) unless every guest proved the host
+path:
+
+- **Lobby UDP relay (SFU)** -- the fallback; everyone dials one server endpoint.
+- **Host relay over an advertised port** (`recomp_net/host_relay.h`) -- the host
+  holds a UPnP / NAT-PMP / STUN-mapped UDP port and runs the LAN hub; guests probe it.
+- **Host relay over ICE** (`recomp_net/host_ice.h`, default on, needs
+  `RNET_ENABLE_ICE`) -- no port to forward: the host answers one ICE agent per
+  guest, guests offer, the agents connected in the waiting room carry the match
+  (`rnet_session_start_ice_hub_adopt` / `rnet_session_adopt_ice_agent`). No TURN;
+  a guest that cannot connect directly reports `fail` and the server relay
+  carries the match. `rnet_lobby_set_relay_via_ice(0)` opts out. Details:
+  [docs/architecture.md](docs/architecture.md),
+  [docs/signaling.md](docs/signaling.md),
+  [docs/host_integration.md](docs/host_integration.md).
+
 ## Recommended host / recomp-engine patches
 
 recomp-net alone does not make a recomp title feel good online. The **host
