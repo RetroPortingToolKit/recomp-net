@@ -4051,6 +4051,13 @@ int rnet_lobby_member_latency_ms(int slot)
                 return -1; /* host row */
         }
     }
+    /* The direct link's round trip when the waiting room has one; the
+     * server-relayed ping only stands in until then. */
+    {
+        const int ice_ms = rnet_host_ice_peer_rtt_ms(g_host_ice, slot);
+        if (ice_ms >= 0)
+            return ice_ms;
+    }
     return g_lc.member_rtt_ms[idx];
 }
 

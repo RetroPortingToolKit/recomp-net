@@ -288,6 +288,21 @@ static void scenario_1(void)
         rnet_host_ice_status(g_n[0].h, &after);
         check(after.completed == 2, "1: links stay COMPLETED while idle");
     }
+    {
+        /* The waiting room's latency is the link's own round trip, not a
+         * ping through the lobby server: on loopback it is a few ms. */
+        int k, r;
+        for (k = 1; k <= 2; ++k)
+        {
+            r = rnet_host_ice_peer_rtt_ms(g_n[0].h, g_guest_slot[k]);
+            printf("  host -> guest %d rtt %d ms\n", k, r);
+            check(r >= 0 && r < 50, "1: host measures each guest's direct round trip");
+            r = rnet_host_ice_peer_rtt_ms(g_n[k].h, g_guest_slot[k]);
+            printf("  guest %d -> host rtt %d ms\n", k, r);
+            check(r >= 0 && r < 50, "1: a guest measures its direct round trip to the host");
+        }
+        check(rnet_host_ice_peer_rtt_ms(g_n[0].h, 7) == -1, "1: no agent, no round trip");
+    }
     teardown();
 }
 
