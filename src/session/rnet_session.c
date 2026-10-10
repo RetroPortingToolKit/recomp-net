@@ -296,7 +296,13 @@ struct RNetSession
     char modset_ack_reason[RNET_MAX_SLOTS][RNET_MODSET_REASON_MAX];
     rnet_u8 modset_ack_status[RNET_MAX_SLOTS];
     rnet_u32 modset_ack_pending; /* bit i = seat i's answer is waiting */
-    rnet_u32 rb_resolved_q[RNET_RB_CTRL_QUEUE];
+    /* RESOLVED is a watermark, so the queue holds at most one entry per
+     * sender (the highest): with more than two seats the receiver must know
+     * WHICH peer has resolved how far, not just that somebody has. */
+    struct {
+        rnet_u32 through;
+        rnet_u8 from;
+    } rb_resolved_q[RNET_RB_CTRL_QUEUE];
     int rb_resolved_head, rb_resolved_tail, rb_resolved_count;
 
     /* Peer GBA Multi SEND barrier (0-delay; not pad INPUT). */
@@ -387,6 +393,20 @@ static void rb_ctrl_note_drop(RNetSession *s, const char *what)
                 what, RNET_RB_CTRL_QUEUE, (unsigned)s->rb_ctrl_dropped);
     }
 }
+/* Episode-control datagrams are retransmitted until answered, and a host
+ * that is busy in an inline replay drains them only at present edges. With
+ * three peers each resending POST / SEAL_ROWS every pump, a 32-entry FIFO
+ * filled with copies of the same few messages and then refused the next new
+ * one (1,344 drops on a 4-seat WAN race). A retransmit of a message already
+ * waiting is therefore coalesced into it, and a full queue first sheds its
+ * oldest entry when that entry belongs to an older episode than the incoming
+ * one (the host would discard it on take anyway). */
+static int rb_epoch_before(rnet_u32 a, rnet_u32 b)
+{
+    return (rnet_s32)(a - b) < 0;
+}
+#define RB_Q_AT(tail, i) (((tail) + (i)) % RNET_RB_CTRL_QUEUE)
+
 static void send_input_bundle(RNetSession *s);
 static void apply_pending_delay(RNetSession *s);
 static void emit_delay_sync(RNetSession *s, rnet_u8 new_delay, rnet_u32 effective_tick);
@@ -847,6 +867,28 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             break;
         }
+        if (pkt->local_slot != s->wire_slot)
+        {
+            int i, dup = 0;
+            for (i = 0; i < s->rb_sync_count; ++i)
+            {
+                int k = RB_Q_AT(s->rb_sync_tail, i);
+                if (s->rb_sync_q[k].from == pkt->local_slot &&
+                    s->rb_sync_q[k].epoch_id == pkt->rb_epoch_id &&
+                    s->rb_sync_q[k].mismatch_tick == pkt->rb_mismatch_tick &&
+                    s->rb_sync_q[k].load_tick == pkt->rb_load_tick &&
+                    s->rb_sync_q[k].target_tick == pkt->rb_target_tick &&
+                    s->rb_sync_q[k].corrected_slot == pkt->rb_corrected_slot &&
+                    s->rb_sync_q[k].initiator == pkt->rb_initiator &&
+                    s->rb_sync_q[k].flags == pkt->rb_flags)
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                break;
+        }
         if (pkt->local_slot != s->wire_slot &&
             s->rb_sync_count < RNET_RB_CTRL_QUEUE)
         {
@@ -867,6 +909,35 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_SEAL_ROWS:
+        if (pkt->local_slot != s->wire_slot)
+        {
+            int i, dup = 0;
+            for (i = 0; i < s->rb_seal_count; ++i)
+            {
+                int k = RB_Q_AT(s->rb_seal_tail, i);
+                if (s->rb_seal_q[k].from == pkt->local_slot &&
+                    s->rb_seal_q[k].epoch_id == pkt->rb_epoch_id &&
+                    s->rb_seal_q[k].mismatch_tick == pkt->rb_mismatch_tick &&
+                    s->rb_seal_q[k].target_tick == pkt->rb_target_tick &&
+                    s->rb_seal_q[k].slot == pkt->rb_slot &&
+                    s->rb_seal_q[k].row_begin == pkt->rb_row_begin &&
+                    s->rb_seal_q[k].row_count ==
+                        (pkt->rb_row_count > RNET_RB_SEAL_ROWS_CHUNK_MAX
+                             ? RNET_RB_SEAL_ROWS_CHUNK_MAX : pkt->rb_row_count))
+                {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                break;
+            while (s->rb_seal_count >= RNET_RB_CTRL_QUEUE &&
+                   rb_epoch_before(s->rb_seal_q[s->rb_seal_tail].epoch_id, pkt->rb_epoch_id))
+            {
+                s->rb_seal_tail = (s->rb_seal_tail + 1) % RNET_RB_CTRL_QUEUE;
+                s->rb_seal_count--;
+            }
+        }
         if (pkt->local_slot != s->wire_slot &&
             s->rb_seal_count < RNET_RB_CTRL_QUEUE)
         {
@@ -899,6 +970,33 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             break;
         }
+        if (pkt->local_slot != s->wire_slot)
+        {
+            int i, dup = 0;
+            for (i = 0; i < s->rb_base_count; ++i)
+            {
+                int k = RB_Q_AT(s->rb_base_tail, i);
+                if (s->rb_base_q[k].from == pkt->local_slot &&
+                    s->rb_base_q[k].epoch_id == pkt->rb_epoch_id &&
+                    s->rb_base_q[k].load_tick == pkt->rb_load_tick)
+                {
+                    s->rb_base_q[k].digest_master = pkt->rb_digest_master;
+                    s->rb_base_q[k].digest_a = pkt->rb_digest_a;
+                    s->rb_base_q[k].digest_b = pkt->rb_digest_b;
+                    s->rb_base_q[k].digest_c = pkt->rb_digest_c;
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                break;
+            while (s->rb_base_count >= RNET_RB_CTRL_QUEUE &&
+                   rb_epoch_before(s->rb_base_q[s->rb_base_tail].epoch_id, pkt->rb_epoch_id))
+            {
+                s->rb_base_tail = (s->rb_base_tail + 1) % RNET_RB_CTRL_QUEUE;
+                s->rb_base_count--;
+            }
+        }
         if (pkt->local_slot != s->wire_slot &&
             s->rb_base_count < RNET_RB_CTRL_QUEUE)
         {
@@ -921,6 +1019,32 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
         {
             break;
+        }
+        if (pkt->local_slot != s->wire_slot)
+        {
+            int i, dup = 0;
+            for (i = 0; i < s->rb_post_count; ++i)
+            {
+                int k = RB_Q_AT(s->rb_post_tail, i);
+                if (s->rb_post_q[k].from == pkt->local_slot &&
+                    s->rb_post_q[k].epoch_id == pkt->rb_epoch_id &&
+                    s->rb_post_q[k].target_tick == pkt->rb_target_tick)
+                {
+                    s->rb_post_q[k].digest_master = pkt->rb_digest_master;
+                    s->rb_post_q[k].input_digest = pkt->rb_input_digest;
+                    s->rb_post_q[k].match = pkt->rb_match;
+                    dup = 1;
+                    break;
+                }
+            }
+            if (dup)
+                break;
+            while (s->rb_post_count >= RNET_RB_CTRL_QUEUE &&
+                   rb_epoch_before(s->rb_post_q[s->rb_post_tail].epoch_id, pkt->rb_epoch_id))
+            {
+                s->rb_post_tail = (s->rb_post_tail + 1) % RNET_RB_CTRL_QUEUE;
+                s->rb_post_count--;
+            }
         }
         if (pkt->local_slot != s->wire_slot &&
             s->rb_post_count < RNET_RB_CTRL_QUEUE)
@@ -962,12 +1086,32 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_RESOLVED:
-        if (pkt->local_slot != s->wire_slot &&
-            s->rb_resolved_count < RNET_RB_CTRL_QUEUE)
+        if (pkt->local_slot != s->wire_slot)
         {
-            s->rb_resolved_q[s->rb_resolved_head] = pkt->rb_resolved_through;
-            s->rb_resolved_head = (s->rb_resolved_head + 1) % RNET_RB_CTRL_QUEUE;
-            s->rb_resolved_count++;
+            int i, merged = 0;
+            for (i = 0; i < s->rb_resolved_count; ++i)
+            {
+                int k = RB_Q_AT(s->rb_resolved_tail, i);
+                if (s->rb_resolved_q[k].from == pkt->local_slot)
+                {
+                    /* A watermark: a reordered older advert must not lower it. */
+                    if (rb_epoch_before(s->rb_resolved_q[k].through, pkt->rb_resolved_through))
+                        s->rb_resolved_q[k].through = pkt->rb_resolved_through;
+                    merged = 1;
+                    break;
+                }
+            }
+            if (!merged && s->rb_resolved_count < RNET_RB_CTRL_QUEUE)
+            {
+                s->rb_resolved_q[s->rb_resolved_head].through = pkt->rb_resolved_through;
+                s->rb_resolved_q[s->rb_resolved_head].from = pkt->local_slot;
+                s->rb_resolved_head = (s->rb_resolved_head + 1) % RNET_RB_CTRL_QUEUE;
+                s->rb_resolved_count++;
+            }
+            else if (!merged)
+            {
+                rb_ctrl_note_drop(s, "RB_RESOLVED");
+            }
         }
         break;
     default:
@@ -4863,7 +5007,8 @@ int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through)
     if (s == NULL || s->rb_resolved_count <= 0)
         return 0;
     if (resolved_through)
-        *resolved_through = s->rb_resolved_q[s->rb_resolved_tail];
+        *resolved_through = s->rb_resolved_q[s->rb_resolved_tail].through;
+    s->rb_last_from = s->rb_resolved_q[s->rb_resolved_tail].from;
     s->rb_resolved_tail = (s->rb_resolved_tail + 1) % RNET_RB_CTRL_QUEUE;
     s->rb_resolved_count--;
     return 1;
