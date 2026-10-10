@@ -65,8 +65,15 @@ int main(void)
           "history preserves JogCon type");
     f.analog = 2u;
     CHECK(rnet_ih_set_neutral(&jog, 0, &f), "set JogCon neutral");
-    CHECK(rnet_ih_invent_idle(&jog, 0, 30, &got) && got.analog == 2u,
-          "idle prediction preserves JogCon type");
+    CHECK(rnet_ih_invent_idle(&jog, 0, 30, &got) && got.analog == 3u,
+          "idle prediction keeps the last row's device (NeGcon), not neutral's");
+    {
+        RNetInputHist fresh;
+        rnet_ih_reset(&fresh, 1);
+        CHECK(rnet_ih_set_neutral(&fresh, 0, &f), "set JogCon neutral (fresh)");
+        CHECK(rnet_ih_invent_idle(&fresh, 0, 30, &got) && got.analog == 2u,
+              "idle prediction with no prior row uses the neutral JogCon type");
+    }
 
     /* NeGcon (3) is just another type byte: no clamp to the 0..2 range. */
     rnet_ih_reset(&jog, 1);
@@ -103,6 +110,9 @@ int main(void)
 
     CHECK(rnet_ih_invent_idle(&h, 1, 13, &got), "invent idle");
     CHECK(got.buttons == 0xFFFFu && got.stick_x == 0, "idle");
+    CHECK(got.analog == 1u,
+          "idle keeps the seat's device type (a digital fill flipped a DualShock "
+          "seat for one replayed tick and split 4-seat replays)");
 
     f = got;
     f.stick_x = -18;

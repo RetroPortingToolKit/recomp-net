@@ -1,0 +1,32 @@
+rb_test: ROLLBACK start slot=1 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: RB boot digest agreed (a4a1963a)
+rbe: RESIM episode #1 follower slot=1 mismatch=45 load=45 target=45 (rewind 3 frames, replay 1) epoch=8
+rb_test: RB committed epoch=8 span=45..45 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=8 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #2 follower slot=1 mismatch=90 load=90 target=90 (rewind 6 frames, replay 1) epoch=16
+rb_test: RB committed epoch=16 span=90..90 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=16 held=1 ticks (runway 12) — every peer committed
+rbe: RESIM episode #3 follower slot=1 mismatch=135 load=135 target=135 (rewind 5 frames, replay 1) epoch=24
+rb_test: RB committed epoch=24 span=135..135 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=24 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #4 follower slot=1 mismatch=180 load=180 target=180 (rewind 6 frames, replay 1) epoch=32
+rb_test: RB committed epoch=32 span=180..180 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=32 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #5 follower slot=1 mismatch=225 load=225 target=225 (rewind 5 frames, replay 1) epoch=40
+rb_test: RB committed epoch=40 span=225..225 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=40 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #6 follower slot=1 mismatch=270 load=270 target=270 (rewind 6 frames, replay 1) epoch=48
+rb_test: RB committed epoch=48 span=270..270 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=48 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #7 follower slot=1 mismatch=315 load=315 target=315 (rewind 5 frames, replay 1) epoch=56
+rb_test: RB committed epoch=56 span=315..315 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=56 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #8 follower slot=1 mismatch=360 load=360 target=360 (rewind 5 frames, replay 1) epoch=64
+rb_test: RB committed epoch=64 span=360..360 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=64 held=12 ticks (runway 12) — runway spent
+rbe: RESIM episode #9 follower slot=1 mismatch=405 load=405 target=405 (rewind 5 frames, replay 1) epoch=72
+rb_test: RB committed epoch=72 span=405..405 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=72 held=1 ticks (runway 12) — every peer committed
+rb_test: RB quiesce requested at sim=424 (host request) — stage=idle; no new episode or local tip-extend opens from here, open ones finish, peer BEGINs are still followed
+rb_test: RB quiesce: seat 0 will open no more episodes (its sim=421, ours=424)
+rb_test: RB quiesced at sim=426 after 32 ms (requested at sim=424: host request) — no episode open here and every peer has promised to open none. Opened here: 0 as initiator, 9 as follower; corrections not opened while draining: 0; still owed: 0; peers acknowledged 1 of 1; follows that waited for their load tick: 0, that took it at our tip: 0; POSTs re-sent: 21, BEGINs re-sent: 0
