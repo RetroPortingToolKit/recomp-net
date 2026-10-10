@@ -1,4 +1,5 @@
 #include "rnet_ice_internal.h"
+#include "platform/rnet_platform.h" /* rnet_os_monotonic_ms */
 
 #if defined(RNET_ENABLE_ICE)
 
@@ -32,6 +33,7 @@ typedef struct RNetIceRecvSlot
 {
     rnet_u8 data[RNET_ICE_RECV_MAX];
     size_t len;
+    rnet_u64 arrival_ms; /* monotonic, taken in libjuice's receive callback */
 } RNetIceRecvSlot;
 
 typedef struct RNetIceCandSlot
@@ -110,6 +112,7 @@ static void queue_recv(RNetIceAgent *a, const char *data, size_t size)
     }
     memcpy(a->recv_q[a->recv_tail].data, data, size);
     a->recv_q[a->recv_tail].len = size;
+    a->recv_q[a->recv_tail].arrival_ms = rnet_os_monotonic_ms();
     a->recv_tail = (a->recv_tail + 1U) % RNET_ICE_RECV_QUEUE;
     a->recv_count++;
 }
@@ -844,6 +847,12 @@ int rnet_ice_agent_send(RNetIceAgent *agent, const rnet_u8 *buf, size_t len)
 
 int rnet_ice_agent_recv(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len)
 {
+    return rnet_ice_agent_recv_at(agent, buf, cap, out_len, NULL);
+}
+
+int rnet_ice_agent_recv_at(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *out_len,
+                           rnet_u64 *arrival_ms)
+{
     if ((agent == NULL) || (buf == NULL) || (cap == 0) || (out_len == NULL))
     {
         return -1;
@@ -864,6 +873,8 @@ int rnet_ice_agent_recv(RNetIceAgent *agent, rnet_u8 *buf, size_t cap, size_t *o
         }
         memcpy(buf, slot->data, n);
         *out_len = n;
+        if (arrival_ms != NULL)
+            *arrival_ms = slot->arrival_ms;
         agent->recv_head = (agent->recv_head + 1U) % RNET_ICE_RECV_QUEUE;
         agent->recv_count--;
     }

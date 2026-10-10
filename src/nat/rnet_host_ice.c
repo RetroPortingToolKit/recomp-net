@@ -431,10 +431,10 @@ void rnet_host_ice_update(RNetHostIce *h, const RNetHostIceView *v)
 #define HI_RTT_MAGIC "RNETHP1"
 #define HI_RTT_MAGIC_LEN 7
 #define HI_RTT_PING_MS 1000u
-static void hi_rtt_send(HiPeer *p, char kind, unsigned long long ts)
+static void hi_rtt_send(HiPeer *p, char kind, unsigned long long ts, unsigned hold)
 {
-    char buf[40];
-    int n = snprintf(buf, sizeof(buf), "%s%c%llu", HI_RTT_MAGIC, kind, ts);
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "%s%c%llu %u", HI_RTT_MAGIC, kind, ts, hold);
     if (n > 0 && (size_t)n < sizeof(buf))
         (void)rnet_ice_agent_send(p->agent, (const rnet_u8 *)buf, (size_t)n);
 }
@@ -442,23 +442,33 @@ static void hi_rtt_pump(HiPeer *p, rnet_u64 now)
 {
     rnet_u8 buf[64];
     size_t n = 0;
-    while (rnet_ice_agent_recv(p->agent, buf, sizeof(buf) - 1, &n) == 0 && n > 0) {
+    rnet_u64 arrival = 0;
+    /* Both ends pump at the launcher's frame rate, so a reply sent on the
+     * next pump and read on the one after that counted up to two frames of
+     * waiting as latency (~25 ms between two instances on one machine). Time
+     * from the datagram's arrival on libjuice's thread, and have the replier
+     * report how long it held the ping, so the figure is the link's. */
+    while (rnet_ice_agent_recv_at(p->agent, buf, sizeof(buf) - 1, &n, &arrival) == 0 && n > 0) {
         unsigned long long ts;
+        unsigned long hold = 0;
         char *end;
         if (n <= HI_RTT_MAGIC_LEN || memcmp(buf, HI_RTT_MAGIC, HI_RTT_MAGIC_LEN) != 0)
             continue;
         buf[n] = '\0';
         ts = strtoull((const char *)buf + HI_RTT_MAGIC_LEN + 1, &end, 10);
+        if (end && *end == ' ')
+            hold = strtoul(end + 1, NULL, 10);
         if (buf[HI_RTT_MAGIC_LEN] == 'P') {
-            hi_rtt_send(p, 'Q', ts);
-        } else if (buf[HI_RTT_MAGIC_LEN] == 'Q' && ts <= now && now - ts < 60000u) {
-            int ms = (int)(now - ts);
+            hi_rtt_send(p, 'Q', ts, now >= arrival ? (unsigned)(now - arrival) : 0u);
+        } else if (buf[HI_RTT_MAGIC_LEN] == 'Q' && ts <= arrival && arrival - ts < 60000u) {
+            rnet_u64 span = arrival - ts;
+            int ms = (int)(span > hold ? span - hold : 0);
             /* Light smoothing: one late reply should not jump the readout. */
             p->rtt_ms = p->rtt_ms < 0 ? ms : (p->rtt_ms * 3 + ms + 2) / 4;
         }
     }
     if (now >= p->ping_due_ms) {
-        hi_rtt_send(p, 'P', (unsigned long long)now);
+        hi_rtt_send(p, 'P', (unsigned long long)rnet_os_monotonic_ms(), 0u);
         p->ping_due_ms = now + HI_RTT_PING_MS;
     }
 }
@@ -472,9 +482,9 @@ int rnet_host_ice_peer_rtt_ms(const RNetHostIce *h, int slot)
         const HiPeer *p = &h->peer[i];
         if (!p->used || p->agent == NULL)
             continue;
-        /* Host: one agent per guest seat. Guest: its one agent to the host,
-         * shown on its own row, which is where the lobby puts a guest's RTT. */
-        if ((h->role == 1 && p->slot == slot) || (h->role == 2 && p->local_slot == slot))
+        /* Host: one agent per guest seat. Guest: its one agent, which serves
+         * the host's seat. Either way, the row of the peer at the far end. */
+        if (p->slot == slot)
             return p->rtt_ms;
     }
     return -1;

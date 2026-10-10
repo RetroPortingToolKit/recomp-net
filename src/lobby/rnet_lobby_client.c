@@ -4041,22 +4041,31 @@ int rnet_lobby_member_get(int index, RNetLobbyMember *out)
 int rnet_lobby_member_latency_ms(int slot)
 {
     const int idx = rtt_index_for_slot(slot);
-    if (idx < 0)
-        return -1;
+    const int me = local_member_slot();
+    int host_row = 0;
+    if (idx < 0 || slot == me)
+        return -1; /* our own row: no latency to ourselves */
     if (g_lc.host_player_id[0]) {
         int i;
         for (i = 0; i < g_lc.member_count; ++i) {
             if (g_lc.members[i].slot == slot &&
                 strcmp(g_lc.members[i].player_id, g_lc.host_player_id) == 0)
-                return -1; /* host row */
+                host_row = 1;
         }
     }
-    /* The direct link's round trip when the waiting room has one; the
-     * server-relayed ping only stands in until then. */
+    /* The direct link's round trip to that peer when the waiting room has
+     * one; the server-relayed ping only stands in until then. */
     {
         const int ice_ms = rnet_host_ice_peer_rtt_ms(g_host_ice, slot);
         if (ice_ms >= 0)
             return ice_ms;
+    }
+    /* A guest's row for the host used to read nothing at all: the only
+     * figure it had (its own ping to the host, through the server) was kept
+     * on the guest's own row. Show it where it belongs. */
+    if (host_row) {
+        const int mine = me >= 0 ? rtt_index_for_slot(me) : -1;
+        return mine >= 0 ? g_lc.member_rtt_ms[mine] : -1;
     }
     return g_lc.member_rtt_ms[idx];
 }

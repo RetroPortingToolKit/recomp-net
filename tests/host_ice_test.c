@@ -297,7 +297,7 @@ static void scenario_1(void)
             r = rnet_host_ice_peer_rtt_ms(g_n[0].h, g_guest_slot[k]);
             printf("  host -> guest %d rtt %d ms\n", k, r);
             check(r >= 0 && r < 50, "1: host measures each guest's direct round trip");
-            r = rnet_host_ice_peer_rtt_ms(g_n[k].h, g_guest_slot[k]);
+            r = rnet_host_ice_peer_rtt_ms(g_n[k].h, 0); /* the host's seat */
             printf("  guest %d -> host rtt %d ms\n", k, r);
             check(r >= 0 && r < 50, "1: a guest measures its direct round trip to the host");
         }
