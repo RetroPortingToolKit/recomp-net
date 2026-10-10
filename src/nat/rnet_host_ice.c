@@ -29,7 +29,12 @@ typedef struct HiPeer {
     char last_report[8];
     rnet_u64 report_due_ms;
     rnet_u64 retry_at_ms;
+    /* Round trip over this agent once it is linked (-1 until measured). */
+    int rtt_ms;
+    rnet_u64 ping_due_ms;
 } HiPeer;
+
+static void hi_rtt_pump(HiPeer *p, rnet_u64 now);
 
 struct RNetHostIce {
     int role; /* 0 idle, 1 host, 2 guest */
@@ -142,6 +147,8 @@ static int peer_build_agent(RNetHostIce *h, HiPeer *p, int controlling)
     if (p->agent == NULL)
         return -1;
     p->created_ms = rnet_os_monotonic_ms();
+    p->rtt_ms = -1;
+    p->ping_due_ms = 0;
     p->last_report[0] = '\0';
     p->report_due_ms = 0;
     p->retry_at_ms = 0;
@@ -405,12 +412,72 @@ void rnet_host_ice_update(RNetHostIce *h, const RNetHostIceView *v)
         if (!p->used || p->agent == NULL)
             continue;
         rnet_ice_agent_poll(p->agent);
-        if (rnet_ice_agent_state(p->agent) == RNET_ICE_STATE_COMPLETED)
+        if (rnet_ice_agent_state(p->agent) == RNET_ICE_STATE_COMPLETED) {
             rnet_ice_agent_freeze(p->agent); /* linked: no later signal rebuilds it */
+            hi_rtt_pump(p, now);
+        }
         if (h->role == 2)
             guest_report(h, p, now);
     }
     rnet_sig_hold_expire(&h->hold, now, HI_HOLD_MAX_AGE_MS);
+}
+
+/* Waiting-room latency over the linked agent itself. The lobby's own figure
+ * is a ping through the lobby server's WebSocket (rnet_lobby_member_latency_ms
+ * fell back to nothing else), so two peers on one machine read ~100 ms while
+ * their link is loopback. Nothing else reads these agents before launch; the
+ * match session that adopts them drops a stray ping, which does not decode
+ * with its protocol magic. */
+#define HI_RTT_MAGIC "RNETHP1"
+#define HI_RTT_MAGIC_LEN 7
+#define HI_RTT_PING_MS 1000u
+static void hi_rtt_send(HiPeer *p, char kind, unsigned long long ts)
+{
+    char buf[40];
+    int n = snprintf(buf, sizeof(buf), "%s%c%llu", HI_RTT_MAGIC, kind, ts);
+    if (n > 0 && (size_t)n < sizeof(buf))
+        (void)rnet_ice_agent_send(p->agent, (const rnet_u8 *)buf, (size_t)n);
+}
+static void hi_rtt_pump(HiPeer *p, rnet_u64 now)
+{
+    rnet_u8 buf[64];
+    size_t n = 0;
+    while (rnet_ice_agent_recv(p->agent, buf, sizeof(buf) - 1, &n) == 0 && n > 0) {
+        unsigned long long ts;
+        char *end;
+        if (n <= HI_RTT_MAGIC_LEN || memcmp(buf, HI_RTT_MAGIC, HI_RTT_MAGIC_LEN) != 0)
+            continue;
+        buf[n] = '\0';
+        ts = strtoull((const char *)buf + HI_RTT_MAGIC_LEN + 1, &end, 10);
+        if (buf[HI_RTT_MAGIC_LEN] == 'P') {
+            hi_rtt_send(p, 'Q', ts);
+        } else if (buf[HI_RTT_MAGIC_LEN] == 'Q' && ts <= now && now - ts < 60000u) {
+            int ms = (int)(now - ts);
+            /* Light smoothing: one late reply should not jump the readout. */
+            p->rtt_ms = p->rtt_ms < 0 ? ms : (p->rtt_ms * 3 + ms + 2) / 4;
+        }
+    }
+    if (now >= p->ping_due_ms) {
+        hi_rtt_send(p, 'P', (unsigned long long)now);
+        p->ping_due_ms = now + HI_RTT_PING_MS;
+    }
+}
+
+int rnet_host_ice_peer_rtt_ms(const RNetHostIce *h, int slot)
+{
+    int i;
+    if (h == NULL)
+        return -1;
+    for (i = 0; i < RNET_HOST_ICE_MAX_PEERS; ++i) {
+        const HiPeer *p = &h->peer[i];
+        if (!p->used || p->agent == NULL)
+            continue;
+        /* Host: one agent per guest seat. Guest: its one agent to the host,
+         * shown on its own row, which is where the lobby puts a guest's RTT. */
+        if ((h->role == 1 && p->slot == slot) || (h->role == 2 && p->local_slot == slot))
+            return p->rtt_ms;
+    }
+    return -1;
 }
 
 void rnet_host_ice_status(const RNetHostIce *h, RNetHostIceStatus *out)

@@ -135,6 +135,10 @@ int rnet_host_ice_push_signal(RNetHostIce *h, const char *from_player_id, int fr
                               int wire_type, int flag, const char *text);
 
 void rnet_host_ice_status(const RNetHostIce *h, RNetHostIceStatus *out);
+/* Round trip in ms over the linked agent serving lobby seat `slot` (host:
+ * that guest's seat; guest: its own seat, for its link to the host), or -1
+ * when there is no linked agent or no reply yet. */
+int rnet_host_ice_peer_rtt_ms(const RNetHostIce *h, int slot);
 /* Held (not yet delivered) signals for a peer; 0 when none. */
 int rnet_host_ice_held_count(const RNetHostIce *h, const char *player_id);
 
