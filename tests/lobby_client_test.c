@@ -1092,6 +1092,31 @@ static void case_launch_transport_survives_a_lobby_update(void)
  * launch with those endpoints is still ICE -- the server named the transport
  * and allocated no relay. Read as a relay, both peers dialled the host's own
  * public address with nothing listening and timed out (2026-10-09). */
+/* The room list's latency before joining: our ping/pong round trip to the
+ * lobby server plus the host's, which the server publishes per row. */
+static void case_list_latency_estimate(void)
+{
+    printf("  room list latency = ours + the host's, through the server\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.connected = 1;
+    g_srv_rtt_ms = -1; g_srv_rtt_reported = -1; g_srv_ping_sent_ms = 0;
+    handle_server_json(
+        "{\"op\":\"lobby_list\",\"lobbies\":["
+        "{\"lobby_id\":\"A\",\"name\":\"Near\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"host_rtt_ms\":12},"
+        "{\"lobby_id\":\"B\",\"name\":\"Old server\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2}]}");
+    ck(g_lc.list_count == 2, "both rooms listed");
+    ck(rnet_lobby_list_latency_estimate_ms(0) == -1, "unknown until we have measured ourselves");
+    g_srv_ping_sent_ms = lobby_mono_ms() - 40;
+    handle_server_json("{\"op\":\"pong\"}");
+    ck(g_srv_rtt_ms >= 40 && g_srv_rtt_ms < 100, "a pong times our round trip to the server");
+    ck(g_srv_rtt_reported == g_srv_rtt_ms, "and reports it, so the server can publish ours");
+    ck(rnet_lobby_list_latency_estimate_ms(0) == g_srv_rtt_ms + 12, "estimate = ours + the host's");
+    ck(rnet_lobby_list_latency_estimate_ms(1) == -1, "a row without host_rtt_ms stays unknown");
+    ck(rnet_lobby_list_latency_estimate_ms(2) == -1, "out of range is unknown");
+}
+
 static void case_ice_launch_with_equal_endpoints_stays_ice(void)
 {
     printf("  an ICE launch with equal endpoints stays ICE\n");
@@ -1718,6 +1743,7 @@ int main(void)
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
     case_ice_launch_with_equal_endpoints_stays_ice();
+    case_list_latency_estimate();
     case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
