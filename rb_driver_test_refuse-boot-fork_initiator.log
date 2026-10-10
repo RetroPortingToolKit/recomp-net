@@ -1,0 +1,6 @@
+rb_test: ROLLBACK start slot=0 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: peer identity matches (seat 1: build=0b0b0b0b content=0c0c0c0c)
+rbe: forced boot fork — publishing 0104339f for tick 0
+rb_test: RB BOOT DIGEST MISMATCH ours=0104339f peer=a4a1963a (seat 1) — the two sides did not start from the same state, so this match cannot be played. Rollback corrects inputs, not a divergent start.
+rb_test:   peer identity (seat 1): build ours=0b0b0b0b peer=0b0b0b0b, content ours=0c0c0c0c peer=0c0c0c0c
+rb_test: RB match refused (boot_digest_mismatch) at sim=1 — no further tick is admitted; asking the host to return to the lobby

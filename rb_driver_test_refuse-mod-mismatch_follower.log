@@ -1,0 +1,4 @@
+rb_test: ROLLBACK start slot=1 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: RB replay shape: incremental (one replayed tick per host iteration)
+rb_test: MOD SETS DIFFER ours=0c0c0c0c peer=56565656 (seat 0) — this match cannot be played. Every mod in the set changes what the guest simulates, so the two sides are running different games. Compare the "game: mod set" line in each log; the host's selection is the one to match.
+rb_test: RB match refused (mod_set_mismatch) at sim=0 — no further tick is admitted; asking the host to return to the lobby

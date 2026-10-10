@@ -119,6 +119,8 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
 int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *out)
 {
     RNetRbFrame invented;
+    RNetRbFrame prev;
+    uint32_t look;
 
     if (!h || slot < 0 || slot >= h->slot_count)
         return 0;
@@ -133,6 +135,22 @@ int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *
     invented.ry = h->neutral[slot].ry;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
+
+    /* Idle releases the buttons and centres the axes; it does not swap the
+     * controller. The device type (analog) comes from the seat's last row: a
+     * neutral "digital" fill switched an analog / NeGcon pad to digital for
+     * one replayed tick, the emulated pad answered a shorter poll, and the
+     * replay ran a few guest cycles short of the live tick (4-seat R4
+     * rollback: seats that sealed the gap themselves split from the seat
+     * that had its real row). */
+    for (look = 1; look < RNET_INPUT_HIST_DEPTH; look++) {
+        if (tick < look)
+            break;
+        if (rnet_ih_get(h, slot, tick - look, &prev)) {
+            invented.analog = prev.analog;
+            break;
+        }
+    }
 
     if (!rnet_ih_put(h, slot, &invented))
         return 0;
