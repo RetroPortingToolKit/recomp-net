@@ -439,6 +439,10 @@ typedef struct Report {
     uint32_t ep_init[MAX_EPOCHS], ep_follow[MAX_EPOCHS], ep_refused[MAX_EPOCHS];
     uint32_t n_ep_init_ids, n_ep_follow_ids, n_ep_refused_ids;
     uint32_t timeline[TOY_TICKS];
+    /* Hold scenarios: where the sim stood once settled, the engine's digest
+     * there, the furthest it got while held, and whether it ever settled. */
+    uint32_t hold_sim, hold_digest, hold_max_sim;
+    int hold_settled, hold_released;
 } Report;
 
 #define MAX_SEATS 4
@@ -493,6 +497,10 @@ typedef struct Scenario {
      * Each must open, follow and refuse nothing, keep up, drain, and agree
      * with seat 0's timeline -- a spectator never predicts. */
     int observers;
+    /* Session hold: every seat sets rnet_rb_driver_set_hold(hold_at) 30 ticks
+     * before it, must stop exactly there, settle, agree on the state, stay
+     * held for a second without the match dropping, then resume. 0 = none. */
+    uint32_t hold_at;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -705,6 +713,27 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
                     sleep_ms(1);
                 }
                 next_tick_ms = mono_ms();
+            }
+            if (sc->hold_at && !r->hold_released) {
+                uint32_t sim = rnet_rb_driver_sim_tick(d);
+                static uint32_t settled_ms;
+                static int hold_set;
+                if (!hold_set && sim + 30u >= sc->hold_at) {
+                    rnet_rb_driver_set_hold(d, sc->hold_at);
+                    hold_set = 1;
+                }
+                if (hold_set && sim > r->hold_max_sim)
+                    r->hold_max_sim = sim;
+                if (hold_set && !r->hold_settled && rnet_rb_driver_hold_settled(d)) {
+                    r->hold_settled = 1;
+                    r->hold_sim = sim;
+                    r->hold_digest = toy_digest(&g_c.state);
+                    settled_ms = mono_ms();
+                }
+                if (r->hold_settled && (uint32_t)(mono_ms() - settled_ms) >= 1000u) {
+                    rnet_rb_driver_clear_hold(d);
+                    r->hold_released = 1;
+                }
             }
             if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
                 (void)write_all(ready_fd, "R", 1);
@@ -963,6 +992,19 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         }
         goto done;
     }
+    if (sc->hold_at) {
+        for (k = 0; k < nseats; ++k) {
+            snprintf(msg, sizeof(msg), "%s: seat %d stopped at the hold tick and settled "
+                     "(sim %u, furthest %u, hold %u)", sc->name, seat_of[k], rr[k]->hold_sim,
+                     rr[k]->hold_max_sim, sc->hold_at);
+            expect_true(rr[k]->hold_settled && rr[k]->hold_sim == sc->hold_at &&
+                            rr[k]->hold_max_sim == sc->hold_at && rr[k]->hold_released,
+                        msg);
+            snprintf(msg, sizeof(msg), "%s: seat %d held the same state as seat 0 "
+                     "(%08x vs %08x)", sc->name, seat_of[k], rr[k]->hold_digest, rr[0]->hold_digest);
+            expect_true(rr[k]->hold_digest == rr[0]->hold_digest, msg);
+        }
+    }
     for (k = 0; k < nseats; ++k) {
         snprintf(msg, sizeof(msg), "%s: seat %d ran the match (sim %u)", sc->name, seat_of[k], rr[k]->sim);
         expect_true(rr[k]->sim >= (k == 0 ? sc->ticks : sc->ticks / 2u), msg);
@@ -1111,6 +1153,13 @@ int main(int argc, char **argv)
          * latency so the players mispredict and roll back around it. */
         { "4seat-observer-rtt60", 1, 1,      "30",  "8",   45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0, 0, 0u, NULL, 0u, 1 },
+        /* A paused menu: every seat stops on one tick with predictions still
+         * being corrected around it (forced mispredicts, jitter, loss), holds
+         * for a second, and resumes in the same epoch. */
+        { "hold-rtt60",          0, 1,       "30",  "8",   45,    420u,  0,
+          0, 0, NULL, 0, 0u, 1, 0, 0, 0u, NULL, 0u, 0, 200u },
+        { "hold-4seat-loss2",    1, 1,       "30",  "8",   45,    420u,  0,
+          0, 0, NULL, 4, 0u, 1, 0, 0, 0u, "2", 0u, 0, 200u },
     };
     /* Four ports per scenario from a per-process base; kept inside
      * 20000..60003 however many scenarios there are (a base near the top of
