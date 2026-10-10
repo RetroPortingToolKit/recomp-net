@@ -1951,8 +1951,21 @@ static int endpoint_has_usable_port(const char *endpoint)
     return port != 0;
 }
 
+/* Set by each launch: the server named peer-to-peer ICE and allocated no
+ * relay. Its endpoints then carry no relay meaning, however they compare. */
+static int g_launch_named_ice;
+
 static int using_server_input_relay(const RNetLobbyJoinInfo *j)
 {
+    /* Two peers behind one NAT -- two instances on one machine, two players
+     * on one home network -- can advertise the same public ip:port: with the
+     * host relay's port taken first-free from 7777 and the guest's first-free
+     * from 7778, a busy 7777 puts both on :7778. The equal-endpoints rule
+     * below read that as "the server rewrote both to its relay", so an ICE
+     * launch dialled the host's own public address over UDP with nothing
+     * listening, and timed out after 30 s. The server's word wins. */
+    if (g_launch_named_ice)
+        return 0;
     if (g_lc.match_caps.valid && g_lc.match_caps.force_input_relay)
         return 1;
     /* Server rewrote both endpoints to the same relay advertise address. */
@@ -2597,6 +2610,9 @@ static void handle_server_json(const char *json)
         transport[0] = '\0';
         json_get_str(json, "transport", transport, sizeof(transport));
         g_lc.join.transport_host = strcmp(transport, "host") == 0 ? 1 : 0;
+        g_launch_named_ice = (strcmp(transport, "ice") == 0 ||
+                              strcmp(transport, "ice_p2p") == 0) &&
+                             !relay_endpoint[0];
         rnet_host_relay_release_port(g_host_relay);
         ice_launch_discard();   /* a previous launch's agents are never reused */
         g_il.error[0] = '\0';

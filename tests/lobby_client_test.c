@@ -1086,6 +1086,44 @@ static void case_launch_transport_survives_a_lobby_update(void)
        "a p2p launch does not inherit the previous match's relay");
 }
 
+/* Two instances on one machine (or two players behind one NAT) can advertise
+ * the same public ip:port: the host relay takes its port first-free from 7777,
+ * the guest first-free from 7778, and a busy 7777 puts both on :7778. An ICE
+ * launch with those endpoints is still ICE -- the server named the transport
+ * and allocated no relay. Read as a relay, both peers dialled the host's own
+ * public address with nothing listening and timed out (2026-10-09). */
+static void case_ice_launch_with_equal_endpoints_stays_ice(void)
+{
+    printf("  an ICE launch with equal endpoints stays ICE\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    snprintf(g_lc.my_bind, sizeof(g_lc.my_bind), "%s", "0.0.0.0:7779");
+    g_lc.connected = 1;
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":65,"
+        "\"host_endpoint\":\"216.154.76.149:7778\","
+        "\"guest_endpoint\":\"216.154.76.149:7778\","
+        "\"transport\":\"ice\",\"player_count\":2,\"max_slots\":2,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.force_input_relay == 0, "the launch is not taken for a server relay");
+    ck(strcmp(g_lc.join.bind_hostport, "0.0.0.0:0") != 0,
+       "so the guest keeps its own bind instead of an ephemeral relay one");
+
+    /* The same endpoints from a server that names no transport keep the old
+     * reading: that server did rewrite both endpoints to its relay. */
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":66,"
+        "\"host_endpoint\":\"relay.example:8777\","
+        "\"guest_endpoint\":\"relay.example:8777\","
+        "\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.force_input_relay == 1,
+       "a transport-less launch with equal endpoints is still a relay");
+}
+
 
 /* ---- what the lift added ------------------------------------------------ */
 
@@ -1679,6 +1717,7 @@ int main(void)
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
+    case_ice_launch_with_equal_endpoints_stays_ice();
     case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
