@@ -275,7 +275,7 @@ NULL and refuses.
 | `decode_sample` / `sanitize_row` / `neutral_row` | Pad layout: wire bytes to a row, force a row legal, and what "nothing held" is per seat. Active-high pads (SNES, N64) and active-low (PSX) differ; the driver assumes neither. |
 | `admit_sample` (opt.) | Side data riding the pad bytes, from the sample a LIVE admit used. |
 | `boot_digest_noted` (opt.) | Log what explains a boot mismatch (partitions, frame counters). |
-| `request_return_to_lobby` | The match is refused (boot fork, mod-set refusal): leave it. Called once; the reason is `rnet_rb_driver_refusal()` (`boot_digest_mismatch`, `mod_set_mismatch`, `mod_set_not_agreed`). From the refusal on `poll_admit` admits no Live tick, so a refused match cannot play on while the host gets round to it -- but tearing the session down and returning to the lobby is the host's job. A host that never consumes it freezes its players on the last frame. |
+| `request_return_to_lobby` | The match is refused (boot fork, boot verification timeout, mod-set refusal): leave it. Called once; the reason is `rnet_rb_driver_refusal()` (`boot_digest_mismatch`, `boot_digest_timeout`, `mod_set_mismatch`, `mod_set_not_agreed`). From the refusal on `poll_admit` admits no Live tick, so a refused match cannot play on while the host gets round to it -- but tearing the session down and returning to the lobby is the host's job. A host that never consumes it freezes its players on the last frame. |
 | `log` (opt.), `now_ms` | Line sink (NULL = stderr) and a monotonic clock. |
 
 `RNetRbDriverConfig` takes live pointers to the session, seat, seat count,
@@ -320,6 +320,22 @@ a queue that fills is logged (`rnet_session_rb_ctrl_dropped`).
 
 The scheduler is process-global (`rnet_sched_bind`): one started driver per
 process.
+
+Before admitting Live tick 1, the driver verifies every occupied peer's
+tick-0 digest against its own. Missing FRAME_COMMITs are requested at most
+once per 50 ms per peer, including in two-seat sessions. A peer answers a
+tick-0 request with its retained original digest even after the normal
+128-entry digest ring has advanced. This uses the existing
+`FRAME_COMMIT_REQUEST` / `FRAME_COMMIT` messages; the wire format is unchanged.
+If any required boot digest is still missing after four seconds, the driver
+refuses with `boot_digest_timeout`. It never continues unverified. A received
+different digest still refuses with `boot_digest_mismatch`.
+
+`rb_boot_digest_test` runs real session/driver processes behind a UDP proxy
+on Windows and POSIX. It selectively drops boot commits (including replies),
+checks mismatch and permanent-loss refusal, recovers in two-, three- and
+four-seat sessions, and requests the original boot digest after its ring entry
+has expired. The test requires a Python 3 interpreter at configure time.
 
 ### Coordinated stop (for harnesses)
 
