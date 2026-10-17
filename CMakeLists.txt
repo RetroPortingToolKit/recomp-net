@@ -471,6 +471,20 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(rb_driver_test PRIVATE recomp_net)
   add_test(NAME rb_driver_test COMMAND rb_driver_test)
 
+  # Deterministic datagram loss with a real driver in each process. Unlike
+  # the fork-based matrix above, this also executes on Windows.
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_executable(rb_boot_peer tests/rb_boot_peer.c)
+    target_include_directories(rb_boot_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(rb_boot_peer PRIVATE recomp_net)
+    add_test(NAME rb_boot_digest_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/rb_boot_digest_test.py --peer $<TARGET_FILE:rb_boot_peer>)
+    set_tests_properties(rb_boot_digest_test PROPERTIES TIMEOUT 120)
+  else()
+    message(STATUS "Boot datagram regression requires a Python3 interpreter")
+  endif()
+
   add_executable(rollback_episode_test tests/rollback_episode_test.c)
   target_link_libraries(rollback_episode_test PRIVATE recomp_net)
   add_test(NAME rollback_episode_test COMMAND rollback_episode_test)
