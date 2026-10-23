@@ -38,6 +38,7 @@ set(RNET_CORE_SOURCES
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
+  src/lobby/rnet_lan_room.c
   src/lobby/rnet_lan_beacon.c
   src/lobby/rnet_rtt_probe.c
   # Host relay: the host's reachable port (UPnP / NAT-PMP / STUN), the
@@ -404,6 +405,17 @@ if(RNET_BUILD_TESTS)
   add_executable(lan_lobby_test tests/lan_lobby_test.c)
   target_link_libraries(lan_lobby_test PRIVATE recomp_net)
   add_test(NAME lan_lobby_test COMMAND lan_lobby_test)
+  add_executable(lan_room_test tests/lan_room_test.c)
+  target_link_libraries(lan_room_test PRIVATE recomp_net)
+  if(MSVC)
+    target_compile_options(lan_room_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(lan_room_test PRIVATE -UNDEBUG)
+  endif()
+  if(UNIX)
+    target_compile_definitions(lan_room_test PRIVATE _POSIX_C_SOURCE=200809L)
+  endif()
+  add_test(NAME lan_room_test COMMAND lan_room_test)
 
   add_executable(lan_beacon_test tests/lan_beacon_test.c)
   target_link_libraries(lan_beacon_test PRIVATE recomp_net)
