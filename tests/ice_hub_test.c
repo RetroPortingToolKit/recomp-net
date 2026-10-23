@@ -293,7 +293,9 @@ static void teardown(Rig *r)
 
 static void scenario_a(void)
 {
-    static Rig r; /* Signalling queues exceed the default Windows thread stack. */
+    /* The signaling queues occupy over 4 MiB. Keep the fixture off the
+     * stack so the test also runs with Windows' default stack reservation. */
+    static Rig r;
     int rc, i;
     const int B = 100;
     rnet_u32 g1_base, g2_base, g1_burst, g2_burst;

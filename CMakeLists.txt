@@ -317,7 +317,8 @@ if(RNET_BUILD_TESTS)
       --probe "$<TARGET_FILE:auth_startup_probe>")
   endif()
 
-  # Every function a public header declares links against recomp_net.
+  # Every public static-library function links against recomp_net. The
+  # optional module's loader contract is checked by module_test above.
   include(RnetApiLinkTest)
   rnet_add_api_link_test()
 
