@@ -10,9 +10,10 @@
  * real ICE agent pair.
  *
  *   HOST   one answerer agent per currently seated guest. Agents are added
- *          and removed as members join / leave / move seats, and each binds
+ *          and removed as members join / leave, and each binds
  *          an ephemeral port (never a fixed one: N agents cannot share it).
  *   GUEST  one offerer agent whose peer is the host.
+ *          Seat moves preserve both endpoints and update routing metadata.
  *
  * Roles are fixed: the host answers, guests offer. No TURN and no
  * force-relay -- a hub agent that cannot connect directly is a failure, and
@@ -27,7 +28,7 @@
  * `flag` carries the negotiation id (1..255) the offerer chose for its
  * current agent. The answerer rebinds to a new id (a fresh agent) whenever an
  * SDP arrives with one it has not seen, and drops every signal stamped with a
- * stale id, so a guest that moves seats or retries after a failure cannot be
+ * stale id, so a guest that retries after a failure cannot be
  * poisoned by its own earlier exchange.
  *
  * When a guest's agent reaches COMPLETED it sends the lobby

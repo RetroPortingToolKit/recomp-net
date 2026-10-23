@@ -293,7 +293,7 @@ static void teardown(Rig *r)
 
 static void scenario_a(void)
 {
-    Rig r;
+    static Rig r; /* Signalling queues exceed the default Windows thread stack. */
     int rc, i;
     const int B = 100;
     rnet_u32 g1_base, g2_base, g1_burst, g2_burst;
@@ -369,7 +369,7 @@ static void scenario_a(void)
 
 static void scenario_d(void)
 {
-    Rig r;
+    static Rig r;
     int rc, i;
     int host_completed = 0;
 
