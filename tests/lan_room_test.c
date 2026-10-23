@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #ifdef _WIN32
 #include <windows.h>
 static void sleep_ms(void){Sleep(1);}
@@ -14,6 +15,7 @@ static void sleep_ms(void){struct timespec t={0,1000000};nanosleep(&t,NULL);}
 static unsigned long long now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (unsigned long long)t.tv_sec*1000+t.tv_nsec/1000000;}
 #endif
 static RNetLanRoomPeer* p[5];
+static const char* advertised_endpoint="127.0.0.1:19971";
 static void pump_all(void) {int i;for(i=0;i<5;++i)if(p[i])rnet_lan_room_pump(p[i]);sleep_ms();}
 static unsigned count(const RNetLanRoom* room){unsigned i,n=0;for(i=0;i<4;++i)n+=room->member[i].id!=0;return n;}
 static void settle(unsigned expected,unsigned ready) {
@@ -22,7 +24,8 @@ static void settle(unsigned expected,unsigned ready) {
         int i,okay=1;const RNetLanRoom* host;
         pump_all();host=rnet_lan_room_state(p[0]);
         if(count(host)!=expected || host->ready_mask!=ready)okay=0;
-        for(i=1;i<4;++i)if(p[i] && rnet_lan_room_local_slot(p[i])>=0) {
+        for(i=1;i<4;++i)if(p[i]) {
+            if(rnet_lan_room_local_slot(p[i])<0){okay=0;continue;}
             const RNetLanRoom* guest=rnet_lan_room_state(p[i]);
             if(guest->revision!=host->revision || memcmp(guest,host,sizeof(*host)))okay=0;
         }
@@ -41,7 +44,7 @@ static void settle(unsigned expected,unsigned ready) {
     }
 }
 static void open_guest(unsigned i,int cap,const char* password) {
-    assert(!p[i]);assert(rnet_lan_room_guest_open(&p[i],"127.0.0.1:0","127.0.0.1:19971","Room test","test-v1",password,"Same name",cap)==0);
+    assert(!p[i]);assert(rnet_lan_room_guest_open(&p[i],"127.0.0.1:0",advertised_endpoint,"Room test","test-v1",password,"Same name",cap)==0);
 }
 static void expect_reject(int expected) {
     unsigned long long deadline=now()+3000;int status;
@@ -50,8 +53,9 @@ static void expect_reject(int expected) {
 }
 int main(void) {
     RNetLanRoom room;unsigned i;unsigned long long deadline;unsigned previous_revision;int previous_slot;
+    if(getenv("RNET_LAN_ROOM_TEST_ENDPOINT"))advertised_endpoint=getenv("RNET_LAN_ROOM_TEST_ENDPOINT");
     memset(&room,0,sizeof(room));strcpy(room.name,"Four seats");strcpy(room.game,"Room test");strcpy(room.game_version,"test-v1");
-    strcpy(room.endpoint,"127.0.0.1:19971");strcpy(room.member[0].name,"Same name");
+    assert(strlen(advertised_endpoint)<sizeof(room.endpoint));strcpy(room.endpoint,advertised_endpoint);strcpy(room.member[0].name,"Same name");
     room.max_slots=4;room.input_delay=2;room.rollback=1;room.input_prediction=6;
     assert(rnet_lan_room_host_open(&p[0],"127.0.0.1:19971",&room,"private")==0);
     for(i=1;i<4;++i)open_guest(i,4,"private");
@@ -112,6 +116,18 @@ int main(void) {
     for(i=0;i<4;++i)assert(rnet_lan_room_set_ready(p[i],1)==0);
     settle(4,15);assert(rnet_lan_room_start(p[0])==0);
     deadline=now()+4000;
+    if(getenv("RNET_LAN_ROOM_TEST_GUEST_FIRST")) {
+        rnet_u32 session=0;unsigned closed=0;
+        while(!rnet_lan_room_launch_ready(p[0]) || closed!=3) {
+            pump_all();assert(now()<deadline);
+            if(rnet_lan_room_state(p[0])->session_id)session=rnet_lan_room_state(p[0])->session_id;
+            for(i=1;i<4;++i)if(p[i] && rnet_lan_room_launch_ready(p[i])) {
+                assert(session && rnet_lan_room_state(p[i])->session_id==session);
+                rnet_lan_room_close(&p[i]);++closed;
+            }
+        }
+        assert(count(rnet_lan_room_state(p[0]))==4);rnet_lan_room_close(&p[0]);
+    } else {
     while(!rnet_lan_room_launch_ready(p[0])){pump_all();assert(now()<deadline);}
     {const rnet_u32 session=rnet_lan_room_state(p[0])->session_id;
         assert(session);
@@ -123,6 +139,7 @@ int main(void) {
             if(ready)break;sleep_ms();assert(now()<deadline);
         }
         for(i=1;i<4;++i){assert(rnet_lan_room_state(p[i])->session_id==session);rnet_lan_room_close(&p[i]);}
+    }
     }
     puts("lan_room_test: four sockets, same-name identities, readiness/caps, kick/moves, duplicate requests and start handoff passed");
     return 0;

@@ -18,12 +18,15 @@ typedef struct MemberLink {
     rnet_u64 seen,ping;
     int rtt;
 } MemberLink;
+typedef struct RetiredLink {
+    rnet_u32 id;struct sockaddr_in address;int reason;rnet_u64 replied;
+} RetiredLink;
 struct RNetLanRoomPeer {
     rnet_socket socket;
     struct sockaddr_in host_address;
     int host,status,joined,max_supported,want_start;
     rnet_u32 id,sequence,pending_op,pending_a,pending_b,pending_revision;
-    rnet_u32 retired[16];unsigned retired_at;
+    RetiredLink retired[16];unsigned retired_at;
     rnet_u64 opened,last_send,last_host,start_seen,start_sent;
     char game[RNET_LAN_LOBBY_GAME_MAX],version[RNET_LAN_LOBBY_VERSION_MAX];
     char password[RNET_LAN_LOBBY_PASSWORD_MAX],name[RNET_LAN_LOBBY_PLAYER_MAX];
@@ -173,8 +176,10 @@ int rnet_lan_room_guest_open(RNetLanRoomPeer** out,const char* bind,const char* 
     return 0;
 }
 static void remove_member(RNetLanRoomPeer* p,int slot,int reason) {
+    RetiredLink* retired=&p->retired[p->retired_at++%16];
+    retired->id=p->links[slot].id;retired->address=p->links[slot].address;
+    retired->reason=reason;retired->replied=rnet_os_monotonic_ms();
     send_simple(p,&p->links[slot].address,CLOSE,p->links[slot].id,reason);
-    p->retired[p->retired_at++%16]=p->links[slot].id;
     memset(&p->links[slot],0,sizeof(p->links[slot]));p->links[slot].rtt=-1;
     memset(&p->room.member[slot],0,sizeof(p->room.member[slot]));p->room.ready_mask&=~(1u<<slot);
     p->room.starting=0;p->room.session_id=0;configuration_changed(p);
@@ -220,7 +225,7 @@ static void handle_host(RNetLanRoomPeer* p,Buffer* b,const struct sockaddr_in* s
         if(strcmp(game,p->room.game) || strcmp(version,p->room.game_version) || supported<p->room.max_slots)status=RNET_LAN_ROOM_IDENTITY;
         else if(strcmp(password,p->password))status=RNET_LAN_ROOM_PASSWORD;
         else if(p->room.starting)status=RNET_LAN_ROOM_STARTED;
-        for(i=0;i<16;++i)if(p->retired[i]==id)status=RNET_LAN_ROOM_STALE;
+        for(i=0;i<16;++i)if(p->retired[i].id==id)status=RNET_LAN_ROOM_STALE;
         if(!status && slot>=0) {
             if(slot==p->room.host_slot || !same_address(source,&p->links[slot].address))status=RNET_LAN_ROOM_IDENTITY;
             else {p->links[slot].seen=now;send_state(p,slot,0);return;}
@@ -235,6 +240,20 @@ static void handle_host(RNetLanRoomPeer* p,Buffer* b,const struct sockaddr_in* s
         p->room.member[slot].id=id;memcpy(p->room.member[slot].name,name,strlen(name)+1);
         p->links[slot].id=id;p->links[slot].address=*source;p->links[slot].seen=now;p->links[slot].rtt=-1;
         configuration_changed(p);send_state(p,slot,0);return;
+    }
+    /* CLOSE may be lost. A removed owner still repeats its ACK/request;
+     * answer that exact epoch + identity + source with the terminal reason.
+     * Never re-seat it, and never use a display name as an ownership key. */
+    if(epoch==p->room.epoch && slot<0) {
+        for(i=0;i<16;++i) {
+            RetiredLink* retired=&p->retired[i];
+            if(retired->id==id && same_address(source,&retired->address)) {
+                if(now-retired->replied>=RETRY_MS) {
+                    send_simple(p,source,CLOSE,id,retired->reason);retired->replied=now;
+                }
+                return;
+            }
+        }
     }
     if(epoch!=p->room.epoch || slot<0 || slot==p->room.host_slot
        || !same_address(source,&p->links[slot].address))return;
