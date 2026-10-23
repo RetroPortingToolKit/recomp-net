@@ -38,6 +38,7 @@ set(RNET_CORE_SOURCES
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
+  src/lobby/rnet_lan_room.c
   src/lobby/rnet_lan_beacon.c
   src/lobby/rnet_rtt_probe.c
   # Host relay: the host's reachable port (UPnP / NAT-PMP / STUN), the
@@ -405,6 +406,17 @@ if(RNET_BUILD_TESTS)
   add_executable(lan_lobby_test tests/lan_lobby_test.c)
   target_link_libraries(lan_lobby_test PRIVATE recomp_net)
   add_test(NAME lan_lobby_test COMMAND lan_lobby_test)
+  add_executable(lan_room_test tests/lan_room_test.c)
+  target_link_libraries(lan_room_test PRIVATE recomp_net)
+  if(MSVC)
+    target_compile_options(lan_room_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(lan_room_test PRIVATE -UNDEBUG)
+  endif()
+  if(UNIX)
+    target_compile_definitions(lan_room_test PRIVATE _POSIX_C_SOURCE=200809L)
+  endif()
+  add_test(NAME lan_room_test COMMAND lan_room_test)
 
   add_executable(lan_beacon_test tests/lan_beacon_test.c)
   target_link_libraries(lan_beacon_test PRIVATE recomp_net)
@@ -471,6 +483,20 @@ if(RNET_BUILD_TESTS)
   add_executable(rb_driver_test tests/rb_driver_test.c)
   target_link_libraries(rb_driver_test PRIVATE recomp_net)
   add_test(NAME rb_driver_test COMMAND rb_driver_test)
+
+  # Deterministic datagram loss with a real driver in each process. Unlike
+  # the fork-based matrix above, this also executes on Windows.
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_executable(rb_boot_peer tests/rb_boot_peer.c)
+    target_include_directories(rb_boot_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(rb_boot_peer PRIVATE recomp_net)
+    add_test(NAME rb_boot_digest_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/rb_boot_digest_test.py --peer $<TARGET_FILE:rb_boot_peer>)
+    set_tests_properties(rb_boot_digest_test PROPERTIES TIMEOUT 120)
+  else()
+    message(STATUS "Boot datagram regression requires a Python3 interpreter")
+  endif()
 
   add_executable(rollback_episode_test tests/rollback_episode_test.c)
   target_link_libraries(rollback_episode_test PRIVATE recomp_net)

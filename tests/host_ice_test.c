@@ -17,7 +17,7 @@
  *   1  waiting room: both guests reach COMPLETED, each reports path_report
  *      "direct" with an ice type, the host counts two completed peers;
  *   2  guards: signals that must be refused or held, never applied;
- *   3  a seat move rebuilds only that guest's pair and it reconnects;
+ *   3  guest and host seat moves preserve every live pair;
  *   4  handover: waiting-room agents sit idle >= 20 s after COMPLETED, are
  *      adopted by real sessions (host: rnet_session_start_ice_hub_adopt,
  *      guests: rnet_session_adopt_ice_agent), and a datagram sent by guest 1
@@ -72,6 +72,7 @@ static Node g_n[NODES];
 static Msg g_q[QMAX];
 static int g_qn;
 static int g_guest_slot[NODES]; /* seat of guest idx (1..2) */
+static int g_host_slot;
 
 static int node_of(const char *pid)
 {
@@ -110,7 +111,7 @@ static void update_node(int i)
     memset(&v, 0, sizeof(v));
     v.active = 1;
     v.is_host = (i == 0);
-    v.local_slot = i == 0 ? 0 : g_guest_slot[i];
+    v.local_slot = i == 0 ? g_host_slot : g_guest_slot[i];
     if (i == 0)
     {
         peers[0].player_id = g_n[1].pid; peers[0].slot = g_guest_slot[1];
@@ -119,7 +120,7 @@ static void update_node(int i)
     }
     else
     {
-        peers[0].player_id = g_n[0].pid; peers[0].slot = 0;
+        peers[0].player_id = g_n[0].pid; peers[0].slot = g_host_slot;
         v.peer_count = 1;
     }
     v.peers = peers;
@@ -141,7 +142,7 @@ static void deliver(void)
     g_qn = 0;
     for (i = 0; i < n; ++i)
     {
-        int from_slot = batch[i].from == 0 ? 0 : g_guest_slot[batch[i].from];
+        int from_slot = batch[i].from == 0 ? g_host_slot : g_guest_slot[batch[i].from];
         (void)rnet_host_ice_push_signal(g_n[batch[i].to].h, g_n[batch[i].from].pid, from_slot,
                                         batch[i].type, batch[i].flag, batch[i].text);
     }
@@ -177,6 +178,7 @@ static void setup(void)
     g_qn = 0;
     g_n[0].pid = "player-host"; g_n[1].pid = "player-g1"; g_n[2].pid = "player-g2";
     g_guest_slot[1] = 1; g_guest_slot[2] = 2;
+    g_host_slot = 0;
     for (i = 0; i < NODES; ++i)
     {
         g_n[i].idx = i;
@@ -356,7 +358,7 @@ static void scenario_3(void)
 {
     RNetHostIceStatus hs;
     int i;
-    printf("--- 3: a seat move rebuilds only that pair ---\n");
+    printf("--- 3: guest and host seat moves preserve live pairs ---\n");
     setup();
     check(wait_completed(), "3: waiting room connected");
     rnet_host_ice_status(g_n[0].h, &hs);
@@ -366,7 +368,9 @@ static void scenario_3(void)
             if (!strcmp(hs.peer[k].player_id, g_n[1].pid)) neg_g1 = hs.peer[k].negotiation;
         g_guest_slot[2] = 3; /* guest 2 moves seat 2 -> 3 (both tables change) */
         g_n[0].nreports = g_n[1].nreports = g_n[2].nreports = 0;
-        check(wait_completed(), "3: guest 2 reconnects at its new seat");
+        step();
+        rnet_host_ice_status(g_n[0].h, &hs);
+        check(hs.completed == 2, "3: guest move preserves both completed links immediately");
         for (i = 0; i < 50; ++i) step();
         rnet_host_ice_status(g_n[0].h, &hs);
         for (k = 0; k < hs.peer_count; ++k)
@@ -378,7 +382,26 @@ static void scenario_3(void)
         for (i = 0, k = 0; i < g_n[2].nreports; ++i)
             if (strstr(g_n[2].reports[i], "\"direct\"")) k = 1;
         check(k, "3: guest 2 reported direct again after the move");
+        g_host_slot = 2; /* host's own move used to rebuild only the guest ends */
+        g_n[0].nreports = g_n[1].nreports = g_n[2].nreports = 0;
+        step();
+        for (i = 0; i < NODES; ++i) {
+            rnet_host_ice_status(g_n[i].h, &hs);
+            check(hs.completed == (i == 0 ? 2 : 1),
+                  "3: host move preserves all completed agents immediately");
+            if (i != 0)
+                check(hs.peer[0].slot == 2, "3: guest routes its live host agent to the new host seat");
+        }
+        for (i = 0; i < 50; ++i) step();
+        check(wait_completed(), "3: links remain connected after host move");
     }
+    teardown();
+    setup();
+    /* Signals may already be queued when the host moves, before the first
+     * pair completes. The current seat is supplied by the lobby, not payload. */
+    for(i=0;i<NODES;++i)update_node(i);
+    g_host_slot=3;
+    check(wait_completed(), "3: moving host during initial negotiation connects all guests");
     teardown();
 }
 

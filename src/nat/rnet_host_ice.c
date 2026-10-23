@@ -180,7 +180,7 @@ static void apply(RNetHostIce *h, HiPeer *p, const RNetSignal *sig)
             return;
         if (gen == p->gen)
             return; /* a repeat of the SDP this agent already answered */
-        /* A new negotiation id is a fresh offerer (seat move, retry): answer it
+        /* A new negotiation id is a fresh offerer (retry): answer it
          * with a fresh agent, never by renegotiating a live one. */
         if (p->gen != 0 && peer_build_agent(h, p, 0) != 0)
             return;
@@ -355,7 +355,9 @@ void rnet_host_ice_update(RNetHostIce *h, const RNetHostIceView *v)
     if (h->role == 2 && v->peer_count > 0 && v->peers[0].player_id != NULL)
         snprintf(h->host_pid, sizeof(h->host_pid), "%s", v->peers[0].player_id);
 
-    /* Remove agents whose peer left, moved, or (guest) whose own seat moved. */
+    /* A link belongs to player identities, not seats. Moving either endpoint
+     * only changes routing metadata; replacing one end would discard its ICE
+     * credentials while the other end still owns the live negotiation. */
     for (i = 0; i < RNET_HOST_ICE_MAX_PEERS; ++i) {
         HiPeer *p = &h->peer[i];
         int keep = 0;
@@ -363,8 +365,15 @@ void rnet_host_ice_update(RNetHostIce *h, const RNetHostIceView *v)
             continue;
         for (j = 0; j < v->peer_count; ++j) {
             const RNetHostIcePeer *w = &v->peers[j];
-            if (w->player_id != NULL && strcmp(w->player_id, p->pid) == 0 && w->slot == p->slot &&
-                (h->role == 1 || v->local_slot == p->local_slot)) {
+            if (w->player_id != NULL && w->slot >= 0 && strcmp(w->player_id, p->pid) == 0) {
+                if (p->slot != w->slot || p->local_slot != v->local_slot) {
+                    p->slot = w->slot;
+                    p->local_slot = v->local_slot;
+                    /* A seat change may precede its lobby_update. Only replay
+                     * held signals attributed to the new authoritative seat. */
+                    replay_hold(h, p);
+                    p->report_due_ms = 0;
+                }
                 keep = 1;
                 break;
             }

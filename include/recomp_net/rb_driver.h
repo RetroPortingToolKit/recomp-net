@@ -351,7 +351,8 @@ void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap);
 int rnet_rb_driver_in_resim(const RNetRbDriver *d);
 const char *rnet_rb_driver_stall_tag(const RNetRbDriver *d);
 /* Why this match was refused, NULL if it was not: "boot_digest_mismatch" (the
- * peers did not start from the same state), "mod_set_mismatch" (the peers'
+ * peers did not start from the same state), "boot_digest_timeout" (a peer's
+ * starting-state digest was not received in time), "mod_set_mismatch" (the peers'
  * content fingerprints differ), "mod_set_not_agreed" (the host's set could not
  * be confirmed or honoured). Stable codes, suitable for a launcher's
  * last_error. Latched until the next start. */
