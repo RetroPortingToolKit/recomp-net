@@ -204,6 +204,19 @@ state, so a correction that never lands is a measurable divergence):
 - **An abort after the baseline load restores the live tip** ("RB tip
   restored"), instead of leaving the engine on the load tick while sim stays
   at the old tip.
+- **A baseline's earlier input must be settled** (2026-10-24). A snapshot
+  keyed `T` is before tick `T`, but already contains the effects of every
+  published input before it. This includes predictions whose authoritative
+  wire has not arrived, as well as corrections already marked owed. For
+  example, accepting a live-tip load at2313 while2312 remains invented can
+  manufacture a baseline fork when2312's real row arrives during sealing.
+  Initiators move the load to an available earlier snapshot; followers NACK
+  with a frontier below the earliest unresolved dependency before taking a
+  live-tip snapshot. The history scan is bounded and covers only occupied
+  remote seats. It does not promote rows, erase owed corrections, skip digest
+  comparisons or suppress fork counters. Input-history tests cover the prefix
+  boundary, sparse seats, promotion and ring reuse; actual same-build N64
+  peers exercise rejection and recovery under forced late rows.
 - **An answer that beats its BEGIN is held, not dropped** (2026-09-25). An
   initiator that can seal from its own confirmed history sends BEGIN,
   BASELINE and POST in one poll; under jitter the POST can arrive first. It
