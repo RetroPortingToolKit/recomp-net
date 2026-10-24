@@ -43,6 +43,15 @@ void rnet_ih_frame_to_contract(const RNetRbFrame *frame, RNetInputContractFrame 
 int rnet_ih_put(RNetInputHist *h, int slot, const RNetRbFrame *frame);
 int rnet_ih_get(const RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *out);
 
+/* Earliest still-predicted published row in [from, before), considering only
+ * seats in slot_mask. A snapshot BEFORE `before` depends on these rows even
+ * when their authoritative wire has not arrived yet. Scans the bounded stored
+ * history without promoting/mutating it. Returns 0 with outputs untouched
+ * when none exists; output pointers may be NULL. */
+int rnet_ih_first_predicted(const RNetInputHist *h, uint32_t slot_mask,
+                             uint32_t from, uint32_t before,
+                             uint32_t *tick, int *slot);
+
 /* The row an invent uses when a seat has no earlier row: buttons, sticks and
  * analog are copied from `neutral`; tick and flags are ignored. Default after
  * reset is buttons 0xFFFF / sticks 0 (PSX active-low neutral). */
