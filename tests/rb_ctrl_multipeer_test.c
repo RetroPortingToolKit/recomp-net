@@ -224,7 +224,8 @@ static int run_pass(const char *label, unsigned port_base)
 out:
     if (!ok)
     {
-        snprintf(msg, sizeof(msg), "%s: setup", label);
+        snprintf(msg, sizeof(msg), "%s: setup (ports %u..%u)",
+                 label, port_base, port_base + kSeats - 1u);
         CHECK(0, msg);
     }
     for (i = 0; i < kSeats; ++i)
@@ -235,7 +236,9 @@ out:
 
 int main(void)
 {
-    unsigned base = 44000u + (test_pid() % 4000u) * 8u;
+    /* Reserve eight ports in 20000..51999, including the impaired pass.
+     * Starting at 44000 let high PID residues produce ports above 65535. */
+    unsigned base = 20000u + (test_pid() % 4000u) * 8u;
     set_env("RNET_SIM_LATENCY_MS", NULL);
     set_env("RNET_SIM_LOSS_PCT", NULL);
     (void)run_pass("clean link", base);
