@@ -1,4 +1,5 @@
 #include "protocol/rnet_protocol.h"
+#include "recomp_net/session.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -34,6 +35,18 @@ int main(void)
     expect_true(dec.rb_load_tick == 48u && dec.rb_target_tick == 56u, "rb_sync load/target");
     expect_true(dec.rb_corrected_slot == 1u && dec.rb_initiator == 1u, "rb_sync slot/initiator");
     expect_true(dec.rb_flags == 0x03u, "rb_sync flags");
+
+    /* A prefix refusal carries the required earlier load, including tick 0,
+     * distinctly from a busy NACK's confirmed frontier. */
+    n = rnet_proto_encode_rb_sync(buf, sizeof(buf), MAGIC, 0xABCD, 1,
+                                 7u, 50u, 48u, 0u, 1u,
+                                 RNET_RB_SYNC_OP_NACK, RNET_RB_SYNC_FLAG_PREFIX);
+    expect_true(n > 0 && rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0,
+                "prefix NACK decodes");
+    expect_true(dec.rb_initiator == RNET_RB_SYNC_OP_NACK &&
+                    dec.rb_flags == RNET_RB_SYNC_FLAG_PREFIX &&
+                    dec.rb_load_tick == 48u && dec.rb_target_tick == 0u,
+                "prefix NACK preserves safe load and flag");
 
     /* RB_SYNC abort op round-trip (class in mismatch field) */
     n = rnet_proto_encode_rb_sync(buf, sizeof(buf), MAGIC, 0xABCD, 1, 9u, 2u, 44u, 0u, 0u, 2u, 0u);

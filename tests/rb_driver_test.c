@@ -91,6 +91,7 @@ typedef struct Toy {
 typedef struct Child {
     int slot;
     int mode;
+    uint32_t snap_depth;
     Toy state;
     struct { uint32_t tick; int valid; Toy s; } snaps[TOY_SNAPS];
     RNetRbFrame pub[RNET_RB_MAX_SLOTS];
@@ -150,7 +151,7 @@ static void toy_step(void)
 
 static int h_snap_save(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % g_c.snap_depth;
     (void)ctx;
     g_c.snaps[i].tick = tick;
     g_c.snaps[i].valid = 1;
@@ -160,7 +161,7 @@ static int h_snap_save(void *ctx, uint32_t tick)
 
 static int h_snap_load(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % g_c.snap_depth;
     (void)ctx;
     if (!g_c.snaps[i].valid || g_c.snaps[i].tick != tick)
         return 0;
@@ -170,7 +171,7 @@ static int h_snap_load(void *ctx, uint32_t tick)
 
 static int h_snap_has(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % g_c.snap_depth;
     (void)ctx;
     return g_c.snaps[i].valid && g_c.snaps[i].tick == tick;
 }
@@ -501,6 +502,10 @@ typedef struct Scenario {
      * before it, must stop exactly there, settle, agree on the state, stay
      * held for a second without the match dropping, then resume. 0 = none. */
     uint32_t hold_at;
+    /* Simultaneous wrong predictions with the real runner's short snapshot
+     * window. Grade the settled frontier, not merely an early matching prefix. */
+    int force_all;
+    uint32_t snap_depth;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -570,6 +575,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     memset(&g_c, 0, sizeof(g_c));
     g_c.slot = slot;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
+    g_c.snap_depth = sc->snap_depth ? sc->snap_depth : TOY_SNAPS;
     if (slot >= slots)
         snprintf(logname, sizeof(logname), "rb_driver_test_%s_observer.log", sc->name);
     else if (slots == 2)
@@ -586,7 +592,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     setenv("RNET_SIM_SEED", seed, 1);
     /* Pinned per peer, not inherited: a knob exported for one side must never
      * reach the other (the SNES harness learned that twice). */
-    if (slot == 0 && sc->force_mispredict > 0) {
+    if ((slot == 0 || sc->force_all) && sc->force_mispredict > 0) {
         char v[16];
         snprintf(v, sizeof(v), "%d", sc->force_mispredict);
         setenv("RNET_RB_FORCE_MISPREDICT", v, 1);
@@ -648,7 +654,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     cfg.part_names[0] = "acc_lo";
     cfg.part_names[1] = "acc_hi";
     cfg.part_names[2] = "tick";
-    cfg.snap_depth = TOY_SNAPS;
+    cfg.snap_depth = g_c.snap_depth;
     cfg.log_prefix = "rb_test";
     fill_host(&host);
     /* Identity only where a scenario is about it: the ordinary scenarios stay
@@ -680,7 +686,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     start_ms = mono_ms();
     next_tick_ms = start_ms;
     {
-        int ready_sent = 0, asked = 0;
+        int ready_sent = 0, asked = 0, final_hold_set = 0;
         uint32_t lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
@@ -735,7 +741,13 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
                     r->hold_released = 1;
                 }
             }
-            if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks) {
+            if (sc->force_all && !final_hold_set &&
+                rnet_rb_driver_sim_tick(d) + 30u >= sc->ticks) {
+                rnet_rb_driver_set_hold(d, sc->ticks);
+                final_hold_set = 1;
+            }
+            if (!ready_sent && rnet_rb_driver_sim_tick(d) >= sc->ticks &&
+                (!sc->force_all || rnet_rb_driver_hold_settled(d))) {
                 (void)write_all(ready_fd, "R", 1);
                 ready_sent = 1;
             }
@@ -1084,6 +1096,10 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     if (upto >= TOY_TICKS) upto = TOY_TICKS - 1u;
     snprintf(msg, sizeof(msg), "%s: the confirmed frontier advanced (%u)", sc->name, upto);
     expect_true(upto >= sc->ticks / 3u, msg);
+    if (sc->force_all) {
+        snprintf(msg, sizeof(msg), "%s: settled through the final input window (%u)", sc->name, upto);
+        expect_true(upto + 20u >= sc->ticks, msg);
+    }
     for (k = 1; k < nseats; ++k) {
         first_bad = 0;
         for (t = 1; t <= upto; ++t) {
@@ -1160,6 +1176,8 @@ int main(int argc, char **argv)
           0, 0, NULL, 0, 0u, 1, 0, 0, 0u, NULL, 0u, 0, 200u },
         { "hold-4seat-loss2",    1, 1,       "30",  "8",   45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0, 0, 0u, "2", 0u, 0, 200u },
+        { "two-side-prefix-loss", 1, 1,     "20",  "5",   15,   1200u,  0,
+          0, 0, NULL, 2, 0u, 1, 0, 0, 0u, "2", 0u, 0, 0u, 1, 40u },
     };
     /* Four ports per scenario from a per-process base; kept inside
      * 20000..60003 however many scenarios there are (a base near the top of
