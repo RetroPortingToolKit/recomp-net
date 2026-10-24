@@ -105,6 +105,7 @@ typedef struct Child {
     uint32_t replay_admits;
     uint32_t n_refusal_lines;   /* "RB match refused" */
     uint32_t n_deferred, n_at_tip, n_chain_stall;
+    uint32_t n_missing_snap_refused;
     /* Epochs, for the per-pair ledger: opened here, followed, refused. */
 #define MAX_EPOCHS 512
     uint32_t ep_init[MAX_EPOCHS], ep_follow[MAX_EPOCHS], ep_refused[MAX_EPOCHS];
@@ -296,6 +297,8 @@ static void h_log(void *ctx, const char *line)
     }
     if (strstr(line, "RB follow refused")) {
         g_c.n_refused++;
+        if (strstr(line, "no snapshot at load tick"))
+            g_c.n_missing_snap_refused++;
         if (g_c.n_ep_refused_ids < MAX_EPOCHS)
             g_c.ep_refused[g_c.n_ep_refused_ids++] = line_epoch(line);
     }
@@ -426,6 +429,7 @@ typedef struct Report {
              n_extend, n_unapplied, n_lobby, n_forced, replay_admits;
     uint32_t n_quiesced, n_quiesce_timeout, n_drain_unopened, n_tiphold_end;
     uint32_t n_deferred, n_at_tip, n_chain_stall;
+    uint32_t n_missing_snap_refused;
     int quiesce_state;
     uint64_t resim_ticks;
     uint32_t episodes_driver;
@@ -476,8 +480,9 @@ typedef struct Scenario {
     unsigned lag_ms;
     /* Every seat publishes / confirms a mod set: the handshake runs. */
     int modset;
-    /* 1: the follower-behind case must have been exercised (a deferral or a
-     * follow at our tip), and nothing refused. */
+    /* 1: exercise deferral/live-tip and refuse nothing. 2: in a multi-seat
+     * room, prefix and superseded-epoch NACKs are valid; still forbid a
+     * missing-load-snapshot refusal, which should defer or take the live tip. */
     int expect_no_refusal;
     /* RBE_RB_TIMESYNC=0 on every seat: the pacing controller would otherwise
      * pull the lagging seat level again (it slows the peer that mispredicts,
@@ -819,6 +824,7 @@ report:
     r->n_deferred = g_c.n_deferred;
     r->n_at_tip = g_c.n_at_tip;
     r->n_chain_stall = g_c.n_chain_stall;
+    r->n_missing_snap_refused = g_c.n_missing_snap_refused;
     memcpy(r->ep_init, g_c.ep_init, sizeof(r->ep_init));
     memcpy(r->ep_follow, g_c.ep_follow, sizeof(r->ep_follow));
     memcpy(r->ep_refused, g_c.ep_refused, sizeof(r->ep_refused));
@@ -862,6 +868,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
     uint32_t upto, t, first_bad = 0;
     uint32_t sum_init = 0, sum_follow = 0, sum_refused = 0, sum_fork = 0, sum_lobby = 0;
     uint32_t sum_timeout = 0, sum_deferred = 0, sum_at_tip = 0, sum_stall = 0;
+    uint32_t sum_missing_snap_refused = 0;
     int64_t ledger;
     char msg[320];
     int k, j;
@@ -961,6 +968,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         sum_deferred += r->n_deferred;
         sum_at_tip += r->n_at_tip;
         sum_stall += r->n_chain_stall;
+        sum_missing_snap_refused += r->n_missing_snap_refused;
         snprintf(msg, sizeof(msg), "%s: seat %d reported", sc->name, seat_of[k]);
         expect_true(got[k], msg);
         snprintf(msg, sizeof(msg), "%s: seat %d reached RUNNING", sc->name, seat_of[k]);
@@ -1067,7 +1075,9 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
         snprintf(msg, sizeof(msg), "%s: a follower behind the load tick followed it "
                  "(deferred %u, at our tip %u, refused %u)", sc->name, sum_deferred,
                  sum_at_tip, sum_refused);
-        expect_true(sum_deferred + sum_at_tip > 0u && sum_refused == 0u, msg);
+        expect_true(sum_deferred + sum_at_tip > 0u &&
+                        (sc->expect_no_refusal == 2 ? sum_missing_snap_refused == 0u
+                                                   : sum_refused == 0u), msg);
     }
     /* No advisory stall on a link that loses nothing: an aborted episode no
      * longer leaves a stale digest behind, and nothing else should stall. */
@@ -1148,7 +1158,7 @@ int main(int argc, char **argv)
         { "3seat-loopback",      1, 1,       "0",   "0",   45,    420u,  0,
           0, 0, NULL, 3, 0u, 1, 0 },
         { "3seat-behind",        1, 1,       "0",   "0",   30,    420u,  0,
-          0, 0, NULL, 3, 50u, 1, 1, 1, 0u },
+          0, 0, NULL, 3, 100u, 1, 2, 1, 0u },
         { "4seat-rtt200",        1, 1,       "100", "25",  45,    420u,  0,
           0, 0, NULL, 4, 0u, 1, 0 },
         { "4seat-mixed-rtt60",   0, 1,       "30",  "8",   45,    420u,  1,
