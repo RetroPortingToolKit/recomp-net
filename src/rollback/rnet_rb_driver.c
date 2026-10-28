@@ -250,7 +250,7 @@ struct RNetRbDriver {
     unsigned long force_mispredict_n;
     int      force_boot_fork;
     int      force_mod_mismatch;
-    char     force_modset[1024];
+    char     force_modset[RNET_MODSET_TEXT_MAX];
     int      allow_boot_fork;
     char     allow_boot_fork_env[96];
     int      allow_mod_mismatch;
@@ -1273,7 +1273,7 @@ static void rb_modset_pump(RNetRbDriver *d)
 {
     RNetSession *s = rb_session(d);
     const int host = (rb_local_slot(d) == 0);
-    char text[1024];
+    char text[RNET_MODSET_TEXT_MAX];
     rnet_u8 status = 0;
     char reason[96];
 

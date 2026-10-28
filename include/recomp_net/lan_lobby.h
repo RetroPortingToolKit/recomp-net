@@ -2,6 +2,7 @@
 #define RNET_LAN_LOBBY_H
 
 #include "recomp_net/types.h"
+#include "recomp_net/modset.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,7 +21,7 @@ extern "C" {
 #define RNET_LAN_LOBBY_ENDPOINT_MAX   64
 #define RNET_LAN_LOBBY_PLAYER_MAX     64
 #define RNET_LAN_LOBBY_PASSWORD_MAX   64
-#define RNET_LAN_LOBBY_MOD_SET_MAX    512
+#define RNET_LAN_LOBBY_MOD_SET_MAX    RNET_MODSET_TEXT_MAX
 #define RNET_LAN_LOBBY_HAS_MOD_SET    1
 
 typedef struct RNetLanLobby {

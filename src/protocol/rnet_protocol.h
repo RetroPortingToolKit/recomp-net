@@ -5,6 +5,7 @@
 #include "recomp_net/input.h"
 #include "recomp_net/types.h"
 #include "recomp_net/rollback.h"
+#include "recomp_net/modset.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,13 +47,14 @@ extern "C" {
  * cannot reproduce the host's set is running a different game and must not be
  * allowed to start rather than be discovered desyncing later.
  *
- * One packet, not a chunked transfer: a realistic set is a few hundred bytes
- * against a 1200-byte MTU, and a set too large to fit is refused loudly rather
- * than silently truncated -- two different sets can share a prefix. */
+ * Small sets retain the original one-packet encoding. Large sets use chunks
+ * and are exposed only after complete reassembly/checksum validation. */
 #define RNET_PKT_MODSET 26      /* host->peer: canonical effective mod set */
 #define RNET_PKT_MODSET_ACK 27  /* peer->host: can/cannot honour it, and why */
 
-#define RNET_MODSET_TEXT_MAX 1024u
+#define RNET_PKT_MODSET_CHUNK 28 /* bounded canonical settings transfer */
+#define RNET_MODSET_PACKET_TEXT_MAX 1024u
+#define RNET_MODSET_CHUNK_BYTES 960u
 #define RNET_MODSET_REASON_MAX 96u
 
 /* MODSET_ACK status */
@@ -102,7 +104,7 @@ typedef struct RNetRbWireFrame
 /* Wire version, sent in HELLO's former reserved byte (0 from a peer that
  * predates it). Peers of different versions refuse to link: version 2 widened
  * the seal-row frame, which an older peer would misparse. */
-#define RNET_WIRE_VERSION 2u
+#define RNET_WIRE_VERSION 3u /* complete, MTU-bounded large mod-set negotiation */
 /* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
  * chunks its own seal rows has to know the bound the send path enforces. */
 
@@ -197,6 +199,9 @@ int rnet_proto_encode_modset(rnet_u8 *out, size_t cap, rnet_u32 magic,
 int rnet_proto_encode_modset_ack(rnet_u8 *out, size_t cap, rnet_u32 magic,
                                  rnet_u32 session_id, rnet_u8 local_slot,
                                  rnet_u8 status, const char *reason);
+int rnet_proto_encode_modset_chunk(rnet_u8 *out, size_t cap, rnet_u32 magic,
+    rnet_u32 session_id, rnet_u8 local_slot, rnet_u16 total,
+    rnet_u16 offset, const char *data, rnet_u16 length, rnet_u32 checksum);
 int rnet_proto_encode_rb_resolved(rnet_u8 *out, size_t cap, rnet_u32 magic, rnet_u32 session_id,
                                   rnet_u8 local_slot, rnet_u32 resolved_through);
 
@@ -255,8 +260,10 @@ typedef struct RNetDecodedPacket
     rnet_u32 rb_state_hash;
     rnet_u32 rb_resolved_through;
     /* MODSET / MODSET_ACK */
-    char modset_text[RNET_MODSET_TEXT_MAX];
+    char modset_text[RNET_MODSET_PACKET_TEXT_MAX];
     rnet_u16 modset_len;
+    rnet_u16 modset_total, modset_offset;
+    rnet_u32 modset_checksum;
     rnet_u8 modset_status;
     char modset_reason[RNET_MODSET_REASON_MAX];
     /* SIO_MULTI_XFER */

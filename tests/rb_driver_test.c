@@ -539,9 +539,14 @@ static int stop_requested(int fd)
     return read(fd, &c, 1) == 1;
 }
 
+static const char *expected_modset;
+static char large_modset[RNET_MODSET_TEXT_MAX];
 static int modset_ok(const char *want, char *reason, uint32_t cap)
 {
-    (void)want;
+    if (expected_modset && strcmp(want,expected_modset)) {
+        if(reason && cap)snprintf(reason,cap,"resolved mod options differ");
+        return 3;
+    }
     if (reason && cap)
         reason[0] = '\0';
     return 0;
@@ -656,8 +661,23 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
      * peers see is the injected one. */
     if (sc->refusal || slots > 2)
         rnet_rb_driver_set_identity(d, 0x0b0b0b0bu, 0x0c0c0c0cu);
-    if (sc->modset)
-        rnet_rb_driver_set_modset(d, "mods none\n", modset_ok, NULL);
+    if (sc->modset) {
+        const char *text="mods none\n";
+        expected_modset=NULL;
+        if(sc->modset>=2) {
+            const char *path=getenv("RNET_TEST_MODSET_FILE");
+            if(path && path[0]) {
+                FILE *file=fopen(path,"rb");size_t n;
+                if(!file)goto report;
+                n=fread(large_modset,1,sizeof(large_modset),file);fclose(file);
+                if(n>=sizeof(large_modset)||n<1024)goto report;
+                large_modset[n]=0;
+            } else {memset(large_modset,'m',2526);large_modset[2526]=0;}
+            if(sc->modset==3 && slot==1)large_modset[strlen(large_modset)-1]='?';
+            text=expected_modset=large_modset;
+        }
+        rnet_rb_driver_set_modset(d,text,modset_ok,NULL);
+    }
     if (!rnet_rb_driver_start(d, &cfg, &host))
         goto report;
 
@@ -1107,6 +1127,12 @@ int main(int argc, char **argv)
      * 60 Hz frontend cadence, so a pass here means what a pass there means.
      * RNET_SIM_LATENCY_MS is one-way per peer: RTT is double. */
     static const Scenario scenarios[] = {
+        { "large-modset-match", 0,1,"30","8",45,420u,0,
+          0,0,NULL,2,0u,2,0,0,0u,"2" },
+        { "large-modset-refuse", 0,1,"30","8",0,420u,0,
+          0,0,"mod_set_not_agreed",2,0u,3,0,0,0u,"2" },
+        { "large-modset-3seat", 0,1,"30","8",45,420u,0,
+          0,0,NULL,3,0u,2,0,0,0u,"2" },
         /* name                  mode A, B   latency jitter force  ticks  one-side */
         { "inline-loopback",     0, 0,       "0",   "0",   45,    420u,  0 },
         { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u,  0 },

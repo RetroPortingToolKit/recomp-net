@@ -24,6 +24,7 @@ set(RNET_BUILD_ID "unknown" CACHE STRING "Source id reported by rnet_module_info
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(RNET_CORE_SOURCES
+  src/session/rnet_modset.c
   src/platform/rnet_address.c
   src/platform/rnet_platform.c
   src/platform/rnet_stun.c
@@ -306,6 +307,15 @@ endif()
 # ---- Tests ----
 if(RNET_BUILD_TESTS)
   enable_testing()
+  add_executable(modset_transfer_test tests/modset_transfer_test.c)
+  target_link_libraries(modset_transfer_test PRIVATE recomp_net)
+  target_include_directories(modset_transfer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(modset_transfer_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(modset_transfer_test PRIVATE -UNDEBUG)
+  endif()
+  add_test(NAME modset_transfer_test COMMAND modset_transfer_test)
 
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)

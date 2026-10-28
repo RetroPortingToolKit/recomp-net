@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "recomp_net/modset.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -298,7 +299,7 @@ typedef struct RNetLobbyMatchCaps {
      *
      * Carried so a guest can match the host BEFORE launching rather than
      * discovering the difference from a refused match. */
-    char mod_set[512];
+    char mod_set[RNET_MODSET_TEXT_MAX];
     /* Which packages this match's AUTHORITY grants the presentation-only
      * exemption to: ';'-separated `id@version` or `id@version#sha256`.
      *

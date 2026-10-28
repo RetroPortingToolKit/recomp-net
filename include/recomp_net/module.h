@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define RNET_MODULE_ABI_VERSION 1u
+#define RNET_MODULE_ABI_VERSION 2u /* larger lobby/LAN canonical settings fields */
 #define RNET_MODULE_ABI_MINOR 1u /* startup_profiles.h functions appended */
 
 #define RNET_MODULE_FEATURE_ICE (1u << 0)      /* built with libjuice */

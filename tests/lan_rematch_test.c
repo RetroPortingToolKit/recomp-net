@@ -146,7 +146,7 @@ int main(void)
     snprintf(bind_g, sizeof(bind_g), "127.0.0.1:%u", port + 1u);
     snprintf(hroom.endpoint, sizeof(hroom.endpoint), "%s", bind_h);
     hroom.session_variant = 37;
-    snprintf(hroom.mod_set, sizeof(hroom.mod_set), "test.coop@1/coop player1=zero");
+    memset(hroom.mod_set,'m',2526);hroom.mod_set[2526]=0;
 
     /* --- 1. the non-blocking join, single-threaded -------------------- */
     printf("  non-blocking join while the host is pumped on the same thread\n");

@@ -31,7 +31,7 @@ int main(void)
     room.rollback = 1;
     room.input_prediction = 7;
     room.session_variant = 37;
-    snprintf(room.mod_set, sizeof(room.mod_set), "test.coop@1/coop player1=zero;test.view@1/wide aspect=21:9");
+    memset(room.mod_set,'m',2526);room.mod_set[2526]=0;
 
     expect(rnet_lan_lobby_publish(path, &room) == RNET_LAN_LOBBY_OK,
            "publish room");

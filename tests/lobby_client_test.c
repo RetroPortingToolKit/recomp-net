@@ -495,6 +495,35 @@ static void case_mod_set_round_trips(void)
        "resolved option values survive");
 }
 
+/* Exercise the complete canonical list, beyond the old 512-byte field. A
+ * retained real-title caps fixture may also be supplied for integration QA. */
+static void case_large_mod_set_round_trips(void)
+{
+    RNetLobbyMatchCaps caps,back;
+    char json[5120],obj[5120];
+    const char *path=getenv("RNET_TEST_CAPS_JSON");
+    memset(&caps,0,sizeof(caps));caps.valid=1;
+    if(path && path[0]) {
+        FILE *file=fopen(path,"rb");size_t n;
+        ck(file!=NULL,"real title caps fixture opens");if(!file)return;
+        n=fread(obj,1,sizeof(obj),file);fclose(file);
+        ck(n<sizeof(obj),"real title caps fixture fits");if(n>=sizeof(obj))return;
+        obj[n]=0;parse_match_caps_object(obj,&caps);
+    } else { memset(caps.mod_set,'m',2526);caps.mod_set[2526]=0; }
+    ck(strlen(caps.mod_set)>1024,"full large canonical list supplied");
+    if(!append_match_caps_json(json,sizeof(json),&caps)) {
+        ck(0,"complete large mod set and plan fit server caps contract");return;
+    }
+    ck(json_extract_object(json,"match_caps",obj,sizeof(obj)),"large caps extract completely");
+    memset(&back,0,sizeof(back));parse_match_caps_object(obj,&back);
+    ck(!strcmp(caps.mod_set,back.mod_set),"large resolved options round trip without prefixes");
+    ck(caps.mod_count==back.mod_count,"all plan packages survive with large settings");
+    { int i;for(i=0;i<caps.mod_count;i++) {
+        ck(!strcmp(caps.mods[i].id,back.mods[i].id) && !strcmp(caps.mods[i].ver,back.mods[i].ver) &&
+           !strcmp(caps.mods[i].feats,back.mods[i].feats),"large caps retain package identity and required features");
+    }}
+}
+
 
 /* ---- relay size cap -----------------------------------------------------
  *
@@ -1774,6 +1803,7 @@ int main(void)
     case_ice_local_becomes_remote();
     case_offer_round_trips_through_a_slot_row();
     case_mod_set_round_trips();
+    case_large_mod_set_round_trips();
     case_relay_cap_is_five_mb();
     case_direct_paths_are_never_capped();
     case_unknown_path_allows();

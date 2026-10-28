@@ -7,7 +7,7 @@
 #include <string.h>
 
 #define RNET_DJ_MAGIC "RNETDJ1"
-#define RNET_DJ_MAX_PKT 2048
+#define RNET_DJ_MAX_PKT (RNET_MODSET_TEXT_MAX + 2048u)
 
 /* Received chat, oldest at head. Sized so a burst between two pumps is kept
  * rather than dropped; when it does overflow the OLDEST goes, because losing

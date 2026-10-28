@@ -569,7 +569,9 @@ int rnet_proto_encode_modset(rnet_u8 *out, size_t cap, rnet_u32 magic,
                              const char *text)
 {
     rnet_u8 *c = out;
-    size_t n = clamped_len(text, RNET_MODSET_TEXT_MAX);
+    size_t n = clamped_len(text, RNET_MODSET_PACKET_TEXT_MAX);
+    if (!text || n >= RNET_MODSET_PACKET_TEXT_MAX)
+        return -1; /* never serialize a prefix as a complete settings list */
     if (cap < (18 + n))
     {
         return -1;
@@ -585,6 +587,24 @@ int rnet_proto_encode_modset(rnet_u8 *out, size_t cap, rnet_u32 magic,
         memcpy(c, text, n);
         c += n;
     }
+    return finish_packet(out, c, cap);
+}
+
+int rnet_proto_encode_modset_chunk(rnet_u8 *out, size_t cap, rnet_u32 magic,
+    rnet_u32 session_id, rnet_u8 local_slot, rnet_u16 total,
+    rnet_u16 offset, const char *data, rnet_u16 length, rnet_u32 checksum)
+{
+    rnet_u8 *c = out;
+    if (!data || !total || total >= RNET_MODSET_TEXT_MAX || offset >= total ||
+        offset % RNET_MODSET_CHUNK_BYTES || !length ||
+        length != ((unsigned)(total - offset) > RNET_MODSET_CHUNK_BYTES ?
+                   RNET_MODSET_CHUNK_BYTES : (unsigned)(total - offset)) ||
+        memchr(data, 0, length) || cap < 26u + length)
+        return -1;
+    write_u32(&c, magic); write_u16(&c, RNET_PKT_MODSET_CHUNK);
+    write_u32(&c, session_id); *c++ = local_slot; *c++ = 0;
+    write_u16(&c, total); write_u16(&c, offset); write_u16(&c, length);
+    write_u32(&c, checksum); memcpy(c, data, length); c += length;
     return finish_packet(out, c, cap);
 }
 
@@ -957,12 +977,12 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         n = read_u16(&c);
         dst = (out->type == RNET_PKT_MODSET) ? out->modset_text
                                              : out->modset_reason;
-        dst_cap = (out->type == RNET_PKT_MODSET) ? RNET_MODSET_TEXT_MAX
+        dst_cap = (out->type == RNET_PKT_MODSET) ? RNET_MODSET_PACKET_TEXT_MAX
                                                  : RNET_MODSET_REASON_MAX;
         /* A body longer than the field is a malformed or hostile packet, not
          * something to truncate into: a truncated set compares equal to any
          * set sharing its prefix. */
-        if (((size_t)n >= dst_cap) || ((size_t)(end - c) < (size_t)n))
+        if (((size_t)n >= dst_cap) || ((size_t)(end - c) < (size_t)n) || memchr(c, 0, n))
         {
             return -1;
         }
@@ -973,6 +993,22 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
         }
         dst[n] = '\0';
         out->modset_len = n;
+        break;
+    }
+    case RNET_PKT_MODSET_CHUNK:
+    {
+        unsigned expected;
+        if ((size_t)(end - c) < 12u) return -1;
+        out->local_slot = *c++; c++;
+        out->modset_total = read_u16(&c); out->modset_offset = read_u16(&c);
+        out->modset_len = read_u16(&c); out->modset_checksum = read_u32(&c);
+        if (!out->modset_total || out->modset_total >= RNET_MODSET_TEXT_MAX ||
+            out->modset_offset >= out->modset_total || out->modset_offset % RNET_MODSET_CHUNK_BYTES)
+            return -1;
+        expected = out->modset_total - out->modset_offset;
+        if (expected > RNET_MODSET_CHUNK_BYTES) expected = RNET_MODSET_CHUNK_BYTES;
+        if (out->modset_len != expected || (size_t)(end-c) != expected || memchr(c, 0, expected)) return -1;
+        memcpy(out->modset_text,c,expected); out->modset_text[expected]=0; c+=expected;
         break;
     }
     case RNET_PKT_RB_RESOLVED:

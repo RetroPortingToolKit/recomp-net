@@ -6,6 +6,7 @@
 #include "recomp_net/input.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/types.h"
+#include "recomp_net/modset.h"
 
 #ifdef __cplusplus
 extern "C" {
