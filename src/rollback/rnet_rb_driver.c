@@ -720,6 +720,15 @@ static int rb_snap_has(RNetRbDriver *d, uint32_t tick)
     return d->host.snap_has(d->host.ctx, tick) ? 1 : 0;
 }
 
+/* Reserve the abort backup before choosing or advertising a baseline. A
+ * full store can evict its oldest entry on this save; doing it only after
+ * sealing made an accepted load disappear immediately before replay.
+ * Sealing holds sim fixed, so replay can reuse this exact snapshot. */
+static int rb_reserve_tip(RNetRbDriver *d)
+{
+    return rb_snap_has(d, d->sim) || d->host.snap_save(d->host.ctx, d->sim);
+}
+
 static uint32_t rb_snap_oldest_or0(RNetRbDriver *d)
 {
     uint32_t oldest = 0u;
@@ -2139,9 +2148,9 @@ static int rb_run_replay(RNetRbDriver *d)
      * sim says it is (rb_restore_tip). Keyed like every snapshot: the state
      * BEFORE tick sim runs, which is the state now. */
     d->tip_tick = d->sim;
-    if (!d->host.snap_save(d->host.ctx, d->tip_tick)) {
+    if (!rb_snap_has(d, d->tip_tick)) {
         rb_episode_abort(d, RNET_RB_ABORT_CLASS_NO_SNAP,
-                         "could not save the live tip before the baseline load");
+                         "reserved live tip is missing before the baseline load");
         return 0;
     }
     if (!d->host.snap_load(d->host.ctx, d->corr.load_tick)) {
@@ -2315,6 +2324,11 @@ static int rb_tip_extend(RNetRbDriver *d, uint32_t tick, int slot, int notify_pe
                   "covers it\n",
                (unsigned)d->corr.epoch_id, (unsigned)tick,
                (unsigned)d->tip_extends);
+        return 0;
+    }
+    if (!rb_reserve_tip(d)) {
+        rb_log(d, "RB tip-extend refused epoch=%u -- cannot reserve live tip %u\n",
+               (unsigned)d->corr.epoch_id, (unsigned)d->sim);
         return 0;
     }
     /* The replay re-runs from load, so we must still hold that snapshot, and
@@ -2536,6 +2550,25 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
         return 0;
     }
 
+    {
+        int at_tip = !as_initiator && peer_load == d->sim &&
+                     !rb_snap_has(d, peer_load);
+        if (!rb_reserve_tip(d)) {
+            rb_log(d, "RB %s refused epoch=%u -- cannot reserve live tip %u\n",
+                   as_initiator ? "episode" : "follow", (unsigned)peer_epoch,
+                   (unsigned)d->sim);
+            if (!as_initiator)
+                rb_send_nack(d, peer_epoch, mismatch_tick, peer_load, slot);
+            return 0;
+        }
+        if (at_tip) {
+            d->n_follow_at_tip++;
+            rb_log(d, "RB follow at our live tip epoch=%u load=%u -- the load "
+                      "snapshot is the live state; taken now\n",
+                   (unsigned)peer_epoch, (unsigned)peer_load);
+        }
+    }
+
     if (as_initiator) {
         uint32_t want = mismatch_tick;
         if (d->prefix_load_cap_valid && want > d->prefix_load_cap)
@@ -2602,19 +2635,6 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
                                     RNET_RB_SYNC_FLAG_PREFIX);
                 return 0;
             }
-        }
-        /* The load tick is our live tip: we have simulated everything before
-         * it and nothing of it. A snapshot keyed T is the state BEFORE tick T
-         * runs, which is exactly the machine as it stands between two polls
-         * at sim == T -- the same state the live admit of T would have saved.
-         * Take it now instead of refusing (see defer_valid for what refusing
-         * cost). Never mid-replay: the machine is then not at sim. */
-        if (!rb_snap_has(d, load) && load == d->sim && !d->in_resim &&
-            d->host.snap_save(d->host.ctx, load)) {
-            d->n_follow_at_tip++;
-            rb_log(d, "RB follow at our live tip epoch=%u load=%u — the load "
-                      "snapshot is the live state; taken now\n",
-                   (unsigned)peer_epoch, (unsigned)load);
         }
         if (!rb_snap_has(d, load)) {
             /* Every BEGIN we turn down has to be countable, or the two peers'
@@ -3603,12 +3623,14 @@ static void rb_reconcile_wire(RNetRbDriver *d)
     RNetSession *s = rb_session(d);
     int slots = rb_slot_count(d);
     int local = rb_local_slot(d);
-    uint32_t from = rnet_rb_resolved_through(d->rb) + 1u;
+    uint32_t from = 0u;
     int slot;
 
-    /* Nothing older than the history window can be reconciled anyway, and an
-     * un-advancing watermark would otherwise make this scan grow without
-     * bound as the match runs. */
+    /* Hash agreement does not promote input history. Equal predictions can
+     * remain flagged below the resolved watermark, then a later prefix scan
+     * demands an expired snapshot for a row whose owner already confirmed
+     * it. Reconcile every retained prediction against actual wire authority;
+     * the history window bounds the work even if confirmation stops. */
     if (d->sim > RNET_INPUT_HIST_DEPTH &&
         from < d->sim - RNET_INPUT_HIST_DEPTH)
         from = d->sim - RNET_INPUT_HIST_DEPTH;
