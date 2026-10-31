@@ -3026,6 +3026,37 @@ static void rb_on_peer_post(RNetRbDriver *d, int from, uint32_t epoch,
     d->answered_mask |= bit;
 }
 
+static void rb_on_nack(RNetRbDriver *d, uint32_t epoch, uint32_t c, uint8_t flags)
+{
+    if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
+        int prefix = (flags & RNET_RB_SYNC_FLAG_PREFIX) &&
+                     c < d->corr.load_tick;
+        if (prefix) {
+            if (!d->prefix_load_cap_valid || c < d->prefix_load_cap)
+                d->prefix_load_cap = c;
+            d->prefix_load_cap_valid = 1u;
+            /* A chain repair need not have an owed wire row, and a
+             * completed local replay may already have paid one. The
+             * peer still requires this repair from a safe prefix.
+             * Queue the original mismatch now rather than waiting
+             * for another misprediction to retry an expired cap. */
+            rb_owed_mark(d, d->corr.mismatch_tick, d->corr.slot);
+            rb_log(d, "RB prefix realign epoch=%u -- next load <= %u\n",
+                   (unsigned)epoch, (unsigned)d->prefix_load_cap);
+        }
+        /* A prefix NACK carries its earliest unsettled tick; other
+         * NACKs carry the ordinary confirmed frontier. */
+        rnet_rb_demote_resolved_through(d->rb, prefix ? (c ? c - 1u : 0u) : c);
+        rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN, "peer NACK");
+        /* Retry the supplied safe earlier load before the short
+         * snapshot ring ages out. Other refusals retain backoff. */
+        if (prefix) {
+            d->cooldown_until_tick = d->sim;
+            d->owed_retry_after = d->sim;
+        }
+    }
+}
+
 static void rb_drain_wire(RNetRbDriver *d)
 {
     RNetSession *s = rb_session(d);
@@ -3237,25 +3268,7 @@ static void rb_drain_wire(RNetRbDriver *d)
             rb_follow_or_defer(d, epoch, a, b, c, (int)slot, flags);
             break;
         case RNET_RB_SYNC_OP_NACK:
-            if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
-                int prefix = (flags & RNET_RB_SYNC_FLAG_PREFIX) &&
-                             c < d->corr.load_tick;
-                if (prefix) {
-                    if (!d->prefix_load_cap_valid || c < d->prefix_load_cap)
-                        d->prefix_load_cap = c;
-                    d->prefix_load_cap_valid = 1u;
-                    rb_log(d, "RB prefix realign epoch=%u -- next load <= %u\n",
-                           (unsigned)epoch, (unsigned)d->prefix_load_cap);
-                }
-                /* A prefix NACK carries its earliest unsettled tick; other
-                 * NACKs carry the ordinary confirmed frontier. */
-                rnet_rb_demote_resolved_through(d->rb, prefix ? (c ? c - 1u : 0u) : c);
-                rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN, "peer NACK");
-                /* Retry the supplied safe earlier load before the short
-                 * snapshot ring ages out. Other refusals retain backoff. */
-                if (prefix)
-                    d->cooldown_until_tick = d->sim;
-            }
+            rb_on_nack(d, epoch, c, flags);
             break;
         case RNET_RB_SYNC_OP_ABORT:
             if (d->defer_valid && epoch == d->defer_epoch) {
