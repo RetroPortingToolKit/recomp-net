@@ -2,6 +2,7 @@
  * snapshot window. Other driver dependencies come from the normal library. */
 #define rnet_session_peek_remote_input test_peek_remote_input
 #include "../src/rollback/rnet_rb_driver.c"
+static unsigned wire_button;
 
 /* Replace only the transport read. The actual reconciliation and prefix
  * guard run below, with a real rollback session and input history. */
@@ -12,6 +13,7 @@ int test_peek_remote_input(const RNetSession *s, int slot, rnet_u32 wire,
     if (slot != 1 || wire != 233u) return 0;
     memset(out, 0, sizeof(*out));
     out->valid = 1;
+    out->bytes[0] = (rnet_u8)wire_button;
     return 1;
 }
 
@@ -19,7 +21,7 @@ static int inert_tick(void *ctx, uint32_t tick) { (void)ctx; (void)tick; return 
 static uint8_t no_row(void *ctx, int32_t slot, uint32_t tick, RNetRbFrame *out)
 { (void)ctx; (void)slot; (void)tick; (void)out; return 0; }
 static void decode_idle(void *ctx, int slot, const RNetInputSample *in, RNetRbFrame *out)
-{ (void)ctx; (void)slot; (void)in; (void)out; }
+{ (void)ctx; (void)slot; out->buttons=in->bytes[0]; }
 
 static int check_confirmed_prediction(void)
 {
@@ -93,6 +95,51 @@ static void init_short(ShortStore *s) {
     uint32_t t; memset(s,0,sizeof(*s));
     for(t=233u;t<273u;t++) { s->live=t; short_save(s,t); }
     s->live=273u; s->saves=0;
+}
+
+static void sample_noop(rnet_u32 tick, RNetInputSample *out, void *ctx)
+{ (void)tick; (void)out; (void)ctx; }
+static void publish_noop(rnet_u32 tick, const RNetInputSample *rows, int slots, void *ctx)
+{ (void)tick; (void)rows; (void)slots; (void)ctx; }
+
+static int check_begin_before_reconcile(unsigned different)
+{
+    RNetRbDriver *d=calloc(1,sizeof(*d));
+    ShortStore store;
+    RNetRbConfig cfg={0}; RNetRollbackVTable vt={0};
+    RNetConfig netcfg={0}; RNetHostVTable nethost={0};
+    RNetSession *session; RNetRbFrame row={0};
+    uint32_t expected=different ? 233u : 269u;
+    if(!d) return 1;
+    netcfg.slot_count=2;
+    nethost.sample_local=sample_noop; nethost.publish=publish_noop;
+    session=rnet_session_create(&netcfg,&nethost);
+    if(!session) { free(d); return 1; }
+    cfg.slot_count=2;
+    vt.load_state=inert_tick; vt.advance_sim=inert_tick; vt.get_input_row=no_row;
+    d->rb=rnet_rb_create(&cfg,&vt);
+    if(!d->rb) { rnet_session_destroy(session); free(d); return 1; }
+    d->cfg.session=&session; d->sim=273u;
+    d->host.ctx=&store; d->host.now_ms=now_ms; d->host.log=quiet;
+    d->host.snap_save=short_save; d->host.snap_has=short_has;
+    d->host.snap_oldest=short_oldest; d->host.decode_sample=decode_idle;
+    rb_owed_reset(d); rnet_ih_reset(&d->ih,2); init_short(&store);
+    row.tick=233u; row.is_valid=row.is_predicted=1;
+    rnet_ih_put(&d->ih,1,&row);
+    row.tick=269u; rnet_ih_put(&d->ih,1,&row);
+    rnet_rb_set_peer_convergence(d->rb,250u);
+    wire_button=different;
+    /* Actual follower BEGIN before reconciliation, matching wire available
+     * in this poll. Equal233 must not request the now-evicted233 baseline;
+     * unavailable269 (and genuinely different233) must remain guarded. */
+    if(rb_begin_episode(d,270u,1,0,270u,270u,25u,0u) || d->episode_count ||
+       d->nacked_n!=1u || d->nacked[0].frontier!=expected ||
+       d->nacked[0].flags!=RNET_RB_SYNC_FLAG_PREFIX ||
+       !rnet_ih_get(&d->ih,1,233u,&row) || row.is_predicted!=(different!=0u)) {
+        fprintf(stderr,"BEGIN before reconciliation misclassified prefix (different=%u)\n",different);
+        rnet_rb_destroy(d->rb); rnet_session_destroy(session); free(d); wire_button=0; return 1;
+    }
+    rnet_rb_destroy(d->rb); rnet_session_destroy(session); free(d); wire_button=0; return 0;
 }
 
 static int check_tip_reservation(void)
@@ -182,5 +229,6 @@ static int check_case(uint32_t prefix, int already_replayed)
 int main(void)
 {
     return check_case(118u, 1) || check_case(118u, 0) || check_case(0u, 1) ||
-           check_confirmed_prediction() || check_tip_reservation();
+           check_confirmed_prediction() || check_tip_reservation() ||
+           check_begin_before_reconcile(0u) || check_begin_before_reconcile(1u);
 }

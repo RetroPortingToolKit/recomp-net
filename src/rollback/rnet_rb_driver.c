@@ -741,13 +741,42 @@ static uint32_t rb_snap_oldest_or0(RNetRbDriver *d)
  * already owed is unsafe, but so is a prediction whose wire has not arrived:
  * discovering that it was wrong during sealing is too late to compare the
  * baseline. Preserve the row/owed marks; choose/refuse the load instead. */
-static int rb_unsettled_before(const RNetRbDriver *d, uint32_t load,
+static void rb_promote_matching_prefix(RNetRbDriver *d, uint32_t before)
+{
+    RNetSession *s = rb_session(d);
+    uint32_t mask = rb_expect_mask(d), i;
+    uint32_t from = d->sim > RNET_INPUT_HIST_DEPTH
+                        ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    int slot;
+    if (!s) return;
+    /* BEGIN is drained before reconciliation. An owner row arriving in that
+     * same poll can settle an equal prediction without opening an episode.
+     * Leave differing or missing rows untouched: the prefix guard and normal
+     * correction logic still own them. */
+    for (slot = 0; slot < rb_slot_count(d); ++slot) {
+        if (!(mask & (1u << slot))) continue;
+        for (i = 0; i < RNET_INPUT_HIST_DEPTH; ++i) {
+            const RNetRbFrame *row = &d->ih.rows[slot][i];
+            RNetInputSample sample;
+            RNetRbFrame wire;
+            if (!row->is_valid || !row->is_predicted ||
+                row->tick < from || row->tick >= before) continue;
+            if (!rnet_session_peek_remote_input(s, slot,
+                    rnet_sched_wire_for_sim(row->tick), &sample) || !sample.valid) continue;
+            rb_row_from_sample(d, slot, row->tick, &sample, &wire);
+            if (rb_rows_equal(row, &wire)) rnet_ih_promote(&d->ih, slot, &wire);
+        }
+    }
+}
+
+static int rb_unsettled_before(RNetRbDriver *d, uint32_t load,
                                 uint32_t *tick, int *slot)
 {
     uint32_t from = d->sim > RNET_INPUT_HIST_DEPTH
                         ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
     uint32_t first, owed;
     int first_slot, owed_slot;
+    rb_promote_matching_prefix(d, load);
     int found = rnet_ih_first_predicted(&d->ih, rb_expect_mask(d), from,
                                         load, &first, &first_slot);
     if (rb_owed_first(d, &owed, &owed_slot) && owed < load &&
