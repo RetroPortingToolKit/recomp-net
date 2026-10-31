@@ -478,6 +478,9 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
 #define RNET_RB_SYNC_FLAG_LIGHT_TIP 0x01u /* light-tip class (skip ready-ACK RTT) */
 #define RNET_RB_SYNC_FLAG_REREPLAY 0x02u  /* tip-extend requires re-replay from load */
 #define RNET_RB_SYNC_FLAG_MEDIA_KF 0x04u  /* FMV media keyframe episode (§97) */
+/* NACK only: c is the earliest unsettled input tick. The next load must be
+ * <= c; retrying the refused load cannot repair that prefix. */
+#define RNET_RB_SYNC_FLAG_PREFIX 0x08u
 
 /* Shared cooldown classes carried by ABORT (mismatch_tick field). */
 #define RNET_RB_ABORT_CLASS_REALIGN 0u  /* clean realign heal: no cooldown */

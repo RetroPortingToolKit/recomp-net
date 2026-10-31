@@ -166,6 +166,7 @@ struct RNetRbDriver {
     struct {
         uint32_t epoch, mismatch, load, frontier;
         int      slot;
+        uint8_t  flags;
     } nacked[RB_NACKED];                  /* BEGINs refused, a ring */
     uint32_t nacked_n;
     uint32_t rtt_ema_ms;
@@ -220,6 +221,8 @@ struct RNetRbDriver {
     uint32_t owed_tick[RNET_INPUT_HIST_DEPTH];
     int8_t   owed_slot[RNET_INPUT_HIST_DEPTH];   /* -1 = none owed */
     uint32_t owed_retry_after;   /* sim tick before which no retry is tried */
+    uint32_t prefix_load_cap;    /* peer's unsettled prefix: load <= this tick */
+    uint8_t prefix_load_cap_valid;
 
     /* Live-tip restore. Loading the baseline rewinds the engine; an abort
      * after that (baseline fork, missing row) used to leave it on the load
@@ -659,6 +662,8 @@ static void rb_owed_reset(RNetRbDriver *d)
     memset(d->owed_tick, 0, sizeof(d->owed_tick));
     memset(d->owed_slot, -1, sizeof(d->owed_slot));
     d->owed_retry_after = 0u;
+    d->prefix_load_cap = 0u;
+    d->prefix_load_cap_valid = 0u;
 }
 
 static void rb_owed_mark(RNetRbDriver *d, uint32_t tick, int slot)
@@ -715,12 +720,76 @@ static int rb_snap_has(RNetRbDriver *d, uint32_t tick)
     return d->host.snap_has(d->host.ctx, tick) ? 1 : 0;
 }
 
+/* Reserve the abort backup before choosing or advertising a baseline. A
+ * full store can evict its oldest entry on this save; doing it only after
+ * sealing made an accepted load disappear immediately before replay.
+ * Sealing holds sim fixed, so replay can reuse this exact snapshot. */
+static int rb_reserve_tip(RNetRbDriver *d)
+{
+    return rb_snap_has(d, d->sim) || d->host.snap_save(d->host.ctx, d->sim);
+}
+
 static uint32_t rb_snap_oldest_or0(RNetRbDriver *d)
 {
     uint32_t oldest = 0u;
     if (!d->host.snap_oldest(d->host.ctx, &oldest))
         return 0u;
     return oldest;
+}
+
+/* A load snapshot depends on every input BEFORE its key. A real correction
+ * already owed is unsafe, but so is a prediction whose wire has not arrived:
+ * discovering that it was wrong during sealing is too late to compare the
+ * baseline. Preserve the row/owed marks; choose/refuse the load instead. */
+static void rb_promote_matching_prefix(RNetRbDriver *d, uint32_t before)
+{
+    RNetSession *s = rb_session(d);
+    uint32_t mask = rb_expect_mask(d), i;
+    uint32_t from = d->sim > RNET_INPUT_HIST_DEPTH
+                        ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    int slot;
+    if (!s) return;
+    /* BEGIN is drained before reconciliation. An owner row arriving in that
+     * same poll can settle an equal prediction without opening an episode.
+     * Leave differing or missing rows untouched: the prefix guard and normal
+     * correction logic still own them. */
+    for (slot = 0; slot < rb_slot_count(d); ++slot) {
+        if (!(mask & (1u << slot))) continue;
+        for (i = 0; i < RNET_INPUT_HIST_DEPTH; ++i) {
+            const RNetRbFrame *row = &d->ih.rows[slot][i];
+            RNetInputSample sample;
+            RNetRbFrame wire;
+            if (!row->is_valid || !row->is_predicted ||
+                row->tick < from || row->tick >= before) continue;
+            if (!rnet_session_peek_remote_input(s, slot,
+                    rnet_sched_wire_for_sim(row->tick), &sample) || !sample.valid) continue;
+            rb_row_from_sample(d, slot, row->tick, &sample, &wire);
+            if (rb_rows_equal(row, &wire)) rnet_ih_promote(&d->ih, slot, &wire);
+        }
+    }
+}
+
+static int rb_unsettled_before(RNetRbDriver *d, uint32_t load,
+                                uint32_t *tick, int *slot)
+{
+    uint32_t from = d->sim > RNET_INPUT_HIST_DEPTH
+                        ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    uint32_t first, owed;
+    int first_slot, owed_slot;
+    rb_promote_matching_prefix(d, load);
+    int found = rnet_ih_first_predicted(&d->ih, rb_expect_mask(d), from,
+                                        load, &first, &first_slot);
+    if (rb_owed_first(d, &owed, &owed_slot) && owed < load &&
+        (!found || owed < first)) {
+        first = owed;
+        first_slot = owed_slot;
+        found = 1;
+    }
+    if (found) {
+        *tick = first;
+        *slot = first_slot;
+    }
+    return found;
 }
 
 /* Deepest tick <= want that we still hold a snapshot for. Returns 0 and
@@ -2051,8 +2120,23 @@ static void rb_replay_finish(RNetRbDriver *d)
      * behind, and the chain stalled on a tick this replay had already fixed. */
     for (off = 0; off < RNET_RB_PEER_SEAL_MASK_BITS; ++off) {
         uint32_t t = d->corr.load_tick + off;
+        int slot;
         if (!(d->replay_dig_mask & (1ull << off)))
             continue;
+        /* This whole replay completed on owner-sealed rows. The host owns
+         * their promotion into input history (commit_promote_sealed only
+         * moves a watermark). Leaving old predictions here made a later
+         * prefix scan demand an already-replayed, now-expired snapshot.
+         * Do this only after full replay: an aborted partial replay restores
+         * the old tip and must retain its outstanding corrections. */
+        for (slot = 0; slot < rb_slot_count(d); ++slot) {
+            RNetRbFrame row;
+            if (rnet_rb_get_sealed_frame(d->rb, slot, t, &row) &&
+                row.is_valid && !row.is_predicted) {
+                rb_row_sanitize(d, slot, &row);
+                rnet_ih_promote(&d->ih, slot, &row);
+            }
+        }
         rb_hc_note_local(d, t, d->replay_dig[off]);
         if (s)
             rnet_session_send_rb_frame_commit(s, t, d->replay_dig[off]);
@@ -2093,9 +2177,9 @@ static int rb_run_replay(RNetRbDriver *d)
      * sim says it is (rb_restore_tip). Keyed like every snapshot: the state
      * BEFORE tick sim runs, which is the state now. */
     d->tip_tick = d->sim;
-    if (!d->host.snap_save(d->host.ctx, d->tip_tick)) {
+    if (!rb_snap_has(d, d->tip_tick)) {
         rb_episode_abort(d, RNET_RB_ABORT_CLASS_NO_SNAP,
-                         "could not save the live tip before the baseline load");
+                         "reserved live tip is missing before the baseline load");
         return 0;
     }
     if (!d->host.snap_load(d->host.ctx, d->corr.load_tick)) {
@@ -2170,6 +2254,9 @@ static void rb_commit_episode(RNetRbDriver *d)
      * failure path below, which is the only place it belongs.
      */
     rnet_rb_commit_promote_sealed(d->rb);
+    if (d->prefix_load_cap_valid && d->corr.load_tick <= d->prefix_load_cap &&
+        d->corr.target_tick >= d->prefix_load_cap)
+        d->prefix_load_cap_valid = 0u;
     /* Both peers just agreed on a replayed span, and the replay re-keyed the
      * store onto that timeline. Whatever was poisoned before is gone, so the
      * cap must lift — a ratchet that only ever tightens would walk the usable
@@ -2266,6 +2353,11 @@ static int rb_tip_extend(RNetRbDriver *d, uint32_t tick, int slot, int notify_pe
                   "covers it\n",
                (unsigned)d->corr.epoch_id, (unsigned)tick,
                (unsigned)d->tip_extends);
+        return 0;
+    }
+    if (!rb_reserve_tip(d)) {
+        rb_log(d, "RB tip-extend refused epoch=%u -- cannot reserve live tip %u\n",
+               (unsigned)d->corr.epoch_id, (unsigned)d->sim);
         return 0;
     }
     /* The replay re-runs from load, so we must still hold that snapshot, and
@@ -2392,8 +2484,9 @@ static int rb_cooldown_active(const RNetRbDriver *d)
 
 /* Refuse a peer's BEGIN, and remember that we did (see begin_resend_ms): a
  * repeat of that BEGIN means the NACK was lost, and it is sent again. */
-static void rb_nack_begin(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
-                          uint32_t load, uint32_t frontier, int slot)
+static void rb_nack_begin_flags(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
+                                uint32_t load, uint32_t frontier, int slot,
+                                uint8_t flags)
 {
     RNetSession *s = rb_session(d);
     uint32_t i = d->nacked_n++ % RB_NACKED;
@@ -2402,10 +2495,17 @@ static void rb_nack_begin(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
     d->nacked[i].load = load;
     d->nacked[i].frontier = frontier;
     d->nacked[i].slot = slot;
+    d->nacked[i].flags = flags;
     if (s)
         rnet_session_send_rb_sync(s, epoch, mismatch, load, frontier,
                                   (rnet_u8)(slot < 0 ? 0 : slot),
-                                  RNET_RB_SYNC_OP_NACK, 0u);
+                                  RNET_RB_SYNC_OP_NACK, flags);
+}
+
+static void rb_nack_begin(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
+                          uint32_t load, uint32_t frontier, int slot)
+{
+    rb_nack_begin_flags(d, epoch, mismatch, load, frontier, slot, 0u);
 }
 
 static void rb_send_nack(RNetRbDriver *d, uint32_t epoch, uint32_t mismatch,
@@ -2430,7 +2530,7 @@ static int rb_begin_repeat(RNetRbDriver *d, uint32_t epoch)
                                           d->nacked[i].load, d->nacked[i].frontier,
                                           (rnet_u8)(d->nacked[i].slot < 0 ? 0
                                                                           : d->nacked[i].slot),
-                                          RNET_RB_SYNC_OP_NACK, 0u);
+                                          RNET_RB_SYNC_OP_NACK, d->nacked[i].flags);
         return 1;
     }
     d->begin_seen[d->begin_seen_n++ % RB_BEGIN_SEEN] = epoch;
@@ -2479,8 +2579,30 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
         return 0;
     }
 
+    {
+        int at_tip = !as_initiator && peer_load == d->sim &&
+                     !rb_snap_has(d, peer_load);
+        if (!rb_reserve_tip(d)) {
+            rb_log(d, "RB %s refused epoch=%u -- cannot reserve live tip %u\n",
+                   as_initiator ? "episode" : "follow", (unsigned)peer_epoch,
+                   (unsigned)d->sim);
+            if (!as_initiator)
+                rb_send_nack(d, peer_epoch, mismatch_tick, peer_load, slot);
+            return 0;
+        }
+        if (at_tip) {
+            d->n_follow_at_tip++;
+            rb_log(d, "RB follow at our live tip epoch=%u load=%u -- the load "
+                      "snapshot is the live state; taken now\n",
+                   (unsigned)peer_epoch, (unsigned)peer_load);
+        }
+    }
+
     if (as_initiator) {
-        if (!rb_snap_floor(d, mismatch_tick, &load)) {
+        uint32_t want = mismatch_tick;
+        if (d->prefix_load_cap_valid && want > d->prefix_load_cap)
+            want = d->prefix_load_cap;
+        if (!rb_snap_floor(d, want, &load)) {
             /* No snapshot reaches back that far. Refusing is the honest
              * outcome — loading a different tick would resim a timeline
              * neither peer ran — but refusing SILENTLY is not: this path
@@ -2495,6 +2617,22 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
                    (unsigned)d->fork_cap);
             rnet_sched_note_mispredict(d->sim - mismatch_tick);
             return 0;
+        }
+        {
+            uint32_t earlier;
+            int earlier_slot;
+            if (rb_unsettled_before(d, load, &earlier, &earlier_slot)) {
+                if (!rb_snap_floor(d, earlier, &load)) {
+                    rb_log(d, "RB episode deferred mismatch=%u -- unresolved "
+                              "prefix tick=%u slot=%d has no snapshot\n",
+                           (unsigned)mismatch_tick, (unsigned)earlier, earlier_slot);
+                    return 0;
+                }
+                rb_log(d, "RB earlier baseline load=%u -- unresolved prefix "
+                          "tick=%u slot=%d before mismatch=%u\n",
+                       (unsigned)load, (unsigned)earlier, earlier_slot,
+                       (unsigned)mismatch_tick);
+            }
         }
         target = rnet_rb_suggest_target(d->rb, mismatch_tick, sim_tip);
         /* suggest_target adds tip_seal_slack (default 2) so the tick after the
@@ -2512,18 +2650,20 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
     } else {
         load = peer_load;
         target = peer_target;
-        /* The load tick is our live tip: we have simulated everything before
-         * it and nothing of it. A snapshot keyed T is the state BEFORE tick T
-         * runs, which is exactly the machine as it stands between two polls
-         * at sim == T -- the same state the live admit of T would have saved.
-         * Take it now instead of refusing (see defer_valid for what refusing
-         * cost). Never mid-replay: the machine is then not at sim. */
-        if (!rb_snap_has(d, load) && load == d->sim && !d->in_resim &&
-            d->host.snap_save(d->host.ctx, load)) {
-            d->n_follow_at_tip++;
-            rb_log(d, "RB follow at our live tip epoch=%u load=%u — the load "
-                      "snapshot is the live state; taken now\n",
-                   (unsigned)peer_epoch, (unsigned)load);
+        {
+            uint32_t earlier;
+            int earlier_slot;
+            if (rb_unsettled_before(d, load, &earlier, &earlier_slot)) {
+                rb_log(d, "RB follow refused epoch=%u span=%u..%u -- unresolved "
+                          "prefix tick=%u slot=%d; NACK at frontier=%u\n",
+                       (unsigned)peer_epoch, (unsigned)load, (unsigned)target,
+                       (unsigned)earlier, earlier_slot,
+                       (unsigned)(earlier ? earlier - 1u : 0u));
+                rb_nack_begin_flags(d, peer_epoch, mismatch_tick, load,
+                                    earlier, slot,
+                                    RNET_RB_SYNC_FLAG_PREFIX);
+                return 0;
+            }
         }
         if (!rb_snap_has(d, load)) {
             /* Every BEGIN we turn down has to be countable, or the two peers'
@@ -2535,26 +2675,6 @@ static int rb_begin_episode(RNetRbDriver *d, uint32_t mismatch_tick, int slot,
                    (unsigned)rb_snap_oldest_or0(d), (unsigned)d->sim);
             rb_send_nack(d, peer_epoch, mismatch_tick, load, slot);
             return 0;
-        }
-        /* We still owe a correction BEFORE the load tick: our state at load is
-         * not the one the peer holds, so following can only end in a baseline
-         * fork -- the fork cap, lockstep and an abort, for a divergence we
-         * already know about. Refuse and let our own re-open cover it; the
-         * NACK carries a frontier below the owed tick. */
-        {
-            uint32_t owed_t;
-            int owed_slot;
-            if (rb_owed_first(d, &owed_t, &owed_slot) && owed_t < load) {
-                rb_log(d, "RB follow refused epoch=%u span=%u..%u — we owe a "
-                          "correction at tick=%u slot=%d before it; NACK at "
-                          "frontier=%u\n",
-                       (unsigned)peer_epoch, (unsigned)load, (unsigned)target,
-                       (unsigned)owed_t, owed_slot,
-                       (unsigned)(owed_t ? owed_t - 1u : 0u));
-                rb_nack_begin(d, peer_epoch, mismatch_tick, load,
-                              owed_t ? owed_t - 1u : 0u, slot);
-                return 0;
-            }
         }
         /* The published-input fallback in rb_vt_get_input_row covers the
          * ordinary case where the initiator is a few ticks ahead of us, but it
@@ -2955,6 +3075,37 @@ static void rb_on_peer_post(RNetRbDriver *d, int from, uint32_t epoch,
     d->answered_mask |= bit;
 }
 
+static void rb_on_nack(RNetRbDriver *d, uint32_t epoch, uint32_t c, uint8_t flags)
+{
+    if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
+        int prefix = (flags & RNET_RB_SYNC_FLAG_PREFIX) &&
+                     c < d->corr.load_tick;
+        if (prefix) {
+            if (!d->prefix_load_cap_valid || c < d->prefix_load_cap)
+                d->prefix_load_cap = c;
+            d->prefix_load_cap_valid = 1u;
+            /* A chain repair need not have an owed wire row, and a
+             * completed local replay may already have paid one. The
+             * peer still requires this repair from a safe prefix.
+             * Queue the original mismatch now rather than waiting
+             * for another misprediction to retry an expired cap. */
+            rb_owed_mark(d, d->corr.mismatch_tick, d->corr.slot);
+            rb_log(d, "RB prefix realign epoch=%u -- next load <= %u\n",
+                   (unsigned)epoch, (unsigned)d->prefix_load_cap);
+        }
+        /* A prefix NACK carries its earliest unsettled tick; other
+         * NACKs carry the ordinary confirmed frontier. */
+        rnet_rb_demote_resolved_through(d->rb, prefix ? (c ? c - 1u : 0u) : c);
+        rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN, "peer NACK");
+        /* Retry the supplied safe earlier load before the short
+         * snapshot ring ages out. Other refusals retain backoff. */
+        if (prefix) {
+            d->cooldown_until_tick = d->sim;
+            d->owed_retry_after = d->sim;
+        }
+    }
+}
+
 static void rb_drain_wire(RNetRbDriver *d)
 {
     RNetSession *s = rb_session(d);
@@ -3166,12 +3317,7 @@ static void rb_drain_wire(RNetRbDriver *d)
             rb_follow_or_defer(d, epoch, a, b, c, (int)slot, flags);
             break;
         case RNET_RB_SYNC_OP_NACK:
-            if (d->stage != kRbIdle && epoch == d->corr.epoch_id) {
-                /* c carries the follower's confirmed frontier: demote to a
-                 * mutually provable tick instead of guessing load-1. */
-                rnet_rb_demote_resolved_through(d->rb, c);
-                rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN, "peer NACK");
-            }
+            rb_on_nack(d, epoch, c, flags);
             break;
         case RNET_RB_SYNC_OP_ABORT:
             if (d->defer_valid && epoch == d->defer_epoch) {
@@ -3506,12 +3652,14 @@ static void rb_reconcile_wire(RNetRbDriver *d)
     RNetSession *s = rb_session(d);
     int slots = rb_slot_count(d);
     int local = rb_local_slot(d);
-    uint32_t from = rnet_rb_resolved_through(d->rb) + 1u;
+    uint32_t from = 0u;
     int slot;
 
-    /* Nothing older than the history window can be reconciled anyway, and an
-     * un-advancing watermark would otherwise make this scan grow without
-     * bound as the match runs. */
+    /* Hash agreement does not promote input history. Equal predictions can
+     * remain flagged below the resolved watermark, then a later prefix scan
+     * demands an expired snapshot for a row whose owner already confirmed
+     * it. Reconcile every retained prediction against actual wire authority;
+     * the history window bounds the work even if confirmation stops. */
     if (d->sim > RNET_INPUT_HIST_DEPTH &&
         from < d->sim - RNET_INPUT_HIST_DEPTH)
         from = d->sim - RNET_INPUT_HIST_DEPTH;
