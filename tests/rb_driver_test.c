@@ -501,6 +501,8 @@ typedef struct Scenario {
      * before it, must stop exactly there, settle, agree on the state, stay
      * held for a second without the match dropping, then resume. 0 = none. */
     uint32_t hold_at;
+    /* Both seats can discover different wrong predictions at once. */
+    int guest_force_mispredict;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -586,9 +588,11 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     setenv("RNET_SIM_SEED", seed, 1);
     /* Pinned per peer, not inherited: a knob exported for one side must never
      * reach the other (the SNES harness learned that twice). */
-    if (slot == 0 && sc->force_mispredict > 0) {
+    int inject = slot == 0 ? sc->force_mispredict :
+                 slot == 1 ? sc->guest_force_mispredict : 0;
+    if (inject > 0) {
         char v[16];
-        snprintf(v, sizeof(v), "%d", sc->force_mispredict);
+        snprintf(v, sizeof(v), "%d", inject);
         setenv("RNET_RB_FORCE_MISPREDICT", v, 1);
     } else {
         setenv("RNET_RB_FORCE_MISPREDICT", "0", 1);
@@ -1108,6 +1112,10 @@ int main(int argc, char **argv)
      * RNET_SIM_LATENCY_MS is one-way per peer: RTT is double. */
     static const Scenario scenarios[] = {
         /* name                  mode A, B   latency jitter force  ticks  one-side */
+        { .name="dual-inline", .latency_ms="0", .jitter_ms="0",
+          .force_mispredict=20, .guest_force_mispredict=20, .ticks=520u },
+        { .name="dual-inline-skew", .latency_ms="0", .jitter_ms="0",
+          .force_mispredict=20, .guest_force_mispredict=19, .ticks=520u },
         { "inline-loopback",     0, 0,       "0",   "0",   45,    420u,  0 },
         { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u,  0 },
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },

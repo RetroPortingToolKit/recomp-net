@@ -3634,6 +3634,22 @@ static void rb_reconcile_wire(RNetRbDriver *d)
                  * though we did nothing here. Counting these as drops reported
                  * 42 findings that were all fine, which is worse than
                  * reporting none. */
+            } else if (t < d->corr.load_tick) {
+                /* The snapshot at load already contains this wrong row.
+                 * Replaying from load cannot repair it, and comparing that
+                 * baseline would report an avoidable digest fork. The row is
+                 * already owed above: realign now so the existing retry path
+                 * opens an episode that actually reaches it. */
+                rb_log(d, "RB correction precedes baseline tick=%u slot=%d "
+                          "load=%u stage=%s; realigning before replay\n",
+                       (unsigned)t, slot, (unsigned)d->corr.load_tick,
+                       rb_stage_name(d->stage));
+                rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN,
+                                 "late correction precedes baseline");
+                /* General abort backoff would leave the known bad timeline
+                 * live for another 30 ticks and stall hash confirmation. */
+                d->cooldown_until_tick = d->sim;
+                d->owed_retry_after = d->sim;
             } else {
                 /* Genuinely lost. rnet_ih_promote above already marked the row
                  * authoritative, so the next scan skips it: this was the only
