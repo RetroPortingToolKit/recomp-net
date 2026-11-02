@@ -237,6 +237,7 @@ struct RNetRbDriver {
      * hold_at, and nothing is predicted while the hold is set, so every row
      * before hold_at is a real one by the time the sim reaches it. */
     int      hold_active;
+    uint32_t held_retry_ms;
     uint32_t hold_at;
     int      hold_logged;
 
@@ -3519,6 +3520,23 @@ static void rb_reconcile_wire(RNetRbDriver *d)
     if (!s)
         return;
 
+    /* Frame-based abort backoff cannot expire at a session hold. Permit an
+     * owed repair there on a bounded wall-clock cadence, without advancing
+     * the guest past the requested boundary or relaxing baseline checks. */
+    if (d->hold_active && d->sim >= d->hold_at && d->stage == kRbIdle &&
+        (rb_cooldown_active(d) || d->sim < d->owed_retry_after)) {
+        uint32_t owed, now = rb_now(d);
+        int owed_slot;
+        if (rb_owed_first(d, &owed, &owed_slot) &&
+            (uint32_t)(now - d->held_retry_ms) >= 50u) {
+            d->held_retry_ms = now;
+            d->cooldown_until_tick = d->sim;
+            d->owed_retry_after = d->sim;
+            rb_log(d, "RB held correction retry tick=%u slot=%d at sim=%u\n",
+                   (unsigned)owed, owed_slot, (unsigned)d->sim);
+        }
+    }
+
     /* A correction owed from an episode that did not commit comes first: it is
      * the oldest thing wrong with our timeline. */
     if (d->stage == kRbIdle && !rb_cooldown_active(d) && d->sim >= d->owed_retry_after &&
@@ -3719,6 +3737,13 @@ static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
      * open here too. */
     if (d->stage != kRbIdle || d->defer_valid)
         return;
+    /* A held final state must settle before our marker permits a peer to
+     * leave. Otherwise it can exit before answering our last missing digest
+     * request, stranding a confirmed-save consumer at the terminal hold. */
+    if (d->hold_active && d->sim >= d->hold_at &&
+        (!rnet_rb_driver_hold_settled(d) ||
+         (d->sim && !rb_hc_confirm_through(d, d->sim - 1u))))
+        return;
     if (wire_ok && (d->quiesce_sent_ms == 0u ||
                     (uint32_t)(now - d->quiesce_sent_ms) >= RB_QUIESCE_RESEND_MS))
         rb_quiesce_send(d);
@@ -3866,6 +3891,8 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
          * with no "RB quiesced" line. */
         if (d->quiesce == RNET_RB_QUIESCE_DRAINING)
             rb_drain_wire(d);
+        if (d->rb)
+            rnet_rb_set_peer_convergence(d->rb, rb_hc_resolved(d));
         rb_quiesce_pump(d, 0);
         return RNET_RB_ADMIT_STALL;
     }
@@ -3896,6 +3923,12 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     /* The hash-chain watermark can stop all frame admission. Its recovery
      * timer must advance from the poll path, including while no frame runs. */
     rb_check_chain_fork(d);
+
+    /* A hold admits no frame, but its last FRAME_COMMITs still arrive here.
+     * Publish the already-agreed chain frontier without requiring another
+     * finish_frame; confirmed-save consumers must not stay one tick behind. */
+    if (d->rb)
+        rnet_rb_set_peer_convergence(d->rb, rb_hc_resolved(d));
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
@@ -4257,6 +4290,7 @@ void rnet_rb_driver_set_hold(RNetRbDriver *d, uint32_t tick)
     if (!d)
         return;
     d->hold_active = 1;
+    d->held_retry_ms = 0u;
     d->hold_at = tick;
     d->hold_logged = 0;
     rb_log(d, "RB hold set at %u (sim %u)\n", (unsigned)tick, (unsigned)d->sim);

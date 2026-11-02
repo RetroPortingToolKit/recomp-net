@@ -25,7 +25,7 @@ def udp():
     return sock
 
 
-def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=False):
+def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=False, terminal=False):
     with tempfile.TemporaryDirectory(prefix='rnet-boot-') as temporary:
         folder = Path(temporary)
         selector = selectors.DefaultSelector()
@@ -56,7 +56,7 @@ def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=Fals
                 files.append(log)
                 processes.append(subprocess.Popen([str(peer), str(slot), str(slots), bind, remote,
                                                     str(addresses[0][1]), refusal, str(int(mismatch)),
-                                                    str(int(late)), str(folder)], env=env, stdout=subprocess.PIPE, stderr=log))
+                                                    str(2 if terminal else int(late)), str(folder)], env=env, stdout=subprocess.PIPE, stderr=log))
             deadline = time.monotonic() + 20
             stop_written = False
             while any(p.poll() is None for p in processes) and time.monotonic() < deadline:
@@ -90,9 +90,12 @@ def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=Fals
                                 # Positive one-way loss: receiver 1 waits while
                                 # sender 0 has already accepted peer 1's hash.
                                 eligible = permanent or (sender == 0 and receiver == slots-1)
-                                if eligible and (permanent or dropped < drops):
+                                if not terminal and eligible and (permanent or dropped < drops):
                                     dropped += 1
                                     continue
+                            if terminal and tick == 219 and sender == 0 and receiver == 1 and dropped < drops:
+                                dropped += 1
+                                continue
                     forward.sendto(packet, destination)
             assert all(p.poll() is not None for p in processes), name + ': child timeout'
             reports = []
@@ -110,6 +113,8 @@ def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=Fals
             else:
                 assert all(r['agreed'] == 1 and not r['refused'] and r['sim'] >= 220 and
                            r['confirmed'] >= 215 and not r['desync'] for r in reports), (name, reports)
+                if terminal:
+                    assert all(r['sim'] == 220 and r['confirmed'] == 219 for r in reports), (name, reports)
             if drops:
                 assert dropped == drops and requests > 0, (name, dropped, requests)
             if late:
@@ -144,7 +149,8 @@ def main():
     cases = [('clean', {}), ('lost-first', dict(drops=1)), ('lost-replies', dict(drops=3)),
              ('mismatch-after-loss', dict(drops=1, mismatch=True)), ('permanent-loss', dict(permanent=True)),
              ('three-seat-loss', dict(slots=3, drops=2)), ('four-seat-loss', dict(slots=4, drops=2)),
-             ('retained-boot-digest', dict(late=True))]
+             ('retained-boot-digest', dict(late=True)),
+             ('terminal-commit-loss', dict(terminal=True, drops=3))]
     for name, options in cases:
         if not args.case or name == args.case:
             run(args.peer.resolve(), name, **options)

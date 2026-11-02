@@ -441,7 +441,7 @@ typedef struct Report {
     uint32_t timeline[TOY_TICKS];
     /* Hold scenarios: where the sim stood once settled, the engine's digest
      * there, the furthest it got while held, and whether it ever settled. */
-    uint32_t hold_sim, hold_digest, hold_max_sim;
+    uint32_t hold_sim, hold_digest, hold_max_sim, hold_confirmed;
     int hold_settled, hold_released;
 } Report;
 
@@ -730,6 +730,11 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
                     r->hold_digest = toy_digest(&g_c.state);
                     settled_ms = mono_ms();
                 }
+                if (hold_set && sim == sc->hold_at) {
+                    uint32_t confirmed = rnet_rb_driver_confirmed_through(d);
+                    if (confirmed > r->hold_confirmed)
+                        r->hold_confirmed = confirmed;
+                }
                 if (r->hold_settled && (uint32_t)(mono_ms() - settled_ms) >= 1000u) {
                     rnet_rb_driver_clear_hold(d);
                     r->hold_released = 1;
@@ -1003,6 +1008,10 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
             snprintf(msg, sizeof(msg), "%s: seat %d held the same state as seat 0 "
                      "(%08x vs %08x)", sc->name, seat_of[k], rr[k]->hold_digest, rr[0]->hold_digest);
             expect_true(rr[k]->hold_digest == rr[0]->hold_digest, msg);
+            snprintf(msg, sizeof(msg), "%s: seat %d confirmed the paused state without "
+                     "running another tick (confirmed %u, hold %u)", sc->name,
+                     seat_of[k], rr[k]->hold_confirmed, sc->hold_at);
+            expect_true(rr[k]->hold_confirmed + 1u >= sc->hold_at, msg);
         }
     }
     for (k = 0; k < nseats; ++k) {
@@ -1015,7 +1024,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                     msg);
     }
     snprintf(msg, sizeof(msg), "%s: episodes ran (nothing exercised otherwise)", sc->name);
-    expect_true(sum_init > 0u && sum_follow > 0u, msg);
+    expect_true((sum_init > 0u && sum_follow > 0u) || sc->force_mispredict == 0, msg);
     snprintf(msg, sizeof(msg), "%s: 0 forks", sc->name);
     expect_true(sum_fork == 0u, msg);
     snprintf(msg, sizeof(msg), "%s: no match refused to start", sc->name);
@@ -1061,7 +1070,7 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
      * longer leaves a stale digest behind, and nothing else should stall. */
     snprintf(msg, sizeof(msg), "%s: no chain stall (%u)", sc->name, sum_stall);
     expect_true(sum_stall == 0u || (sc->loss_pct && sc->loss_pct[0]), msg);
-    if (sc->mode_a || sc->mode_b) {
+    if ((sc->mode_a || sc->mode_b) && sc->force_mispredict > 0) {
         uint32_t ra = 0;
         for (k = 0; k < nseats; ++k)
             if (k == 0 ? sc->mode_a : sc->mode_b)
@@ -1156,6 +1165,8 @@ int main(int argc, char **argv)
         /* A paused menu: every seat stops on one tick with predictions still
          * being corrected around it (forced mispredicts, jitter, loss), holds
          * for a second, and resumes in the same epoch. */
+        { "hold-confirmed",      1, 1,       "0",   "0",   0,     240u,  0,
+          0, 0, NULL, 0, 0u, 1, 0, 0, 0u, NULL, 0u, 0, 120u },
         { "hold-rtt60",          0, 1,       "30",  "8",   45,    420u,  0,
           0, 0, NULL, 0, 0u, 1, 0, 0, 0u, NULL, 0u, 0, 200u },
         { "hold-4seat-loss2",    1, 1,       "30",  "8",   45,    420u,  0,

@@ -483,6 +483,10 @@ if(RNET_BUILD_TESTS)
   add_executable(rb_driver_test tests/rb_driver_test.c)
   target_link_libraries(rb_driver_test PRIVATE recomp_net)
   add_test(NAME rb_driver_test COMMAND rb_driver_test)
+  add_executable(rb_hold_retry_test tests/rb_hold_retry_test.c)
+  target_include_directories(rb_hold_retry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(rb_hold_retry_test PRIVATE recomp_net)
+  add_test(NAME rb_hold_retry_test COMMAND rb_hold_retry_test)
 
   # Deterministic datagram loss with a real driver in each process. Unlike
   # the fork-based matrix above, this also executes on Windows.
