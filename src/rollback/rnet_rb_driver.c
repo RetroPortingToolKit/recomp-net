@@ -3866,6 +3866,8 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
          * with no "RB quiesced" line. */
         if (d->quiesce == RNET_RB_QUIESCE_DRAINING)
             rb_drain_wire(d);
+        if (d->rb)
+            rnet_rb_set_peer_convergence(d->rb, rb_hc_resolved(d));
         rb_quiesce_pump(d, 0);
         return RNET_RB_ADMIT_STALL;
     }
@@ -3896,6 +3898,12 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     /* The hash-chain watermark can stop all frame admission. Its recovery
      * timer must advance from the poll path, including while no frame runs. */
     rb_check_chain_fork(d);
+
+    /* A hold admits no frame, but its last FRAME_COMMITs still arrive here.
+     * Publish the already-agreed chain frontier without requiring another
+     * finish_frame; confirmed-save consumers must not stay one tick behind. */
+    if (d->rb)
+        rnet_rb_set_peer_convergence(d->rb, rb_hc_resolved(d));
 
     if (d->stage == kRbReplaying)
         return rb_replay_step(d);   /* INCREMENTAL: the episode just loaded */
