@@ -3719,6 +3719,13 @@ static void rb_quiesce_pump(RNetRbDriver *d, int wire_ok)
      * open here too. */
     if (d->stage != kRbIdle || d->defer_valid)
         return;
+    /* A held final state must settle before our marker permits a peer to
+     * leave. Otherwise it can exit before answering our last missing digest
+     * request, stranding a confirmed-save consumer at the terminal hold. */
+    if (d->hold_active && d->sim >= d->hold_at &&
+        (!rnet_rb_driver_hold_settled(d) ||
+         (d->sim && !rb_hc_confirm_through(d, d->sim - 1u))))
+        return;
     if (wire_ok && (d->quiesce_sent_ms == 0u ||
                     (uint32_t)(now - d->quiesce_sent_ms) >= RB_QUIESCE_RESEND_MS))
         rb_quiesce_send(d);

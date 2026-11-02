@@ -287,6 +287,9 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d);
  * every peer's marker; by then no episode either side opened can still be
  * unanswered, so the two ledgers balance by construction. Live keeps running
  * throughout: the host keeps calling poll_admit / finish_frame until DRAINED.
+ * If a session hold has reached its target, its consumed input rows and final
+ * state hash must also settle before this peer sends its marker. This keeps
+ * peers available to answer a missing final FRAME_COMMIT request.
  *
  * Keep calling poll_admit while draining EVEN IF the session is no longer
  * running: a peer that finished first leaves, its BYE stops our session, and

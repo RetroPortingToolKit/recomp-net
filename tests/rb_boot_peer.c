@@ -86,7 +86,7 @@ static void log_line(void *ctx, const char *line) {
 int main(int argc, char **argv) {
     Peer p; RNetConfig net; RNetHostVTable io; RNetRbDriverConfig config; RNetRbHost host;
     RNetSession *session; RNetRbDriver *driver;
-    int slot, slots, delay = 3, started = 0, ready = 0, draining = 0, late_sent = 0;
+    int slot, slots, delay = 3, started = 0, ready = 0, draining = 0, late_sent = 0, hold_set = 0;
     unsigned mismatch, late, target = 220, live_after_refusal = 0;
     uint32_t start, refused_at = 0, sim_at_refusal = 0;
     char ready_path[2048], stop_path[2048], reason[64] = "";
@@ -128,7 +128,10 @@ int main(int argc, char **argv) {
             if (!rnet_rb_driver_start(driver, &config, &host)) break;
             started = 1;
         }
-        if (late && slot == 1 && !late_sent && p.state.tick >= 180) {
+        if (late == 2 && !hold_set && p.state.tick + 1u >= target) {
+            rnet_rb_driver_set_hold(driver, target); hold_set = 1;
+        }
+        if (late == 1 && slot == 1 && !late_sent && p.state.tick >= 180) {
             rnet_session_send_rb_sync(session, 0, 0, 0, 0, 0, RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST, 0);
             late_sent = 1;
         }
@@ -136,7 +139,10 @@ int main(int argc, char **argv) {
             marker = fopen(ready_path, "wb"); if (!marker) { ++p.failed; break; }
             fclose(marker); ready = 1;
         }
-        if (ready && !draining && (marker = fopen(stop_path, "rb")) != NULL) {
+        if (ready && !draining &&
+            (late != 2 || (rnet_rb_driver_hold_settled(driver) &&
+                           rnet_rb_driver_confirmed_through(driver) + 1u >= target)) &&
+            (marker = fopen(stop_path, "rb")) != NULL) {
             fclose(marker); rnet_rb_driver_request_quiesce(driver); draining = 1;
         }
         admit = rnet_rb_driver_poll_admit(driver);
@@ -155,6 +161,9 @@ int main(int argc, char **argv) {
             rnet_rb_driver_quiesce_state(driver) == RNET_RB_QUIESCE_TIMED_OUT) break;
         rnet_os_sleep_micros(1000);
     }
+    if (late == 2 && (p.state.tick != target ||
+        rnet_rb_driver_confirmed_through(driver) + 1u < target ||
+        rnet_rb_driver_quiesce_state(driver) != RNET_RB_QUIESCE_DRAINED)) ++p.failed;
     if (slots > 2 && slot == 0) {
         uint32_t until = now(NULL);
         while ((uint32_t)(now(NULL) - until) < 300) { rnet_session_pump(session); rnet_os_sleep_micros(1000); }
