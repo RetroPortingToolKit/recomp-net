@@ -493,6 +493,9 @@ typedef struct Scenario {
      * Each must open, follow and refuse nothing, keep up, drain, and agree
      * with seat 0's timeline -- a spectator never predicts. */
     int observers;
+    /* Zero retains the existing eight-tick frontend delay. */
+    int initial_delay;
+    int inject_both;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -553,7 +556,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     RNetRbDriver *d = NULL;
     RNetRbDriverConfig cfg;
     RNetRbHost host;
-    int local = slot, slots = seats_of(sc), delay = 8;   /* the SNES harness's D */
+    int local = slot, slots = seats_of(sc), delay = sc->initial_delay ? sc->initial_delay : 8;
     char bind[64], peer[64], logname[128], seed[16];
     uint32_t start_ms, next_tick_ms;
     Report *r = (Report *)calloc(1, sizeof(Report));
@@ -578,7 +581,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     setenv("RNET_SIM_SEED", seed, 1);
     /* Pinned per peer, not inherited: a knob exported for one side must never
      * reach the other (the SNES harness learned that twice). */
-    if (slot == 0 && sc->force_mispredict > 0) {
+    if ((slot == 0 || sc->inject_both) && sc->force_mispredict > 0) {
         char v[16];
         snprintf(v, sizeof(v), "%d", sc->force_mispredict);
         setenv("RNET_RB_FORCE_MISPREDICT", v, 1);
@@ -1068,6 +1071,12 @@ int main(int argc, char **argv)
         /* name                  mode A, B   latency jitter force  ticks  one-side */
         { "inline-loopback",     0, 0,       "0",   "0",   45,    420u,  0 },
         { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u,  0 },
+        /* A low lobby delay is raised by the scheduler's rollback floor.
+         * Both peers then meet an injected miss while rebuilding the cushion.
+         * A hidden, already-arrived row must not strand both at one tick. */
+        { .name = "cushion-rebuild-injection", .mode_a = 1, .mode_b = 1,
+          .latency_ms = "25", .jitter_ms = "10", .force_mispredict = 45,
+          .ticks = 240u, .initial_delay = 2, .inject_both = 1 },
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
         /* The stop propagates: only the initiator is asked. */
         { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },

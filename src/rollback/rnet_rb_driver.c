@@ -4000,6 +4000,28 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
             rb_stats_seat_tip(d, s, slot, &st_seat);
             if (rnet_sched_on_remote_miss(slot, d->sim, wire, &st_seat,
                                           d->prediction_cap, &why)) {
+                /* Rebuilding the cushion forbids invention. Withholding an
+                 * already-arrived row here would therefore park the injector
+                 * on this same tick forever. Consume that real row exactly
+                 * as the ordinary hit path does; actual missing rows still
+                 * obey the scheduler, and ordinary grace can still produce
+                 * the intended forced rollback. */
+                if (d->force_invent_slot == slot && why &&
+                    strcmp(why, "cushion_rebuild") == 0 &&
+                    rnet_session_peek_remote_input(s, slot, wire, &sample) &&
+                    sample.valid) {
+                    d->force_invent_slot = -1;
+                    rb_log_raw(d, "rbe: injected mispredict cancelled slot=%d sim=%u "
+                                  "-- cushion rebuild requires real input\n",
+                               slot, (unsigned)d->sim);
+                    rb_row_from_sample(d, slot, d->sim, &sample, &row);
+                    if (d->host.admit_sample)
+                        d->host.admit_sample(d->host.ctx, slot, d->sim, &sample);
+                    rnet_ih_put(&d->ih, slot, &row);
+                    d->rows[slot] = row;
+                    rnet_sched_note_remote_hit();
+                    continue;
+                }
                 d->stall_tag = why ? why : "remote_miss";
                 return RNET_RB_ADMIT_STALL;
             }
