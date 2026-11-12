@@ -91,6 +91,7 @@ typedef struct Toy {
 typedef struct Child {
     int slot;
     int mode;
+    unsigned snap_capacity;
     Toy state;
     struct { uint32_t tick; int valid; Toy s; } snaps[TOY_SNAPS];
     RNetRbFrame pub[RNET_RB_MAX_SLOTS];
@@ -150,7 +151,7 @@ static void toy_step(void)
 
 static int h_snap_save(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % (g_c.snap_capacity ? g_c.snap_capacity : TOY_SNAPS);
     (void)ctx;
     g_c.snaps[i].tick = tick;
     g_c.snaps[i].valid = 1;
@@ -160,7 +161,7 @@ static int h_snap_save(void *ctx, uint32_t tick)
 
 static int h_snap_load(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % (g_c.snap_capacity ? g_c.snap_capacity : TOY_SNAPS);
     (void)ctx;
     if (!g_c.snaps[i].valid || g_c.snaps[i].tick != tick)
         return 0;
@@ -170,7 +171,7 @@ static int h_snap_load(void *ctx, uint32_t tick)
 
 static int h_snap_has(void *ctx, uint32_t tick)
 {
-    unsigned i = tick % TOY_SNAPS;
+    unsigned i = tick % (g_c.snap_capacity ? g_c.snap_capacity : TOY_SNAPS);
     (void)ctx;
     return g_c.snaps[i].valid && g_c.snaps[i].tick == tick;
 }
@@ -496,6 +497,10 @@ typedef struct Scenario {
     /* Zero retains the existing eight-tick frontend delay. */
     int initial_delay;
     int inject_both;
+    /* A small real-host ring and a longer run expose a late row before an
+     * already-open correction's load. Zero keeps the short fixture defaults. */
+    unsigned snap_capacity;
+    uint32_t run_timeout_ms;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -564,6 +569,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
 
     memset(&g_c, 0, sizeof(g_c));
     g_c.slot = slot;
+    g_c.snap_capacity = sc->snap_capacity;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
     if (slot >= slots)
         snprintf(logname, sizeof(logname), "rb_driver_test_%s_observer.log", sc->name);
@@ -679,7 +685,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
         uint32_t lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
-        while ((uint32_t)(mono_ms() - start_ms) < 40000u) {
+        while ((uint32_t)(mono_ms() - start_ms) < (sc->run_timeout_ms ? sc->run_timeout_ms : 40000u)) {
             RNetRbAdmit a;
             RNetRbQuiesce q;
             rnet_session_pump(s);
@@ -1077,6 +1083,13 @@ int main(int argc, char **argv)
         { .name = "cushion-rebuild-injection", .mode_a = 1, .mode_b = 1,
           .latency_ms = "25", .jitter_ms = "10", .force_mispredict = 45,
           .ticks = 240u, .initial_delay = 2, .inject_both = 1 },
+        /* Both incremental peers can predict just before the other opens an
+         * episode. That input may arrive only during sealing: its prediction
+         * must resolve before the load snapshot can be compared. */
+        { .name = "baseline-prefix", .mode_a = 1, .mode_b = 1,
+          .latency_ms = "25", .jitter_ms = "10", .force_mispredict = 45,
+          .ticks = 3300u, .initial_delay = 2, .inject_both = 1, .slow_ms = 2,
+          .snap_capacity = 40u, .run_timeout_ms = 120000u },
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
         /* The stop propagates: only the initiator is asked. */
         { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },
