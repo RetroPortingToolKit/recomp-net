@@ -93,6 +93,7 @@ struct RNetRbDriver {
      * snapshot, so it is buffered until ours exists. */
     RNetRbDigestParts local_base;
     int              local_base_valid;
+    int              baseline_waiting_logged;
     uint32_t         peer_base_mask;
     RNetRbDigestParts peer_base[RB_MAX_SLOTS];
     uint32_t         cooldown_until_tick;
@@ -1887,6 +1888,7 @@ static void rb_episode_clear(RNetRbDriver *d)
     d->peer_post_mask = 0;
     d->peer_commit_mask = 0;
     d->local_base_valid = 0;
+    d->baseline_waiting_logged = 0;
     d->peer_base_mask = 0;
     memset(&d->corr, 0, sizeof(d->corr));
     if (d->rb)
@@ -3405,11 +3407,54 @@ static void rb_post_resend(RNetRbDriver *d)
     d->n_post_resent++;
 }
 
+/* A snapshot before load includes every earlier predicted input. Resolve
+ * that prefix before publishing its digest: a late mismatch there needs an
+ * earlier replay, not a baseline-fork verdict for a known-unfixed timeline. */
+static int rb_baseline_prefix_ready(RNetRbDriver *d)
+{
+    uint32_t t, owed_t;
+    int slot, owed_slot;
+    uint32_t from = rnet_rb_resolved_through(d->rb) + 1u;
+
+    if (rb_owed_first(d, &owed_t, &owed_slot) && owed_t < d->corr.load_tick) {
+        rb_log(d, "RB baseline prefix needs correction tick=%u slot=%d "
+                  "before load=%u -- realigning before the baseline load\n",
+               (unsigned)owed_t, owed_slot, (unsigned)d->corr.load_tick);
+        rb_episode_abort(d, RNET_RB_ABORT_CLASS_REALIGN,
+                         "late correction precedes the baseline");
+        /* No machine state was loaded and the old tick is still in reach.
+         * Retry it now rather than age its snapshot through a cooldown. */
+        d->cooldown_until_tick = 0u;
+        return 0;
+    }
+    if (d->sim > RNET_INPUT_HIST_DEPTH &&
+        from < d->sim - RNET_INPUT_HIST_DEPTH)
+        from = d->sim - RNET_INPUT_HIST_DEPTH;
+    for (t = from; t < d->corr.load_tick && t < d->sim; ++t) {
+        for (slot = 0; slot < rb_slot_count(d); ++slot) {
+            RNetRbFrame row;
+            if (slot != rb_local_slot(d) &&
+                rnet_ih_get(&d->ih, slot, t, &row) && row.is_predicted) {
+                if (!d->baseline_waiting_logged) {
+                    rb_log(d, "RB baseline prefix waiting epoch=%u tick=%u "
+                              "slot=%d before load=%u\n",
+                           (unsigned)d->corr.epoch_id, (unsigned)t, slot,
+                           (unsigned)d->corr.load_tick);
+                    d->baseline_waiting_logged = 1;
+                }
+                return 0; /* reconcile promotes or marks it owed next poll */
+            }
+        }
+    }
+    return 1;
+}
+
 static void rb_pump_episode(RNetRbDriver *d)
 {
     switch (d->stage) {
     case kRbSealing:
-        if (rnet_rb_all_peer_seal_rows_complete(d->rb)) {
+        if (rnet_rb_all_peer_seal_rows_complete(d->rb) &&
+            rb_baseline_prefix_ready(d)) {
             rnet_rb_set_phase(d->rb, nRNetRbPhaseAwaitingBaseline);
             if (rb_run_replay(d))
                 rb_enter_verify(d);
@@ -4027,6 +4072,28 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
             rb_stats_seat_tip(d, s, slot, &st_seat);
             if (rnet_sched_on_remote_miss(slot, d->sim, wire, &st_seat,
                                           d->prediction_cap, &why)) {
+                /* Rebuilding the cushion forbids invention. Withholding an
+                 * already-arrived row here would therefore park the injector
+                 * on this same tick forever. Consume that real row exactly
+                 * as the ordinary hit path does; actual missing rows still
+                 * obey the scheduler, and ordinary grace can still produce
+                 * the intended forced rollback. */
+                if (d->force_invent_slot == slot && why &&
+                    strcmp(why, "cushion_rebuild") == 0 &&
+                    rnet_session_peek_remote_input(s, slot, wire, &sample) &&
+                    sample.valid) {
+                    d->force_invent_slot = -1;
+                    rb_log_raw(d, "rbe: injected mispredict cancelled slot=%d sim=%u "
+                                  "-- cushion rebuild requires real input\n",
+                               slot, (unsigned)d->sim);
+                    rb_row_from_sample(d, slot, d->sim, &sample, &row);
+                    if (d->host.admit_sample)
+                        d->host.admit_sample(d->host.ctx, slot, d->sim, &sample);
+                    rnet_ih_put(&d->ih, slot, &row);
+                    d->rows[slot] = row;
+                    rnet_sched_note_remote_hit();
+                    continue;
+                }
                 /* Same wedge as lockstep above: outside a grace wait (which
                  * times out into an invent) the scheduler is waiting for a
                  * REAL row -- cushion_rebuild, boot_tip_wait -- and that is

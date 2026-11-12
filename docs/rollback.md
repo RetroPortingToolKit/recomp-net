@@ -201,6 +201,13 @@ state, so a correction that never lands is a measurable divergence):
   later ("RB correction retried"), or declared "RB correction LOST" once no
   snapshot reaches it. A completed replay pays it even if the episode then
   fails to commit: the span was re-run on authoritative rows.
+- **The baseline waits for its earlier input prefix.** A prediction before
+  `load` is already part of that snapshot. Sealing resolves those earlier
+  predictions before loading or sending BASELINE; an older mismatch discovered
+  during sealing realigns the episode and immediately retries the owed tick.
+  Comparing the unfinished snapshot instead would misclassify a repairable
+  input correction as a baseline fork. `rb_driver_test baseline-prefix` covers
+  two incremental peers with jitter, a 40-snapshot ring and unequal pacing.
 - **An abort after the baseline load restores the live tip** ("RB tip
   restored"), instead of leaving the engine on the load tick while sim stays
   at the old tip.
