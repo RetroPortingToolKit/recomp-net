@@ -548,6 +548,15 @@ refused, 21 chain stalls).
 
 ## Portable input contract
 
+Hosts packing digital inputs into the button field and two byte axes can set
+`RNetRbDriverConfig.strict_inputs` (or `RNetRbConfig.strict_inputs` when using
+the episode core directly). Every changed button or axis bit then requires a
+correction, without analog deadbands. Equal rows still use the existing host
+gates. The host must settle this choice in its session input identity before
+starting; the default analog policy and wire representation remain unchanged.
+The packed-row driver fixtures exercise both replay modes over real UDP peers,
+including a simulation digest that depends on the extra bytes.
+
 Pure decision core (no engine includes) for "published row vs late authoritative
 row → rewind or promote?". All game-specific behavior enters through
 `RNetInputContractParams` (numeric thresholds) and `RNetInputContractHostGates`

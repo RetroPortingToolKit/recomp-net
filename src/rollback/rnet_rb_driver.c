@@ -1673,6 +1673,7 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
     /* Seal completion waits on the same seats the episode FSM does
      * (rb_expect_mask): never on an empty seat of a sparse room. */
     rcfg.occupied_mask = d->cfg.occupied_mask;
+    rcfg.strict_inputs = d->cfg.strict_inputs;
     rcfg.tip_runway = (uint32_t)rb_env_int(d, "TIP_RUNWAY",
                                            RNET_RB_TIP_RUNWAY_DEFAULT, 0, 32);
     /* Keep the light-tip ceiling at the runway: a coalesced episode's depth

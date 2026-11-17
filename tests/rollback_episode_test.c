@@ -333,6 +333,60 @@ static void test_history_authority(const RNetRbConfig *cfg, const RNetRollbackVT
     host->remote_history = 0u;
 }
 
+static void test_strict_inputs(const RNetRollbackVTable *vt)
+{
+    RNetRbConfig cfg;
+    RNetRbSession *s;
+    RNetInputContractFrame published, wire;
+    unsigned bit, completed, predicted;
+    memset(&cfg, 0, sizeof(cfg));
+    memset(&published, 0, sizeof(published));
+    cfg.slot_count = 2;
+    published.tick = 88;
+    published.stick_x = 64;
+    published.stick_y = 64;
+    published.is_predicted = 0; /* Confirmed analog micro-drift may promote. */
+    wire = published;
+    wire.stick_x = 65;
+    s = rnet_rb_create(&cfg, vt);
+    expect_true(s != NULL, "legacy analog session creates");
+    expect_true(!rnet_input_contract_decision_is_rewind(
+                    rnet_rb_decide_stick_replace(s, &published, &wire, 1)),
+                "legacy analog micro-drift still promotes");
+    rnet_rb_destroy(s);
+
+    cfg.strict_inputs = 1;
+    s = rnet_rb_create(&cfg, vt);
+    expect_true(s != NULL, "strict digital session creates");
+    for (completed = 0; completed < 2; ++completed)
+        for (predicted = 0; predicted < 2; ++predicted)
+        {
+            published.is_predicted = (uint8_t)predicted;
+            expect_true(!rnet_input_contract_decision_is_rewind(
+                            rnet_rb_decide_stick_replace(s, &published, &published,
+                                                        (uint8_t)completed)),
+                        "identical digital rows need no correction");
+            for (bit = 0; bit < 32; ++bit)
+            {
+                uint8_t byte;
+                wire = published;
+                if (bit < 16) wire.buttons ^= (uint16_t)(1u << bit);
+                else
+                {
+                    int8_t *axis = bit < 24 ? &wire.stick_x : &wire.stick_y;
+                    memcpy(&byte, axis, 1);
+                    byte ^= (uint8_t)(1u << (bit & 7));
+                    memcpy(axis, &byte, 1);
+                }
+                expect_true(rnet_input_contract_decision_is_rewind(
+                                rnet_rb_decide_stick_replace(s, &published, &wire,
+                                                            (uint8_t)completed)),
+                            "every packed digital bit requires correction");
+            }
+        }
+    rnet_rb_destroy(s);
+}
+
 int main(void)
 {
     RNetRbConfig cfg;
@@ -758,6 +812,7 @@ int main(void)
     test_seal_bounds(cfg, &vt);
     test_history_authority(&cfg, &vt, &host);
     test_sparse_room(&vt, &host);
+    test_strict_inputs(&vt);
 
     if (g_failures == 0)
     {

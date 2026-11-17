@@ -227,6 +227,9 @@ typedef struct RNetRbDriverConfig
      * would have passed them. Appended last so a zeroed config keeps the old
      * behaviour. */
     uint16_t inject_flip_bits;
+    /* All button/axis bits are exact digital input; no analog deadbands.
+     * The host must include this session-fixed choice in its input contract. */
+    uint8_t strict_inputs;
 } RNetRbDriverConfig;
 
 typedef struct RNetRbDriver RNetRbDriver;

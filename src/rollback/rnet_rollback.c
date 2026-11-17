@@ -501,7 +501,13 @@ RNetInputContractDecision rnet_rb_decide_stick_replace(RNetRbSession *s,
 {
     RNetInputContractParams params;
 
-    if (s == NULL)
+    if (s == NULL || published == NULL || wire == NULL)
+    {
+        return nRNetInputContractRewind;
+    }
+    if (s->cfg.strict_inputs &&
+        (published->buttons != wire->buttons ||
+         published->stick_x != wire->stick_x || published->stick_y != wire->stick_y))
     {
         return nRNetInputContractRewind;
     }

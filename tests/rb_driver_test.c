@@ -91,6 +91,7 @@ typedef struct Toy {
 typedef struct Child {
     int slot;
     int mode;
+    int packed_inputs;
     unsigned snap_capacity;
     Toy state;
     struct { uint32_t tick; int valid; Toy s; } snaps[TOY_SNAPS];
@@ -141,8 +142,12 @@ static void toy_step(void)
     int i;
     uint32_t tick = g_c.state.tick;
     uint32_t acc = fold(g_c.state.acc, tick);
-    for (i = 0; i < g_c.pub_slots; ++i)
+    for (i = 0; i < g_c.pub_slots; ++i) {
         acc = fold(acc, (uint32_t)g_c.pub[i].buttons | ((uint32_t)i << 16));
+        if (g_c.packed_inputs)
+            acc = fold(acc, (uint8_t)g_c.pub[i].stick_x |
+                            ((uint32_t)(uint8_t)g_c.pub[i].stick_y << 8));
+    }
     g_c.state.acc = acc;
     g_c.state.tick = tick + 1u;
     if (tick < TOY_TICKS)
@@ -245,6 +250,10 @@ static void h_decode(void *ctx, int slot, const RNetInputSample *in, RNetRbFrame
     (void)ctx;
     (void)slot;
     out->buttons = (uint16_t)((in->bytes[0] | ((uint16_t)in->bytes[1] << 8)) & 0x0FFFu);
+    if (g_c.packed_inputs && in->size >= 4) {
+        memcpy(&out->stick_x, in->bytes + 2, 1);
+        memcpy(&out->stick_y, in->bytes + 3, 1);
+    }
 }
 
 static void h_sanitize(void *ctx, int slot, RNetRbFrame *f)
@@ -261,6 +270,7 @@ static void h_neutral(void *ctx, int slot, RNetRbFrame *out)
     (void)ctx;
     (void)slot;
     out->buttons = 0;
+    out->stick_x = out->stick_y = 0;
 }
 
 static void h_lobby(void *ctx)
@@ -320,11 +330,19 @@ static void h_log(void *ctx, const char *line)
 static void sample_local(rnet_u32 tick, RNetInputSample *out, void *opaque)
 {
     uint16_t b = toy_pad(g_c.slot, tick);
+    if (g_c.packed_inputs) b = (uint16_t)(0x100u + g_c.slot);
     (void)opaque;
     memset(out, 0, sizeof(*out));
     out->size = 2;
     out->bytes[0] = (rnet_u8)(b & 0xffu);
     out->bytes[1] = (rnet_u8)(b >> 8);
+    if (g_c.packed_inputs) {
+        /* Only low extra-byte bits change. Analog micro-drift promotion would
+         * drop real button changes from another local player in a bundle. */
+        out->size = 4;
+        out->bytes[2] = (uint8_t)(64u | ((tick / 3u + (unsigned)g_c.slot) & 1u));
+        out->bytes[3] = (uint8_t)(64u | ((tick / 5u + (unsigned)g_c.slot) & 1u));
+    }
     out->valid = 1;
 }
 
@@ -500,7 +518,7 @@ typedef struct Scenario {
     /* A small real-host ring and a longer run expose a late row before an
      * already-open correction's load. Zero keeps the short fixture defaults. */
     unsigned snap_capacity;
-    uint32_t run_timeout_ms;
+    int packed_inputs;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -568,6 +586,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     int started;
 
     memset(&g_c, 0, sizeof(g_c));
+    g_c.packed_inputs = sc->packed_inputs;
     g_c.slot = slot;
     g_c.snap_capacity = sc->snap_capacity;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
@@ -645,6 +664,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     cfg.slot_count = &slots;
     cfg.input_delay = &delay;
     cfg.occupied_mask = sc->occupied_mask;
+    cfg.strict_inputs = (uint8_t)sc->packed_inputs;
     cfg.replay_mode = g_c.mode ? RNET_RB_REPLAY_INCREMENTAL : RNET_RB_REPLAY_INLINE;
     cfg.part_names[0] = "acc_lo";
     cfg.part_names[1] = "acc_hi";
@@ -685,7 +705,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
         uint32_t lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
-        while ((uint32_t)(mono_ms() - start_ms) < (sc->run_timeout_ms ? sc->run_timeout_ms : 40000u)) {
+        while (1) { /* Finite tick workload and coordinated drain own completion. */
             RNetRbAdmit a;
             RNetRbQuiesce q;
             rnet_session_pump(s);
@@ -1074,6 +1094,11 @@ int main(int argc, char **argv)
      * 60 Hz frontend cadence, so a pass here means what a pass there means.
      * RNET_SIM_LATENCY_MS is one-way per peer: RTT is double. */
     static const Scenario scenarios[] = {
+        { .name = "packed-digital-inline", .latency_ms = "45", .jitter_ms = "5",
+          .ticks = 480u, .initial_delay = 2, .packed_inputs = 1 },
+        { .name = "packed-digital-incremental", .mode_a = 1, .mode_b = 1,
+          .latency_ms = "45", .jitter_ms = "5", .ticks = 480u,
+          .initial_delay = 2, .packed_inputs = 1 },
         /* name                  mode A, B   latency jitter force  ticks  one-side */
         { "inline-loopback",     0, 0,       "0",   "0",   45,    420u,  0 },
         { "mixed-rtt60",         0, 1,       "30",  "8",   45,    420u,  0 },
@@ -1089,7 +1114,7 @@ int main(int argc, char **argv)
         { .name = "baseline-prefix", .mode_a = 1, .mode_b = 1,
           .latency_ms = "25", .jitter_ms = "10", .force_mispredict = 45,
           .ticks = 3300u, .initial_delay = 2, .inject_both = 1, .slow_ms = 2,
-          .snap_capacity = 40u, .run_timeout_ms = 120000u },
+          .snap_capacity = 40u },
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
         /* The stop propagates: only the initiator is asked. */
         { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },

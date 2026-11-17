@@ -203,6 +203,11 @@ typedef struct RNetRbConfig
      * (RNetSession: a zero sample). Appended last so a zero-initialised
      * config keeps the old behaviour. */
     uint32_t occupied_mask;
+    /* Packed digital hosts may use the two byte axes as additional input
+     * bits. Every changed bit then requires correction, without analog
+     * deadbands. Settle this contract before the session; zero retains the
+     * ordinary analog replacement policy and its host gates. */
+    uint8_t strict_inputs;
 } RNetRbConfig;
 
 /* Lifecycle. */
