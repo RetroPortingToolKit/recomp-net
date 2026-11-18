@@ -32,9 +32,14 @@ static const char *rnet_env(const char *primary, const char *legacy)
     return NULL;
 }
 
-/* §104/§105: auto-delay / lobby seed floors (shared with sync_delay). */
+/* §104/§105: auto-delay / lobby seed floors (shared with sync_delay).
+ * 2026-10-09 (Alex): rollback floor 5 → 3, every port. At 5 a LAN or
+ * same-city link carried 83 ms of input delay it never used -- an MMX
+ * session at RTT 24 ms saw remote rows arrive 4+ ticks early on every tick,
+ * with no miss and no rollback, while players felt the lag. Rollback is
+ * what absorbs the rest; D only has to cover typical transit. */
 #define RB_FORCE_TURN_DELAY_FLOOR 6
-#define RB_AUTO_DELAY_LOWER_FLOOR 5
+#define RB_AUTO_DELAY_LOWER_FLOOR 3
 
 /* ------------------------------------------------------------------ */
 /* Bridge + host gates                                                 */
@@ -251,6 +256,7 @@ static uint32_t g_absurd_catchup_until_ms;
 
 static uint32_t g_ad_ticks;       /* live lead samples this window */
 static int64_t  g_ad_lead_sum;
+static int      g_ad_lead_min;    /* lowest live lead this window */
 static uint32_t g_ad_miss;        /* rows absent at need (once per wire) */
 static uint32_t g_ad_late_n;      /* misses that later arrived (waited out) */
 static uint32_t g_ad_late_sum_ms; /* how late those rows were vs need */
@@ -1210,6 +1216,8 @@ static void np_scorecard_sample(uint32_t now, rnet_u32 sim, rnet_u32 wire,
          * would poison the transit estimate. */
         if (!sched_episode_active() && !sched_tip_holding() &&
             st->remote_lead > -32 && st->remote_lead < 32) {
+            if (!g_ad_ticks || st->remote_lead < g_ad_lead_min)
+                g_ad_lead_min = st->remote_lead;
             g_ad_ticks++;
             g_ad_lead_sum += st->remote_lead;
         }
@@ -1380,13 +1388,25 @@ static void np_pcap_freeze_exit(void)
  *   lateness   = first-miss → arrival for misses we waited out;
  *   transit    ≈ D − 1 − lead_avg (EMA'd; also drives the cushion-rebuild
  *                achievable-lead target).
- * Raise: miss_rate > 2% → D += ceil(late_avg/tick) (1..2 per step).
- * Lower: miss_rate < 0.2% AND ≥2 ticks of spare lead, must repeat on 3
- * consecutive evals + 30 s cooldown + no pcap freeze in the last 30 s.
+ * Raise: miss_rate > 2% with rows waited out → D += the larger of
+ * ceil(late_avg/tick) and 1 − lead_min (1..4 per step); never held back
+ * by the cooldown.
+ * Lower: miss_rate < 0.2% AND the window's LOWEST lead keeps more than
+ * RB_AUTO_DELAY_LEAD_MARGIN ticks spare. One step straight to the D that
+ * leaves exactly that margin (lead falls one-for-one with D), confirmed on
+ * 1 eval the first time and 2 after, + 30 s cooldown + no pcap freeze in
+ * the last 30 s. Pre-2026-10-09 this was one frame per agreement of 3
+ * evals plus the cooldown, so a lobby seed of 9 on a 24 ms link spent the
+ * whole first two minutes of a match at 100-150 ms.
+ *
+ * The margin is two ticks, not one, because the host sees only its own
+ * arrival stream: the guest's view of the host's rows can sit a tick
+ * lower (frame phase), and nothing reports it here.
  * The reactive §22 bump (np_adapt_delay_on_pcap_enter) still catches freeze
  * storms between eval windows. RBE_RB_AUTO_DELAY=0 disables. */
 #define RB_AUTO_DELAY_EVAL_MS     5000u
-#define RB_AUTO_DELAY_AGREE       3u
+#define RB_AUTO_DELAY_AGREE       2u
+#define RB_AUTO_DELAY_LEAD_MARGIN 2
 #define RB_AUTO_DELAY_COOLDOWN_MS 30000u
 /* Delay floors: RB_FORCE_TURN_DELAY_FLOOR / RB_AUTO_DELAY_LOWER_FLOOR
  * defined near top of file (§104/§105). */
@@ -1402,6 +1422,7 @@ static void np_auto_delay_tick(uint32_t now)
     uint32_t tick_ms = g_ts_tick_ema_ms ? g_ts_tick_ema_ms : 17u;
     uint32_t ticks, miss, late_n, late_sum, late_max;
     int64_t  lead_sum;
+    int      lead_min;
     int32_t  lead_avg_x16;
     int32_t  transit_x16;
     uint32_t miss_per_mille;
@@ -1429,6 +1450,7 @@ static void np_auto_delay_tick(uint32_t now)
     /* Harvest + reset the window (both peers, so guest transit stays live). */
     ticks = g_ad_ticks;
     lead_sum = g_ad_lead_sum;
+    lead_min = g_ad_lead_min;
     miss = g_ad_miss;
     late_n = g_ad_late_n;
     late_sum = g_ad_late_sum_ms;
@@ -1477,11 +1499,20 @@ static void np_auto_delay_tick(uint32_t now)
             bump = 1;
         if (bump > 2)
             bump = 2;
+        /* Sized like a lower: enough that the window's worst row would have
+         * arrived with a tick to spare. Lateness alone undercounts it -- a
+         * 70 ms link climbing 3 → 4 → 5 one tick at a time spent ~10 s of
+         * a 40 s run waiting on rows. */
+        if (1 - lead_min > bump)
+            bump = 1 - lead_min;
+        if (bump > 4)
+            bump = 4;
         target = d + bump;
-    } else if (miss_per_mille < 1u && lead_avg_x16 >= 3 * 16) {
-        /* §104: tighter lower bar (was miss<2‰ + lead≥2) — session-144
-         * shrank D 5→4 under healthy fight cushion and fueled invent. */
-        target = d - 1;
+    } else if (miss_per_mille < 1u && lead_min > RB_AUTO_DELAY_LEAD_MARGIN) {
+        /* Keyed on the minimum, not the average: the average hides the
+         * jitter that a too-small D turns into invents (§104, session-144
+         * shrank 5→4 on a healthy average and fueled invent). */
+        target = d - (lead_min - RB_AUTO_DELAY_LEAD_MARGIN);
     } else {
         target = d;
     }
@@ -1502,16 +1533,25 @@ static void np_auto_delay_tick(uint32_t now)
     }
     /* §59: first raise of the session (never changed yet) confirms on 1 eval
      * (~5 s) so a badly under-provisioned lobby D does not invent-storm for
-     * a full 10 s. Later raises keep 2-eval confirm; lowers stay at 3. */
+     * a full 10 s. Later raises keep 2-eval confirm. Lowers confirm on 1
+     * the first time, RB_AUTO_DELAY_AGREE after; consecutive lowers agree
+     * on direction and keep the higher (safer) of their targets, since a
+     * lead minimum moves by a tick from window to window. */
     {
         uint32_t need_agree;
         if (target < d)
-            need_agree = RB_AUTO_DELAY_AGREE;
+            need_agree = s_last_change_ms == 0u ? 1u : RB_AUTO_DELAY_AGREE;
         else if (s_last_change_ms == 0u)
             need_agree = 1u;
         else
             need_agree = 2u;
-        if (target != s_last_target) {
+        if (target < d && s_last_target >= 0 && s_last_target < d) {
+            if (s_last_target > target)
+                target = s_last_target;
+            s_last_target = target;
+            if (++s_agree_streak < need_agree)
+                return;
+        } else if (target != s_last_target) {
             s_last_target = target;
             s_agree_streak = 1u;
             if (s_agree_streak < need_agree)
@@ -1520,7 +1560,10 @@ static void np_auto_delay_tick(uint32_t now)
             return;
         }
     }
-    if (s_last_change_ms != 0u &&
+    /* The cooldown holds back lowers only (no oscillation): a raise answers
+     * rows that are already late, which the player feels as the game
+     * stalling, so it never waits behind the previous change. */
+    if (target < d && s_last_change_ms != 0u &&
         (uint32_t)(now - s_last_change_ms) < RB_AUTO_DELAY_COOLDOWN_MS)
         return;
     if (target < d && g_pcap_last_enter_ms != 0u &&
@@ -1533,12 +1576,12 @@ static void np_auto_delay_tick(uint32_t now)
         fprintf(stderr,
                 "rbe: auto delay %d → %d (arrival: miss=%u/%u "
                 "(%u‰) late avg=%ums max=%ums n=%u lead_avg=%.2f "
-                "transit_est=%.2f ticks)\n",
+                "lead_min=%d transit_est=%.2f ticks)\n",
                 d, target, (unsigned)miss, (unsigned)ticks,
                 (unsigned)miss_per_mille,
                 (unsigned)(late_n ? late_sum / late_n : 0u),
                 (unsigned)late_max, (unsigned)late_n,
-                (double)lead_avg_x16 / 16.0,
+                (double)lead_avg_x16 / 16.0, lead_min,
                 (double)g_transit_x16 / 16.0);
         fflush(stderr);
     }

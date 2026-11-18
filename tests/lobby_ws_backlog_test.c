@@ -296,6 +296,7 @@ static void client_signal_burst(void)
     g_lc.handshake_done = 1;
     g_lc.in_lobby = 1;
     g_lc.is_host = 1;   /* a guest would add RTT pings to the stream */
+    g_srv_ping_wanted = 0; /* and so would the per-connection server ping */
     snprintf(g_lc.join.lobby_id, sizeof(g_lc.join.lobby_id), "L1");
     for (i = 0; i < N; ++i) {
         char json[4608];

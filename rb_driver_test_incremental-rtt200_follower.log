@@ -1,0 +1,9 @@
+rb_test: ROLLBACK start slot=1 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: RB replay shape: incremental (one replayed tick per host iteration)
+rb_test: RB boot digest wait — ours=a4a1963a, peer tick 0 not in yet
+rb_test: RB boot digest agreed (a4a1963a)
+rb_test: RB POST epoch=8 arrived before its BEGIN — held for it
+rb_test: RB POST epoch=8 taken from the early buffer
+rbe: RESIM episode #1 follower slot=1 mismatch=45 load=45 target=45 (rewind 9 frames, replay 1) epoch=8
+rb_test: RB committed epoch=8 span=45..45 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=8 held=8 ticks (runway 12) — every peer committed

@@ -320,6 +320,59 @@ static void case_gate_matches_on_id_only(void)
        "a peer announcing nothing is missing everything");
 }
 
+/* A peer can hold a package and still be unable to run one of its features:
+ * the feature needs a file only the player can supply (another game's ROM).
+ * The offer says which features those are, for every feature of the package;
+ * the files gate counts only the ones the host's plan enables. */
+static void case_gate_holds_for_missing_files(void)
+{
+    RNetLobbyModPkg plan[1];
+    RNetLobbyModPkg peer[1];
+    RNetLobbyModPkg back[RNET_LOBBY_MAX_MODS];
+    char who[64], what[160], files[256], json[1024];
+    int mods_missing = -1, files_missing = -1;
+
+    plan[0] = row("megaman-x.character.zero", "0.0.1");
+    snprintf(plan[0].feats, sizeof(plan[0].feats), "zero");
+    peer[0] = row("megaman-x.character.zero", "0.0.1");
+    snprintf(peer[0].nf, sizeof(peer[0].nf), "other,zero");
+
+    ck(append_mod_pkg_array(json, sizeof(json), "pkgs", peer, 1) > 0,
+       "an offer row with missing files encodes");
+    ck(strstr(json, "\"nf\":\"other,zero\"") != NULL, "nf is on the wire");
+    ck(parse_mod_pkg_array(json, "pkgs", back, RNET_LOBBY_MAX_MODS) == 1 &&
+           !strcmp(back[0].nf, "other,zero"),
+       "nf round-trips");
+    ck(append_mod_pkg_array(json, sizeof(json), "pkgs", plan, 1) > 0 &&
+           strstr(json, "\"nf\"") == NULL,
+       "a row with nothing missing does not carry nf");
+
+    ck(gate_with(plan, 1, peer, 1, who, sizeof(who), what, sizeof(what)) == 0,
+       "having the package satisfies the mods gate");
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 1,
+       "a plan feature without its files blocks the match");
+    ck(!strcmp(who, "Bob"), "the player choosing a file is named");
+    ck(!strcmp(what, "megaman-x.character.zero/zero"),
+       "the feature needing files is named");
+    ck(rnet_lobby_member_mod_readiness(1, &mods_missing, &files_missing, files,
+                                       sizeof(files)) == 1 &&
+           mods_missing == 0 && files_missing == 1 &&
+           !strcmp(files, "megaman-x.character.zero/zero"),
+       "member readiness reports the missing files");
+
+    snprintf(peer[0].nf, sizeof(peer[0].nf), "other");
+    (void)gate_with(plan, 1, peer, 1, who, sizeof(who), what, sizeof(what));
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 0,
+       "files missing for a feature the host did not enable do not block");
+
+    (void)gate_with(plan, 1, peer, 0, who, sizeof(who), what, sizeof(what));
+    ck(rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                         sizeof(what)) == 0,
+       "a missing package is the mods gate's business, not the files gate's");
+}
+
 /* The transfer hooks must outlive a lobby reconnect.
  *
  * They used to live in LobbyClient, which rnet_lobby_disconnect() memsets --
@@ -911,6 +964,68 @@ static void case_gallery_does_not_rearm_ready(void)
     g_lc.fd = -1;
 }
 
+/* A peer with no game image to boot holds the match by staying not ready.
+ * Every set_ready says false while blocked -- the lobby_update auto re-arm
+ * included, which used to flip it straight back -- and the host's start gate
+ * names that peer. Lifting the block announces ready again. */
+static void case_launch_blocked_holds_ready(void)
+{
+    const char *json =
+        "{\"op\":\"lobby_update\",\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\",\"ready\":true},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\",\"ready\":false}]}";
+    char who[64];
+    printf("  a blocked launch holds ready\n");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    rnet_lobby_set_launch_blocked(1);
+    ck(g_lc.pending_n == 1 &&
+           strstr(g_lc.pending_tx[0], "\"ready\":false") != NULL,
+       "blocking announces not ready");
+    handle_server_json(json);
+    ck(g_lc.pending_n == 1, "a lobby_update does not re-arm a blocked peer");
+    (void)rnet_lobby_set_ready(1);
+    ck(g_lc.pending_n == 2 &&
+           strstr(g_lc.pending_tx[1], "\"ready\":false") != NULL,
+       "an explicit set_ready(1) still says false while blocked");
+    rnet_lobby_set_launch_blocked(0);
+    ck(g_lc.pending_n == 3 &&
+           strstr(g_lc.pending_tx[2], "\"ready\":true") != NULL,
+       "lifting the block announces ready");
+
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "h");
+    handle_server_json(json);
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 1 &&
+           !strcmp(who, "Guest"),
+       "the host's gate names the peer that is not ready");
+    g_lc.members[1].ready = 1;
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 0,
+       "a ready peer does not block");
+    g_lc.members[1].ready = 0;
+    g_lc.members[1].is_spectator = 1;
+    ck(rnet_lobby_match_blocked_by_unready(who, sizeof(who)) == 0,
+       "a spectator never blocks a start");
+
+    g_lc.members[1].is_spectator = 0;
+    g_lc.members[1].ready = 1;
+    g_lc.is_host = 1;
+    g_launch_blocked = 1;
+    ck(rnet_lobby_request_start(NULL) == -1 &&
+           !strcmp(g_lc.join.last_error, "local_not_ready"),
+       "a host with nothing to boot does not start");
+    g_launch_blocked = 0;
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 static void case_launch_transport_survives_a_lobby_update(void)
 {
     const char *launch =
@@ -969,6 +1084,114 @@ static void case_launch_transport_survives_a_lobby_update(void)
         "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
     ck(g_lc.join.force_input_relay == 0,
        "a p2p launch does not inherit the previous match's relay");
+}
+
+/* Two instances on one machine (or two players behind one NAT) can advertise
+ * the same public ip:port: the host relay takes its port first-free from 7777,
+ * the guest first-free from 7778, and a busy 7777 puts both on :7778. An ICE
+ * launch with those endpoints is still ICE -- the server named the transport
+ * and allocated no relay. Read as a relay, both peers dialled the host's own
+ * public address with nothing listening and timed out (2026-10-09). */
+/* The room list's latency before joining: our ping/pong round trip to the
+ * lobby server plus the host's, which the server publishes per row. */
+static void case_list_latency_estimate(void)
+{
+    printf("  room list latency = ours + the host's, through the server\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.connected = 1;
+    g_srv_rtt_ms = -1; g_srv_rtt_reported = -1; g_srv_ping_sent_ms = 0;
+    handle_server_json(
+        "{\"op\":\"lobby_list\",\"lobbies\":["
+        "{\"lobby_id\":\"A\",\"name\":\"Near\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"host_rtt_ms\":12},"
+        "{\"lobby_id\":\"B\",\"name\":\"Old server\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2}]}");
+    ck(g_lc.list_count == 2, "both rooms listed");
+    ck(rnet_lobby_list_latency_estimate_ms(0) == -1, "unknown until we have measured ourselves");
+    g_srv_ping_sent_ms = lobby_mono_ms() - 40;
+    handle_server_json("{\"op\":\"pong\"}");
+    ck(g_srv_rtt_ms >= 40 && g_srv_rtt_ms < 100, "a pong times our round trip to the server");
+    ck(g_srv_rtt_reported == g_srv_rtt_ms, "and reports it, so the server can publish ours");
+    ck(rnet_lobby_list_latency_estimate_ms(0) == g_srv_rtt_ms + 12, "estimate = ours + the host's");
+    ck(rnet_lobby_list_latency_estimate_ms(1) == -1, "a row without host_rtt_ms stays unknown");
+    ck(rnet_lobby_list_latency_estimate_ms(2) == -1, "out of range is unknown");
+}
+
+static void case_list_direct_latency(void)
+{
+    static const char *list_json =
+        "{\"op\":\"lobby_list\",\"lobbies\":["
+        "{\"lobby_id\":\"A\",\"name\":\"Open\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"host_rtt_ms\":12},"
+        "{\"lobby_id\":\"P\",\"name\":\"Locked\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"has_password\":true,\"host_rtt_ms\":30}]}";
+    int direct = -1;
+    printf("  room list latency: the direct probe's figure, else the estimate\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    list_probe_reset();
+    g_lc.connected = 1;
+    g_srv_rtt_ms = 20;
+    handle_server_json(list_json);
+    ck(rnet_lobby_list_latency_ms(0, &direct) == 32 && direct == 0,
+       "before a probe lands, the estimate stands in (marked as one)");
+    /* What list_probe_finish leaves behind for room A. */
+    g_lp[0].used = 1;
+    g_lp[0].state = LP_DONE;
+    g_lp[0].rtt_ms = 3;
+    snprintf(g_lp[0].lobby_id, sizeof(g_lp[0].lobby_id), "%s", "A");
+    ck(rnet_lobby_list_latency_ms(0, &direct) == 3 && direct == 1, "a measured room reads direct");
+    ck(rnet_lobby_list_latency_ms(1, &direct) == 50 && direct == 0,
+       "a password room is never probed and keeps the estimate");
+    ck(rnet_lobby_list_latency_ms(1, NULL) == 50, "is_direct may be NULL");
+    handle_server_json(list_json);
+    ck(rnet_lobby_list_latency_ms(0, NULL) == 3,
+       "the server's own list push keeps the measurement (no re-probe)");
+    g_list_probe_armed = 1;
+    handle_server_json("{\"op\":\"lobby_list\",\"lobbies\":[]}");
+    ck(!g_list_probe_armed, "an answered request disarms: the next push probes nothing");
+    ck(!g_lp[0].used, "a room that left the list forgets its figure");
+    snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error), "%s", "");
+    g_lp[1].used = 1;
+    g_lp[1].state = LP_QUEUED;
+    handle_server_json("{\"op\":\"error\",\"code\":\"unknown_op\","
+                       "\"detail\":\"probe_signal\",\"ok\":false}");
+    ck(g_lc.join.last_error[0] == '\0', "an older server's unknown_op is not a join error");
+    ck(g_list_probe_unsupported && g_lp[1].state == LP_DONE,
+       "and stops probing on that connection");
+    list_probe_reset();
+    g_srv_rtt_ms = -1;
+}
+
+static void case_ice_launch_with_equal_endpoints_stays_ice(void)
+{
+    printf("  an ICE launch with equal endpoints stays ICE\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "g");
+    snprintf(g_lc.my_bind, sizeof(g_lc.my_bind), "%s", "0.0.0.0:7779");
+    g_lc.connected = 1;
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":65,"
+        "\"host_endpoint\":\"216.154.76.149:7778\","
+        "\"guest_endpoint\":\"216.154.76.149:7778\","
+        "\"transport\":\"ice\",\"player_count\":2,\"max_slots\":2,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":9,\"force_input_relay\":false},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.force_input_relay == 0, "the launch is not taken for a server relay");
+    ck(strcmp(g_lc.join.bind_hostport, "0.0.0.0:0") != 0,
+       "so the guest keeps its own bind instead of an ephemeral relay one");
+
+    /* The same endpoints from a server that names no transport keep the old
+     * reading: that server did rewrite both endpoints to its relay. */
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":66,"
+        "\"host_endpoint\":\"relay.example:8777\","
+        "\"guest_endpoint\":\"relay.example:8777\","
+        "\"player_count\":2,\"max_slots\":2,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"Host\"},"
+        "{\"slot\":1,\"player_id\":\"g\",\"display_name\":\"Guest\"}]}");
+    ck(g_lc.join.force_input_relay == 1,
+       "a transport-less launch with equal endpoints is still a relay");
 }
 
 
@@ -1367,6 +1590,176 @@ static void case_session_variant(void)
     ck(back.session_variant == 0, "old host resets variant to default");
 }
 
+
+/* ---- host relay over ICE: signalling, hold, launch ----------------------
+ * This test build has no ICE (RNET_ENABLE_ICE is not defined here), so no
+ * agent ever exists: everything below is the lobby client's own job -- the
+ * type range, who is allowed to signal, where an early signal waits -- and
+ * the real agents are exercised by host_ice_test / lobby_ice_launch_test. */
+
+static const char *HI_UPDATE =
+    "{\"op\":\"lobby_update\",\"lobby_id\":\"L\",\"session_id\":3,"
+    "\"host_player_id\":\"h\",\"player_count\":3,\"max_slots\":4,"
+    "\"match_caps\":{\"v\":1,\"input_delay\":5,\"relay\":\"host\",\"relay_via\":\"ice\"},"
+    "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\",\"ready\":true},"
+    "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\",\"ready\":true},"
+    "{\"slot\":2,\"player_id\":\"g2\",\"display_name\":\"G2\",\"ready\":true}],"
+    "\"spectators\":[{\"slot\":64,\"player_id\":\"sp\",\"display_name\":\"S\"}]}";
+
+static void hi_room(const char *me, int is_host)
+{
+    rnet_host_ice_destroy(&g_host_ice);
+    memset(&g_lc, 0, sizeof(g_lc));
+    memset(&g_il, 0, sizeof(g_il));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    g_lc.in_lobby = 1;
+    g_lc.is_host = is_host;
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", me);
+    snprintf(g_lc.host_player_id, sizeof(g_lc.host_player_id), "h");
+    handle_server_json(HI_UPDATE);
+    host_ice_step();   /* what rnet_lobby_pump does every frame */
+}
+
+static void hi_signal(const char *from, int type, int flag)
+{
+    char js[256];
+    snprintf(js, sizeof(js),
+             "{\"op\":\"signal\",\"from_player_id\":\"%s\",\"type\":%d,\"flag\":%d,"
+             "\"text\":\"v=0 x\"}", from, type, flag);
+    handle_server_json(js);
+}
+
+static void case_hostice_caps_and_range(void)
+{
+    RNetLobbyMatchCaps caps;
+    char json[1024];
+    printf("  host-ice: caps field and signal range\n");
+    ck(RNET_LOBBY_SIG_HOSTICE_BASE == 130, "the range starts at 130");
+    ck(rnet_host_ice_sig_is_ours(131) && rnet_host_ice_sig_is_ours(136), "131..136 are ours");
+    ck(!rnet_host_ice_sig_is_ours(130) && !rnet_host_ice_sig_is_ours(137) &&
+       !rnet_host_ice_sig_is_ours(126) && !rnet_host_ice_sig_is_ours(102) &&
+       !rnet_host_ice_sig_is_ours(6),
+       "legacy 1-6, RTT 100-102 and mod transfer 110/111/121-126 are not");
+    memset(&caps, 0, sizeof(caps));
+    parse_match_caps_object("{\"v\":1,\"relay\":\"host\",\"relay_via\":\"ice\"}", &caps);
+    ck(caps.relay_host == 1 && caps.relay_via_ice == 1, "relay_via ice parses");
+    parse_match_caps_object("{\"v\":1,\"relay\":\"host\"}", &caps);
+    ck(caps.relay_host == 1 && caps.relay_via_ice == 0, "absent relay_via is not ice");
+    /* This build cannot run ICE, so a host never advertises it. */
+    caps.relay_host = 1;
+    g_relay_via_ice_pref = 1;
+    ck(append_match_caps_json(json, sizeof(json), &caps) > 0, "caps encode");
+    ck(strstr(json, "\"relay\":\"host\"") && !strstr(json, "relay_via"),
+       "no relay_via is published by a build without ICE");
+}
+
+static void case_hostice_dispatch_and_seating(void)
+{
+    int sig_count_before;
+    printf("  host-ice: dispatch by sender, seated players only\n");
+    hi_room("h", 1);
+    ck(room_relays_via_ice(), "the room's caps ask for ICE");
+    sig_count_before = g_lc.sig_count;
+
+    hi_signal("g1", 131, 1);   /* LOCAL_SDP from a seated guest */
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1,
+       "a seated guest's signal reaches the module (held: no agent in this build)");
+    ck(g_lc.sig_count == sig_count_before, "and does not enter the legacy game queue");
+    hi_signal("g2", 133, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g2") == 1 &&
+       rnet_host_ice_held_count(g_host_ice, "g1") == 1,
+       "each sender has its own hold");
+
+    hi_signal("stranger", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "stranger") == 0, "an unseated sender is refused");
+    hi_signal("sp", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "sp") == 0, "a gallery spectator is refused");
+    hi_signal("g1", 136, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1, "SET_CONTROLLING is refused");
+    hi_signal("g1", 120 + 1, 0);
+    ck(rnet_host_ice_held_count(g_host_ice, "g1") == 1 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 1,
+       "a mod-transfer signal still takes the mod path, not ours");
+    hi_signal("g1", 1, 0);
+    ck(g_lc.sig_count == sig_count_before + 1 || g_lc.sig_count == sig_count_before,
+       "legacy types are untouched (queued for the game, or dropped by its own rule)");
+
+    /* A guest hears the host and nobody else. */
+    hi_room("g1", 0);
+    hi_signal("g2", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "g2") == 0, "a guest refuses another guest");
+    hi_signal("h", 131, 1);
+    ck(rnet_host_ice_held_count(g_host_ice, "h") == 1, "a guest accepts the host");
+    {
+        RNetHostIceStatus st;
+        ck(rnet_lobby_host_ice_status(&st) == 1 && st.role == 2, "the guest role is running");
+        ck(st.reports_sent == 1 && !strcmp(st.last_report, "fail"),
+           "a build that cannot run ICE reports path \"fail\" honestly");
+    }
+    rnet_host_ice_destroy(&g_host_ice);
+}
+
+static void case_hostice_hold_is_per_peer_for_mod_signals(void)
+{
+    printf("  mod-transfer hold: one bucket per sender\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = 1000;
+    g_lc.connected = 1;
+    hi_signal("g1", 121, 0);
+    hi_signal("g2", 121, 0);
+    hi_signal("g1", 123, 0);
+    ck(rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 2 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g2") == 1,
+       "a second sender no longer wipes the first sender's held signals");
+    ck(rnet_sig_hold_get(&g_lc.sig_hold, "g1", 0)->sig.type == RNET_SIGNAL_LOCAL_SDP ||
+       rnet_sig_hold_get(&g_lc.sig_hold, "g1", 0)->sig.type == RNET_SIGNAL_REMOTE_SDP,
+       "in arrival order");
+    rnet_sig_hold_drop(&g_lc.sig_hold, "g1");
+    ck(rnet_sig_hold_count(&g_lc.sig_hold, "g1") == 0 &&
+       rnet_sig_hold_count(&g_lc.sig_hold, "g2") == 1,
+       "consuming one peer's hold leaves the other's");
+    rnet_sig_hold_clear(&g_lc.sig_hold);
+}
+
+static void case_hostice_launch_without_agents_is_refused(void)
+{
+    const char *launch =
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":9,"
+        "\"transport\":\"host\",\"relay_via\":\"ice\",\"host_endpoint\":\"\","
+        "\"guest_endpoint\":\"\",\"player_count\":3,\"max_slots\":4,"
+        "\"match_caps\":{\"v\":1,\"input_delay\":5,\"relay\":\"host\",\"relay_via\":\"ice\"},"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\"},"
+        "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\"},"
+        "{\"slot\":2,\"player_id\":\"g2\",\"display_name\":\"G2\"}]}";
+    printf("  host-ice: a launch no agent backs is refused with a reason\n");
+    hi_room("h", 1);
+    handle_server_json(launch);
+    ck(g_lc.join.transport_ice_hub == 1 && g_lc.join.transport_host == 1,
+       "the launch is read as ICE hub");
+    ck(rnet_lobby_launch_pending() == 0, "not launched");
+    ck(!strcmp(g_lc.join.last_error, "ice_not_connected"), "last_error says why");
+    ck(strstr(rnet_lobby_ice_launch_error(), "G1") != NULL,
+       "and the reason names the guest that is not connected");
+    ck(rnet_lobby_ice_take_hub((RNetLobbyIceSeat[2]){{0}}, 2) == -1,
+       "there is nothing to take");
+    ck(rnet_lobby_ice_take_guest_agent() == NULL, "nor as a guest");
+    /* the legacy launch path is untouched */
+    snprintf(g_lc.my_bind, sizeof(g_lc.my_bind), "%s", "0.0.0.0:7777");
+    handle_server_json(
+        "{\"op\":\"launch\",\"ok\":true,\"lobby_id\":\"L\",\"session_id\":9,"
+        "\"transport\":\"host\",\"host_endpoint\":\"9.9.9.9:7777\","
+        "\"guest_endpoint\":\"\",\"player_count\":2,\"max_slots\":4,"
+        "\"slots\":[{\"slot\":0,\"player_id\":\"h\",\"display_name\":\"H\"},"
+        "{\"slot\":1,\"player_id\":\"g1\",\"display_name\":\"G1\"}]}");
+    ck(g_lc.join.transport_ice_hub == 0 && g_lc.join.transport_host == 1,
+       "a launch without relay_via keeps the endpoint path");
+    ck(rnet_lobby_launch_pending() == 1, "and launches");
+    rnet_host_ice_destroy(&g_host_ice);
+    memset(&g_lc, 0, sizeof(g_lc));
+    g_lc.fd = -1;
+}
+
 int main(void)
 {
     case_rows();
@@ -1375,6 +1768,8 @@ int main(void)
     case_partial_rows_dropped();
     case_overflow_refuses();
     case_gate_matches_on_id_only();
+    case_gate_holds_for_missing_files();
+    case_launch_blocked_holds_ready();
     case_hooks_survive_disconnect();
     case_ice_local_becomes_remote();
     case_offer_round_trips_through_a_slot_row();
@@ -1392,6 +1787,9 @@ int main(void)
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
+    case_ice_launch_with_equal_endpoints_stays_ice();
+    case_list_latency_estimate();
+    case_list_direct_latency();
     case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
@@ -1405,6 +1803,10 @@ int main(void)
     case_host_created_update_launch();
     case_guest_joined_and_host_spectates();
     case_large_frames_are_not_cut();
+    case_hostice_caps_and_range();
+    case_hostice_dispatch_and_seating();
+    case_hostice_hold_is_per_peer_for_mod_signals();
+    case_hostice_launch_without_agents_is_refused();
     printf(fails ? "\n%d failure(s)\n" : "\nall lobby client cases passed\n", fails);
     return fails != 0;
 }

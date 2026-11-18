@@ -1249,6 +1249,13 @@ static void hr_update_guest(RNetHostRelay *hr, const RNetHostRelayView *v)
     }
 }
 
+void rnet_host_relay_path_cleared(RNetHostRelay *hr)
+{
+    if (!hr || hr->st.role != 2 || hr->probe || !hr->st.last_report[0]) return;
+    hr->st.last_report[0] = '\0';
+    hr->report_due_ms = 0;
+}
+
 void rnet_host_relay_update(RNetHostRelay *hr, const RNetHostRelayView *v)
 {
     if (!hr || !v) return;

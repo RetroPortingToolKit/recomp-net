@@ -12,6 +12,7 @@
 #include "recomp_net/chat_report.h"
 
 #include <ctype.h>
+#include <stddef.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,9 @@
 #include "recomp_net/rnet_sha1.h"
 #include "recomp_net/address.h"
 #include "recomp_net/host_relay.h"
+#include "recomp_net/host_ice.h"
+#include "recomp_net/ice_rtt.h"
+#include "nat/rnet_sig_hold.h"
 
 /* The fallback release pin, for a build that never said what it is. The
  * server normalises an empty version to the same word. */
@@ -137,6 +141,7 @@ typedef struct {
     int local_ready;
     int all_ready;
     int launch_pending;
+    int match_active;
     RNetLobbyMatchCaps match_caps;
     /* The server's need_mods refusal: what it says we are missing, and the
      * identity of the peer that could supply it. Kept rather than reduced to
@@ -180,10 +185,9 @@ typedef struct {
      * the sender is still packing the archive. Dropped, they are simply gone
      * -- libjuice will not re-send them -- and the handshake stalls until it
      * times out. Held here and replayed in arrival order once the agent
-     * exists. */
-    RNetSignal sig_hold[24];
-    int   sig_hold_n;
-    char  sig_hold_from[RNET_LOBBY_ID_LEN];
+     * exists. One bucket per sender: a second peer's signals neither evict
+     * nor get replayed into the first's negotiation. */
+    RNetSigHold sig_hold;   /* per sending peer; see nat/rnet_sig_hold.h */
     int      xfer_last_state;    /* last RNetIceState logged */
     uint64_t xfer_started_ms;    /* for the stall watchdog */
     uint64_t xfer_connected_ms;
@@ -259,6 +263,11 @@ static uint64_t lobby_mono_ms(void)
 int rnet_lobby_send_signal(int type, int flag, const char *text);
 
 
+/* Host's preference for ICE as the host relay's path (see host_ice_step). */
+static int g_relay_via_ice_pref = 1;
+static void ice_launch_capture(void);
+static int room_relays_via_ice(void);
+
 static LobbyClient g_lc = {
     .fd = -1,
     .filter_game_version = RNET_LOBBY_DEFAULT_VERSION,
@@ -319,6 +328,20 @@ typedef struct {
 
 static LobbyAutomatch g_am = { .rtt_ms = -1, .probe_socket = -1 };
 
+/* Round trip to the lobby server, timed with the server's own ping/pong over
+ * this WebSocket, and reported (op automatch_rtt) so the server can publish
+ * each room host's figure in lobby_list. A room's latency before joining is
+ * then estimated as ours + the host's -- the fallback for a room the list
+ * probe (below) could not reach directly. */
+/* Once per connection and once per list request -- never on a timer. */
+#define SERVER_PING_TIMEOUT_MS 10000u
+static int g_srv_rtt_ms = -1;
+static int g_srv_rtt_reported = -1;
+static uint64_t g_srv_ping_sent_ms;
+static int g_srv_ping_wanted = 1;
+/* lobby_list host_rtt_ms per row (parallel to g_lc.list), -1 unknown. */
+static int g_list_host_rtt[RNET_LOBBY_MAX_LIST];
+
 static void automatch_reset_queue_state(void)
 {
     g_am.state = RNET_LOBBY_AUTOMATCH_IDLE;
@@ -359,6 +382,15 @@ static void automatch_fail(const char *why)
 
 static int set_nonblock(int fd);   /* defined with the WS socket helpers */
 static const char *effective_game_version(const char *override_ver);
+/* Every free-text value in an outbound frame goes through json_escape, and
+ * JSON_ESC_CAP is the buffer its result needs. Escaping at most doubles a
+ * value (only " \\ \n \r \t expand, each to two bytes; anything else below
+ * 0x20 is dropped), so 2x + 8 never truncates -- which matters most for a
+ * password, where a dropped character would put a secret on the wire that is
+ * not the one the host typed. Declared up here because the first frame that
+ * needs it is built well above the definition. */
+#define JSON_ESC_CAP(n) ((n) * 2 + 8)
+static size_t json_escape(const char *in, char *out, size_t cap);
 static void queue_send(const char *json);
 static void flush_pending(void);
 static int ws_send(const char *json);
@@ -367,6 +399,311 @@ static int json_get_int(const char *json, const char *key, int def);
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
 static size_t json_escape(const char *in, char *out, size_t cap);
 static void parse_match_caps_object(const char *obj, RNetLobbyMatchCaps *out);
+
+/* ---- Room list: direct latency to each room's host ----------------------
+ *
+ * When the list is requested (opened, or Refresh), each listed room gets one
+ * short ICE probe to its host: the server relays the setup as probe_signal
+ * (only between a browser and the host of a room it can see -- never a
+ * password room), the two ends link directly, the browser takes a few pings
+ * and closes it. That is the same path a join would use, so the figure is the
+ * one the match will see; the server-relative estimate above stands in only
+ * for a room whose probe could not link. Nothing runs on a timer: the
+ * server's own list pushes reuse the last measurement.
+ *
+ * Probe signals carry the probe's generation in `flag`, so a reply to a probe
+ * that a Refresh already replaced cannot land in its successor. */
+#define LIST_PROBE_CONCURRENT 4    /* the server's signal burst is ~60 */
+#define LIST_PROBE_SAMPLES 4
+#define LIST_PROBE_TIMEOUT_MS 6000u
+#define LIST_PROBE_MIN_GAP_MS 3000u  /* a Refresh hammered twice probes once */
+#define LIST_ANSWER_MAX 8
+#define LIST_ANSWER_TTL_MS 15000u
+
+enum { LP_IDLE = 0, LP_QUEUED, LP_RUNNING, LP_DONE };
+
+typedef struct ListProbe {
+    char lobby_id[RNET_LOBBY_ID_LEN];
+    int used;
+    int state;
+    int gen;
+    int rtt_ms;            /* last finished measurement, -1 none */
+    uint64_t started_ms;
+    RNetIceRttProbe *probe;
+} ListProbe;
+
+typedef struct ListAnswer {
+    char browser[RNET_LOBBY_ID_LEN];
+    int used;
+    int gen;
+    uint64_t born_ms;
+    RNetIceRttProbe *probe;
+} ListAnswer;
+
+static ListProbe g_lp[RNET_LOBBY_MAX_LIST];
+static ListAnswer g_la[LIST_ANSWER_MAX];
+static int g_list_probe_armed;
+static int g_list_probe_gen;
+static int g_list_probe_unsupported; /* this connection's server refused the op */
+
+static int list_probe_send(const char *lobby_id, const char *to, int gen,
+                           const RNetSignal *msg)
+{
+    char esc[4096];
+    char lid_esc[JSON_ESC_CAP(RNET_LOBBY_ID_LEN)];
+    char to_esc[JSON_ESC_CAP(RNET_LOBBY_ID_LEN)];
+    char out[4608];
+    if (msg->type != RNET_SIGNAL_LOCAL_SDP && msg->type != RNET_SIGNAL_LOCAL_CANDIDATE &&
+        msg->type != RNET_SIGNAL_GATHERING_DONE)
+        return -1;
+    if (!rnet_lobby_connected())
+        return -1;
+    json_escape(msg->text, esc, sizeof(esc));
+    json_escape(lobby_id, lid_esc, sizeof(lid_esc));
+    json_escape(to ? to : "", to_esc, sizeof(to_esc));
+    snprintf(out, sizeof(out),
+             "{\"op\":\"probe_signal\",\"lobby_id\":\"%s\",\"to_player_id\":\"%s\","
+             "\"type\":%d,\"flag\":%d,\"text\":\"%s\"}",
+             lid_esc, to_esc, (int)msg->type, gen, esc);
+    /* Immediately, as rnet_lobby_send_signal_to does: candidates burst. */
+    if (g_lc.handshake_done && g_lc.fd >= 0)
+        return ws_send(out) < 0 ? -1 : 0;
+    queue_send(out);
+    return 0;
+}
+
+static void list_probe_emit(const RNetSignal *msg, void *user)
+{
+    ListProbe *lp = (ListProbe *)user;
+    if (lp && lp->used)
+        (void)list_probe_send(lp->lobby_id, "", lp->gen, msg);
+}
+
+static void list_answer_emit(const RNetSignal *msg, void *user)
+{
+    ListAnswer *la = (ListAnswer *)user;
+    if (la && la->used)
+        (void)list_probe_send(g_lc.join.lobby_id, la->browser, la->gen, msg);
+}
+
+/* STUN only, like the waiting room's agents: a TURN relay would time the
+ * relay, and the point is the path a join takes. */
+static void list_probe_ice_config(RNetIceConfig *cfg, int controlling)
+{
+    const RNetLobbyTurnCredentials *tc = rnet_lobby_turn_credentials();
+    rnet_ice_config_init_defaults(cfg);
+    if (tc && tc->valid && tc->stun_host[0]) {
+        cfg->stun_host = tc->stun_host;
+        cfg->stun_port = (rnet_u16)(tc->stun_port > 0 ? tc->stun_port : 3478);
+    }
+    cfg->controlling = (rnet_u8)(controlling ? 1 : 0);
+}
+
+static void list_probe_finish(ListProbe *lp)
+{
+    const int ms = rnet_ice_rtt_ms(lp->probe);
+    if (ms >= 0)
+        lp->rtt_ms = ms;
+    rnet_ice_rtt_close(&lp->probe);
+    lp->state = LP_DONE;
+}
+
+static void list_answer_free(ListAnswer *la)
+{
+    rnet_ice_rtt_close(&la->probe);
+    memset(la, 0, sizeof(*la));
+}
+
+static void list_probe_reset(void)
+{
+    int i;
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i) {
+        if (g_lp[i].probe)
+            rnet_ice_rtt_close(&g_lp[i].probe);
+        memset(&g_lp[i], 0, sizeof(g_lp[i]));
+    }
+    for (i = 0; i < LIST_ANSWER_MAX; ++i)
+        if (g_la[i].used)
+            list_answer_free(&g_la[i]);
+    g_list_probe_armed = 0;
+    g_list_probe_unsupported = 0;
+}
+
+/* Stop every probe in flight; keep any figures already measured. */
+static void list_probe_unsupported(void)
+{
+    int i;
+    g_list_probe_unsupported = 1;
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i)
+        if (g_lp[i].used && (g_lp[i].state == LP_QUEUED || g_lp[i].state == LP_RUNNING))
+            list_probe_finish(&g_lp[i]);
+}
+
+static ListProbe *list_probe_find(const char *lobby_id)
+{
+    int i;
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i)
+        if (g_lp[i].used && strcmp(g_lp[i].lobby_id, lobby_id) == 0)
+            return &g_lp[i];
+    return NULL;
+}
+
+/* A lobby_list arrived. Forget rooms that left it; if a request armed it,
+ * queue a probe to every room that can take one. */
+static void list_probe_on_list(void)
+{
+    const uint64_t now = lobby_mono_ms();
+    const int armed = g_list_probe_armed;
+    int i, j;
+    g_list_probe_armed = 0;
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i) {
+        int listed = 0;
+        if (!g_lp[i].used)
+            continue;
+        for (j = 0; j < g_lc.list_count && !listed; ++j)
+            listed = strcmp(g_lc.list[j].lobby_id, g_lp[i].lobby_id) == 0;
+        if (!listed) {
+            if (g_lp[i].probe)
+                rnet_ice_rtt_close(&g_lp[i].probe);
+            memset(&g_lp[i], 0, sizeof(g_lp[i]));
+        }
+    }
+    if (!armed || g_list_probe_unsupported || !rnet_host_ice_available())
+        return;
+    for (j = 0; j < g_lc.list_count; ++j) {
+        const RNetLobbyRow *row = &g_lc.list[j];
+        ListProbe *lp;
+        if (!row->lobby_id[0] || row->has_password)
+            continue; /* the server refuses these; don't ask */
+        if (g_lc.in_lobby && strcmp(row->lobby_id, g_lc.join.lobby_id) == 0)
+            continue;
+        lp = list_probe_find(row->lobby_id);
+        if (!lp) {
+            for (i = 0; i < RNET_LOBBY_MAX_LIST && g_lp[i].used; ++i) {}
+            if (i == RNET_LOBBY_MAX_LIST)
+                break;
+            lp = &g_lp[i];
+            memset(lp, 0, sizeof(*lp));
+            lp->used = 1;
+            lp->rtt_ms = -1;
+            snprintf(lp->lobby_id, sizeof(lp->lobby_id), "%s", row->lobby_id);
+        }
+        if (lp->state == LP_QUEUED || lp->state == LP_RUNNING)
+            continue;
+        if (lp->state == LP_DONE && now - lp->started_ms < LIST_PROBE_MIN_GAP_MS)
+            continue;
+        lp->state = LP_QUEUED;
+    }
+}
+
+static void list_probe_pump(void)
+{
+    const uint64_t now = lobby_mono_ms();
+    int i, running = 0;
+    if (!rnet_lobby_connected())
+        return; /* the disconnected branch of the pump resets */
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i) {
+        ListProbe *lp = &g_lp[i];
+        if (!lp->used || lp->state != LP_RUNNING)
+            continue;
+        rnet_ice_rtt_pump(lp->probe);
+        if (rnet_ice_rtt_samples(lp->probe) >= LIST_PROBE_SAMPLES ||
+            now - lp->started_ms > LIST_PROBE_TIMEOUT_MS ||
+            rnet_ice_rtt_state(lp->probe) == RNET_ICE_STATE_FAILED)
+            list_probe_finish(lp);
+        else
+            running++;
+    }
+    for (i = 0; i < RNET_LOBBY_MAX_LIST && running < LIST_PROBE_CONCURRENT; ++i) {
+        ListProbe *lp = &g_lp[i];
+        RNetIceConfig cfg;
+        if (!lp->used || lp->state != LP_QUEUED)
+            continue;
+        g_list_probe_gen = g_list_probe_gen % 255 + 1;
+        lp->gen = g_list_probe_gen;
+        lp->started_ms = now;
+        list_probe_ice_config(&cfg, 1);
+        if (rnet_ice_rtt_open(&lp->probe, &cfg, list_probe_emit, lp) != 0) {
+            lp->state = LP_DONE;
+            continue;
+        }
+        lp->state = LP_RUNNING;
+        running++;
+    }
+    for (i = 0; i < LIST_ANSWER_MAX; ++i) {
+        ListAnswer *la = &g_la[i];
+        if (!la->used)
+            continue;
+        /* Answer only while this is still an open room we host. */
+        if (now - la->born_ms > LIST_ANSWER_TTL_MS || !g_lc.is_host || !g_lc.in_lobby ||
+            g_lc.launch_pending) {
+            list_answer_free(la);
+            continue;
+        }
+        rnet_ice_rtt_pump(la->probe);
+    }
+}
+
+static void list_probe_on_signal(const char *lobby_id, const char *from, int type,
+                                 int flag, const char *text)
+{
+    RNetSignal sig;
+    if (!lobby_id[0] || !from[0] || flag < 1 || flag > 255)
+        return;
+    if (type != RNET_SIGNAL_LOCAL_SDP && type != RNET_SIGNAL_LOCAL_CANDIDATE &&
+        type != RNET_SIGNAL_GATHERING_DONE)
+        return;
+    memset(&sig, 0, sizeof(sig));
+    sig.type = type == RNET_SIGNAL_LOCAL_SDP ? RNET_SIGNAL_REMOTE_SDP
+             : type == RNET_SIGNAL_LOCAL_CANDIDATE ? RNET_SIGNAL_REMOTE_CANDIDATE
+                                                   : RNET_SIGNAL_GATHERING_DONE;
+    sig.peer_slot = 0xFF;
+    snprintf(sig.text, sizeof(sig.text), "%s", text);
+    if (g_lc.is_host && g_lc.in_lobby && strcmp(lobby_id, g_lc.join.lobby_id) == 0) {
+        /* A browser probing our room. Its offer starts a fresh responder
+         * (a Refresh re-probes); anything else joins the one it belongs to. */
+        ListAnswer *la = NULL;
+        int i;
+        if (g_lc.launch_pending)
+            return;
+        for (i = 0; i < LIST_ANSWER_MAX; ++i)
+            if (g_la[i].used && strcmp(g_la[i].browser, from) == 0)
+                la = &g_la[i];
+        if (type == RNET_SIGNAL_LOCAL_SDP && (!la || la->gen != flag)) {
+            RNetIceConfig cfg;
+            if (la) {
+                list_answer_free(la);
+            } else {
+                ListAnswer *oldest = &g_la[0];
+                for (i = 0; i < LIST_ANSWER_MAX && g_la[i].used; ++i)
+                    if (g_la[i].born_ms < oldest->born_ms)
+                        oldest = &g_la[i];
+                la = i < LIST_ANSWER_MAX ? &g_la[i] : oldest;
+                if (la->used)
+                    list_answer_free(la);
+            }
+            la->used = 1;
+            la->gen = flag;
+            la->born_ms = lobby_mono_ms();
+            snprintf(la->browser, sizeof(la->browser), "%s", from);
+            list_probe_ice_config(&cfg, 0);
+            if (rnet_ice_rtt_open(&la->probe, &cfg, list_answer_emit, la) != 0) {
+                list_answer_free(la);
+                return;
+            }
+        }
+        if (la && la->probe && la->gen == flag)
+            rnet_ice_rtt_push_signal(la->probe, &sig);
+        return;
+    }
+    {
+        /* The host's answer to one of ours. The server only lets a room's
+         * host send here, and only to a browser that probed that room. */
+        ListProbe *lp = list_probe_find(lobby_id);
+        if (lp && lp->state == LP_RUNNING && lp->probe && lp->gen == flag)
+            rnet_ice_rtt_push_signal(lp->probe, &sig);
+    }
+}
 
 static void automatch_probe_close(void)
 {
@@ -739,9 +1076,12 @@ int rnet_lobby_automatch_queue(const char *ruleset_id, int mods_enabled,
              "{\"op\":\"automatch_queue\",\"titles\":[{"
              "\"game_name\":\"%s\",\"game_version\":\"%s\","
              "\"disc_fp\":\"%s\",\"ruleset_id\":\"%s\",\"max_slots\":%d}],"
-             "\"mods_enabled\":%s,\"mod_exempt\":%s%s}",
+             "\"mods_enabled\":%s,\"mod_exempt\":%s%s%s}",
              gn_esc, gv_esc, disc_fp, rid_esc, g_cfg.automatch_slots,
-             mods_enabled ? "true" : "false", exempt_json, rtt);
+             mods_enabled ? "true" : "false", exempt_json,
+             /* this client can host a match over ICE (recomp_net/host_ice.h) */
+             (g_relay_via_ice_pref && rnet_host_ice_available()) ? ",\"ice_relay\":true" : "",
+             rtt);
     queue_send(msg);
     g_am.error[0] = '\0';
     g_am.queue_in_flight = 1;
@@ -945,15 +1285,6 @@ static void queue_send(const char *json);
 static void clear_turn_credentials(void);
 static int queue_turn_credentials_request(void);
 
-/* Every free-text value in an outbound frame goes through json_escape, and
- * JSON_ESC_CAP is the buffer its result needs. Escaping at most doubles a
- * value (only " \\ \n \r \t expand, each to two bytes; anything else below
- * 0x20 is dropped), so 2x + 8 never truncates -- which matters most for a
- * password, where a dropped character would put a secret on the wire that is
- * not the one the host typed. Declared up here because the first frame that
- * needs it is built well above the definition. */
-#define JSON_ESC_CAP(n) ((n) * 2 + 8)
-static size_t json_escape(const char *in, char *out, size_t cap);
 
 static void clear_turn_credentials(void)
 {
@@ -1042,7 +1373,8 @@ static void host_relay_step(void)
     v.is_host = g_lc.is_host ? 1 : 0;
     v.active = rnet_lobby_connected() && g_lc.in_lobby && !g_lc.launch_pending &&
                !g_lc.join.local_is_spectator &&
-               g_lc.match_caps.valid && g_lc.match_caps.relay_host;
+               g_lc.match_caps.valid && g_lc.match_caps.relay_host &&
+               !room_relays_via_ice();   /* ICE mode: no port, no set_host_endpoint */
     v.bind_port = (unsigned short)lobby_bind_port();
     if (v.is_host && !v.bind_port) v.active = 0;
     v.host_endpoint = g_lc.join.host_endpoint;
@@ -1067,6 +1399,136 @@ void rnet_lobby_host_relay_release_port(void)
 static void host_relay_leave(void)
 {
     rnet_host_relay_leave(g_host_relay);
+}
+
+/* ---- host relay over ICE (recomp_net/host_ice.h) -------------------------
+ * `relay_via_ice_pref` is the HOST's setting, default ON: it publishes
+ * match_caps.relay_via = "ice" alongside relay = "host" when this build can
+ * run ICE. In that mode the waiting-room proof is an ICE agent pair per
+ * guest, NOT a probe of an advertised UDP port: no set_host_endpoint, no
+ * UPnP / NAT-PMP / STUN port (host_relay_step stands down). */
+static RNetHostIce *g_host_ice;
+
+void rnet_lobby_set_relay_via_ice(int on) { g_relay_via_ice_pref = on ? 1 : 0; }
+int  rnet_lobby_relay_via_ice(void) { return g_relay_via_ice_pref; }
+
+/* The room's published caps ask for ICE as the host relay's path. */
+static int room_relays_via_ice(void)
+{
+    return g_lc.match_caps.valid && g_lc.match_caps.relay_via_ice;
+}
+
+/* Keep the local view identical to caps_json_build's published transport.
+ * Engines supply the host-relay preference; relay_via is derived here. A
+ * zero from the engine must not tear down connected agents while the host
+ * waits for the server to echo its set_match_caps or start request. */
+static void remember_published_caps(const RNetLobbyMatchCaps *caps)
+{
+    if (!caps || !caps->valid) return;
+    g_lc.match_caps = *caps;
+    g_lc.match_caps.relay_via_ice =
+        caps->relay_host && g_relay_via_ice_pref && rnet_host_ice_available();
+}
+
+/* The waiting-room agents handed over at launch, until the engine takes them
+ * (or the room / launch is abandoned). Kept apart from g_lc: a launch that
+ * fails must still be able to say why after the lobby state is reset. */
+typedef struct {
+    int      valid;                       /* a bundle awaits take */
+    int      is_host;
+    int      n;
+    RNetLobbyIceSeat seat[RNET_HOST_ICE_MAX_PEERS];   /* host */
+    RNetIceAgent *guest;                  /* guest: connected to the host */
+    uint64_t born_ms;
+    char     error[200];
+} IceLaunch;
+static IceLaunch g_il;
+
+static void ice_launch_discard(void)
+{
+    int i;
+    for (i = 0; i < g_il.n; ++i)
+        if (g_il.seat[i].agent) rnet_host_ice_destroy_agent(g_il.seat[i].agent);
+    if (g_il.guest) rnet_host_ice_destroy_agent(g_il.guest);
+    memset(&g_il, 0, offsetof(IceLaunch, error));
+}
+
+static void host_ice_leave(void)
+{
+    ice_launch_discard();
+    g_il.error[0] = '\0';
+    rnet_host_ice_destroy(&g_host_ice);
+}
+
+static int host_ice_send_signal(const char *to, int type, int flag, const char *text,
+                                void *ctx)
+{
+    (void)ctx;
+    return rnet_lobby_send_signal_to(to, type, flag, text);
+}
+
+/* Every pump, beside host_relay_step: the room decides which agents exist. */
+static void host_ice_step(void)
+{
+    RNetHostIceView v;
+    RNetHostIcePeer peers[RNET_HOST_ICE_MAX_PEERS];
+    const RNetLobbyTurnCredentials *tc;
+    int n = 0, i;
+    if (!g_host_ice) {
+        g_host_ice = rnet_host_ice_create();
+        if (!g_host_ice) return;
+    }
+    /* A bundle nobody took (the engine declined the launch) must not hold
+     * sockets for the rest of the session. */
+    if (g_il.valid && lobby_mono_ms() - g_il.born_ms > 60000u)
+        ice_launch_discard();
+    memset(&v, 0, sizeof(v));
+    v.is_host = g_lc.is_host ? 1 : 0;
+    v.local_slot = local_member_slot();
+    v.active = rnet_lobby_connected() && g_lc.in_lobby && !g_lc.launch_pending &&
+               !g_lc.match_active && !g_lc.join.local_is_spectator && room_relays_via_ice() &&
+               v.local_slot >= 0;
+    if (v.active) {
+        if (v.is_host) {
+            for (i = 0; i < g_lc.member_count && n < RNET_HOST_ICE_MAX_PEERS; ++i) {
+                const RNetLobbyMember *m = &g_lc.members[i];
+                if (m->is_spectator || !m->player_id[0] ||
+                    strcmp(m->player_id, g_lc.player_id) == 0)
+                    continue;
+                peers[n].player_id = m->player_id;
+                peers[n].slot = m->slot;
+                n++;
+            }
+        } else {
+            const int hs = member_slot_for_player(g_lc.host_player_id);
+            if (g_lc.host_player_id[0] && hs >= 0) {
+                peers[0].player_id = g_lc.host_player_id;
+                peers[0].slot = hs;
+                n = 1;
+            } else {
+                v.active = 0;
+            }
+        }
+    }
+    v.peers = peers;
+    v.peer_count = n;
+    /* STUN only. The lobby's Coturn mint is deliberately not used: hub agents
+     * never use TURN. */
+    tc = rnet_lobby_turn_credentials();
+    if (tc && tc->valid && tc->stun_host[0]) {
+        v.stun_host = tc->stun_host;
+        v.stun_port = (unsigned short)(tc->stun_port > 0 ? tc->stun_port : 3478);
+    }
+    v.send_signal = host_ice_send_signal;
+    v.send_json = host_relay_send;
+    rnet_host_ice_update(g_host_ice, &v);
+}
+
+int rnet_lobby_host_ice_status(RNetHostIceStatus *out)
+{
+    if (!out) return 0;
+    rnet_host_ice_status(g_host_ice, out);
+    return out->role != 0;
 }
 
 static int json_extract_object(const char *json, const char *key, char *out, size_t out_cap);
@@ -1386,7 +1848,7 @@ static int parse_mod_pkg_array(const char *json, const char *key,
     p++;
 
     while (*p && n < max) {
-        char obj[512];
+        char obj[1024];
         const char *start;
         int depth = 0;
         int in_str = 0;
@@ -1419,6 +1881,7 @@ static int parse_mod_pkg_array(const char *json, const char *key,
         json_get_str(obj, "ver", row.ver, sizeof(row.ver));
         json_get_str(obj, "n", row.name, sizeof(row.name));
         json_get_str(obj, "f", row.feats, sizeof(row.feats));
+        json_get_str(obj, "nf", row.nf, sizeof(row.nf));
         if (!row.id[0] || !row.ver[0])
             continue;
         out[n++] = row;
@@ -1446,6 +1909,7 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
         char ver_esc[JSON_ESC_CAP(RNET_LOBBY_MOD_VER_LEN)];
         char name_esc[RNET_LOBBY_MOD_NAME_LEN * 2 + 4];
         char feats_esc[RNET_LOBBY_MOD_FEATS_LEN * 2 + 4];
+        char nf_esc[RNET_LOBBY_MOD_FEATS_LEN * 2 + 4];
         if (!pkgs[i].id[0] || !pkgs[i].ver[0]) continue;
         /* id and ver are escaped for the same reason n and f already were:
          * they come from package metadata, which a crafted package -- or an
@@ -1454,10 +1918,15 @@ static int append_mod_pkg_array(char *dst, size_t cap, const char *key,
         json_escape(pkgs[i].ver, ver_esc, sizeof(ver_esc));
         json_escape(pkgs[i].name, name_esc, sizeof(name_esc));
         json_escape(pkgs[i].feats, feats_esc, sizeof(feats_esc));
+        json_escape(pkgs[i].nf, nf_esc, sizeof(nf_esc));
+        /* "nf" only when there is something to say: it is an offer-row field,
+         * and an absent key already reads as "nothing missing". */
         n = snprintf(dst + used, cap - used,
-                     "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"}",
+                     "%s{\"id\":\"%s\",\"ver\":\"%s\",\"n\":\"%s\",\"f\":\"%s\"%s%s%s}",
                      wrote ? "," : "",
-                     id_esc, ver_esc, name_esc, feats_esc);
+                     id_esc, ver_esc, name_esc, feats_esc,
+                     nf_esc[0] ? ",\"nf\":\"" : "", nf_esc,
+                     nf_esc[0] ? "\"" : "");
         if (n < 0 || (size_t)n >= cap - used) return 0;
         used += (size_t)n;
         wrote++;
@@ -1482,6 +1951,9 @@ static void *g_mod_offer_ctx;
  * rnet_lobby_disconnect memsets g_lc, and a setting made before a reconnect
  * must still be there when the create goes out. */
 static int g_allow_spectators_pref;
+/* rnet_lobby_set_launch_blocked: file scope for the same reason -- whether
+ * this peer has a game image to boot does not change on a reconnect. */
+static int g_launch_blocked;
 
 static RNetLobbyModExportFn  g_mod_export_fn;
 static RNetLobbyModFreeFn    g_mod_free_fn;
@@ -1579,6 +2051,12 @@ static void parse_match_caps_object(const char *obj, RNetLobbyMatchCaps *out)
         json_get_str(obj, "relay", relay, sizeof(relay));
         out->relay_host = strcmp(relay, "host") == 0 ? 1 : 0;
     }
+    {
+        char via[12];
+        via[0] = '\0';
+        json_get_str(obj, "relay_via", via, sizeof(via));
+        out->relay_via_ice = strcmp(via, "ice") == 0 ? 1 : 0;
+    }
     out->rollback = json_get_bool(obj, "rollback", 1) ? 1 : 0;
     /* The engine's own keys last, into an ext that match_caps_clear zeroed. */
     if (g_codec.parse_extra) g_codec.parse_extra(obj, out, g_codec.ctx);
@@ -1646,7 +2124,11 @@ static int append_match_caps_json(char *dst, size_t dst_cap, const RNetLobbyMatc
                  caps->input_delay, pred, variant,
                  caps->force_turn ? "true" : "false",
                  caps->force_input_relay ? "true" : "false",
-                 caps->relay_host ? "\"relay\":\"host\"," : "",
+                 caps->relay_host
+                     ? ((g_relay_via_ice_pref && rnet_host_ice_available())
+                            ? "\"relay\":\"host\",\"relay_via\":\"ice\","
+                            : "\"relay\":\"host\",")
+                     : "",
                  caps->rollback ? "true" : "false",
                  extra, mods, set_esc, allow_esc);
     if (n < 0 || (size_t)n >= dst_cap) return 0;
@@ -1802,8 +2284,21 @@ static int endpoint_has_usable_port(const char *endpoint)
     return port != 0;
 }
 
+/* Set by each launch: the server named peer-to-peer ICE and allocated no
+ * relay. Its endpoints then carry no relay meaning, however they compare. */
+static int g_launch_named_ice;
+
 static int using_server_input_relay(const RNetLobbyJoinInfo *j)
 {
+    /* Two peers behind one NAT -- two instances on one machine, two players
+     * on one home network -- can advertise the same public ip:port: with the
+     * host relay's port taken first-free from 7777 and the guest's first-free
+     * from 7778, a busy 7777 puts both on :7778. The equal-endpoints rule
+     * below read that as "the server rewrote both to its relay", so an ICE
+     * launch dialled the host's own public address over UDP with nothing
+     * listening, and timed out after 30 s. The server's word wins. */
+    if (g_launch_named_ice)
+        return 0;
     if (g_lc.match_caps.valid && g_lc.match_caps.force_input_relay)
         return 1;
     /* Server rewrote both endpoints to the same relay advertise address. */
@@ -1823,7 +2318,11 @@ static void fill_peer_bind_from_join(void)
     const int force_relay = !j->transport_host && using_server_input_relay(j);
     memset(j->bind_hostport, 0, sizeof(j->bind_hostport));
     memset(j->peer_hostport, 0, sizeof(j->peer_hostport));
-    if (force_relay) {
+    if (j->transport_ice_hub || j->transport_ice_pair) {
+        /* Nothing to bind or dial: the agents are already connected. Kept
+         * non-empty so a legacy consumer's "usable bind" check passes. */
+        strncpy(j->bind_hostport, "0.0.0.0:0", sizeof(j->bind_hostport) - 1);
+    } else if (force_relay) {
         /* Everyone dials the lobby-server UDP relay — ephemeral local bind. */
         strncpy(j->bind_hostport, "0.0.0.0:0", sizeof(j->bind_hostport) - 1);
         strncpy(j->peer_hostport, j->host_endpoint, sizeof(j->peer_hostport) - 1);
@@ -2232,6 +2731,7 @@ static void handle_server_json(const char *json)
             while (*p && *p != '{') {
                 if (*p == ']') {
                     g_lc.list_count = n;
+                    list_probe_on_list();
                     return;
                 }
                 ++p;
@@ -2288,22 +2788,27 @@ static void handle_server_json(const char *json)
                     g_lc.list[n].allow_spectators = json_get_bool(chunk, "allow_spectators", 0);
                     g_lc.list[n].max_spectators = json_get_int(chunk, "max_spectators", 0);
                     g_lc.list[n].spectator_count = json_get_int(chunk, "spectator_count", 0);
+                    g_list_host_rtt[n] = json_get_int(chunk, "host_rtt_ms", -1);
                     ++n;
                     p = end;
                 }
             }
         }
         g_lc.list_count = n;
+        list_probe_on_list();
         return;
     }
     if (strcmp(op, "created") == 0) {
         /* A new room starts with an empty log -- carrying the last room's
          * lines in would show a conversation nobody in this one had. */
         rnet_lobby_chat_clear();
+        ice_launch_discard();
         g_lc.in_lobby = 1;
         g_lc.is_host = 1;
         g_lc.join.ok = 1;
         g_lc.launch_pending = 0;
+        g_lc.join.transport_ice_hub = g_lc.join.transport_ice_pair = 0;
+        g_lc.match_active = 0;
         g_lc.all_ready = 0;
         member_rtt_clear();
         json_get_str(json, "lobby_id", g_lc.join.lobby_id, sizeof(g_lc.join.lobby_id));
@@ -2360,10 +2865,13 @@ static void handle_server_json(const char *json)
             (g_am.state == RNET_LOBBY_AUTOMATCH_ACCEPTED ||
              g_am.state == RNET_LOBBY_AUTOMATCH_FOUND);
         automatch_reset_queue_state();
+        ice_launch_discard();
         g_lc.in_lobby = 1;
         g_lc.is_host = 0;
         g_lc.join.ok = 1;
         g_lc.launch_pending = 0;
+        g_lc.join.transport_ice_hub = g_lc.join.transport_ice_pair = 0;
+        g_lc.match_active = 0;
         g_lc.all_ready = 0;
         member_rtt_clear();
         json_get_str(json, "lobby_id", g_lc.join.lobby_id, sizeof(g_lc.join.lobby_id));
@@ -2396,6 +2904,20 @@ static void handle_server_json(const char *json)
         ingest_match_caps_from_json(json);
         fill_peer_bind_from_join();
         parse_slots_array(json);
+        /* The server clears every guest's path report on a roster change and
+         * says so only by omitting `path` from the seat rows: prove ours again
+         * now (rnet_host_relay_path_cleared). */
+        {
+            int i;
+            for (i = 0; i < g_lc.member_count; ++i) {
+                const RNetLobbyMember *m = &g_lc.members[i];
+                if (m->is_spectator || !g_lc.player_id[0] ||
+                    strcmp(m->player_id, g_lc.player_id) != 0)
+                    continue;
+                if (!m->path[0]) rnet_host_relay_path_cleared(g_host_relay);
+                break;
+            }
+        }
         /* Kick/move/start clear ready; re-arm so host Play keeps working on
          * servers that still require all_ready.
          *
@@ -2407,7 +2929,8 @@ static void handle_server_json(const char *json)
          * thousands of frames per second across the room, behind which the
          * rematch's op:launch was never read (Genesis, 4 players + 1
          * spectator, round 2: no peer launched). */
-        if (g_lc.in_lobby && !g_lc.local_ready && !g_lc.join.local_is_spectator) {
+        if (g_lc.in_lobby && !g_lc.local_ready && !g_lc.join.local_is_spectator &&
+            !g_launch_blocked) {
             send_set_ready(1);
             flush_pending();
         }
@@ -2427,7 +2950,12 @@ static void handle_server_json(const char *json)
         transport[0] = '\0';
         json_get_str(json, "transport", transport, sizeof(transport));
         g_lc.join.transport_host = strcmp(transport, "host") == 0 ? 1 : 0;
+        g_launch_named_ice = (strcmp(transport, "ice") == 0 ||
+                              strcmp(transport, "ice_p2p") == 0) &&
+                             !relay_endpoint[0];
         rnet_host_relay_release_port(g_host_relay);
+        ice_launch_discard();   /* a previous launch's agents are never reused */
+        g_il.error[0] = '\0';
         g_lc.join.player_count = json_get_int(json, "player_count", g_lc.join.player_count);
         g_lc.join.max_slots = json_get_int(json, "max_slots", g_lc.join.max_slots);
         g_lc.join.session_id = (uint32_t)json_get_int(json, "session_id", (int)g_lc.join.session_id);
@@ -2435,6 +2963,22 @@ static void handle_server_json(const char *json)
          * session slot from it, so it is read here and nowhere else. */
         g_lc.join.host_spectates = json_get_bool(json, "host_spectates", 0);
         ingest_match_caps_from_json(json);
+        /* The server echoes relay_via in the launch (and in launch.match_caps).
+         * "ice" with transport "host" = the host carries the match over the
+         * waiting-room agents; host_endpoint is empty by design. */
+        {
+            /* Decided by THIS launch alone (top level or its match_caps), never
+             * by caps carried over from an earlier message. */
+            char via[12];
+            via[0] = '\0';
+            json_get_str(json, "relay_via", via, sizeof(via));
+            g_lc.match_caps.relay_via_ice = !strcmp(via, "ice") ? 1 : 0;
+            if (g_lc.match_caps.relay_via_ice) g_lc.match_caps.valid = 1;
+        }
+        g_lc.join.transport_ice_hub =
+            (g_lc.join.transport_host && g_lc.match_caps.relay_via_ice) ? 1 : 0;
+        g_lc.join.transport_ice_pair =
+            g_launch_named_ice && g_lc.match_caps.relay_via_ice;
         if (relay_endpoint[0] && endpoint_has_usable_port(relay_endpoint)) {
             strncpy(g_lc.join.host_endpoint, relay_endpoint,
                     sizeof(g_lc.join.host_endpoint) - 1);
@@ -2466,6 +3010,23 @@ static void handle_server_json(const char *json)
         parse_slots_array(json);
         /* Guest must know the host. Host may leave peer empty to learn the
          * guest from the first UDP packet (LAN / legacy guest_bind :0). */
+        if (g_lc.join.transport_ice_hub || g_lc.join.transport_ice_pair) {
+            /* No endpoints: the match rides the agents already connected in
+             * the waiting room. Capture them NOW, before the next pump's view
+             * (launch_pending) tears them down; the engine takes them. */
+            ice_launch_capture();
+            if (g_il.error[0]) {
+                strncpy(g_lc.join.last_error, "ice_not_connected",
+                        sizeof(g_lc.join.last_error) - 1);
+                g_lc.launch_pending = 0;
+                fprintf(stderr, "rnet_lobby: launch refused - %s\n", g_il.error);
+                return;
+            }
+            g_lc.join.ok = 1;
+            g_lc.join.last_error[0] = '\0';
+            g_lc.launch_pending = 1;
+            return;
+        }
         if (!g_lc.join.host_endpoint[0] || !g_lc.join.bind_hostport[0] ||
             (!g_lc.is_host && !g_lc.join.peer_hostport[0] &&
              !using_server_input_relay(&g_lc.join))) {
@@ -2533,6 +3094,18 @@ static void handle_server_json(const char *json)
                   json_get_bool(json, "system", 0));
         return;
     }
+    if (strcmp(op, "probe_signal") == 0) {
+        char text[2048];
+        char from[RNET_LOBBY_ID_LEN];
+        char lid[RNET_LOBBY_ID_LEN];
+        text[0] = from[0] = lid[0] = '\0';
+        json_get_str(json, "text", text, sizeof(text));
+        json_get_str(json, "from_player_id", from, sizeof(from));
+        json_get_str(json, "lobby_id", lid, sizeof(lid));
+        list_probe_on_signal(lid, from, json_get_int(json, "type", 0),
+                             json_get_int(json, "flag", 0), text);
+        return;
+    }
     if (strcmp(op, "signal") == 0) {
         char text[2048];
         char from[RNET_LOBBY_ID_LEN];
@@ -2584,6 +3157,22 @@ static void handle_server_json(const char *json)
             mod_xfer_fail(text[0] ? text : "the host refused");
             return;
         }
+        if (rnet_host_ice_sig_is_ours(type)) {
+            /* Host-relay-over-ICE waiting-room agents. Dispatched by the
+             * sender's player id, which the SERVER stamps (a client cannot
+             * choose it); only a seated player is a peer, and the seat is
+             * looked up here, never read from the payload. */
+            const int from_slot = member_slot_for_player(from);
+            if (!g_host_ice || !from[0] || from_slot < 0 ||
+                member_is_spectator(from)) {
+                fprintf(stderr, "rnet_lobby: host-ice signal from \"%s\" refused "
+                                "(not a seated player)\n", from);
+                return;
+            }
+            (void)rnet_host_ice_push_signal(g_host_ice, from, from_slot, type, flag,
+                                            text);
+            return;
+        }
         if (type > RNET_LOBBY_SIG_MOD_ICE_BASE &&
             type <= RNET_LOBBY_SIG_MOD_ICE_BASE + 6) {
             /* Only from the peer we are actually transferring with. An SDP
@@ -2595,28 +3184,19 @@ static void handle_server_json(const char *json)
             memset(&sig, 0, sizeof(sig));
             sig.type = (RNetSignalType)t;
             sig.flag = (rnet_u8)flag;
+            sig.peer_slot = 0xFF;
             snprintf(sig.text, sizeof(sig.text), "%s", text);
             if (g_lc.xfer && from[0] && !strcmp(from, g_lc.xfer_peer)) {
                 rnet_ice_xfer_push_signal(g_lc.xfer, &sig);
             } else if (from[0]) {
-                /* No agent yet: the sender is still packing. Hold it. */
-                if (g_lc.sig_hold_n == 0 ||
-                    strcmp(g_lc.sig_hold_from, from) != 0) {
-                    g_lc.sig_hold_n = 0;
-                    snprintf(g_lc.sig_hold_from, sizeof(g_lc.sig_hold_from),
-                             "%s", from);
-                }
-                if (g_lc.sig_hold_n <
-                    (int)(sizeof(g_lc.sig_hold) / sizeof(g_lc.sig_hold[0]))) {
-                    g_lc.sig_hold[g_lc.sig_hold_n++] = sig;
-                } else {
-                    /* Overflowing means the peer gathered far more candidates
-                     * than a handshake needs while we did nothing with them --
-                     * dropping the newest keeps the offer, which is the one
-                     * that matters. */
+                /* No agent yet: the sender is still packing. Hold it, in the
+                 * sender's own bucket. Overflowing means the peer gathered far
+                 * more candidates than a handshake needs while we did nothing
+                 * with them -- the newest is dropped, which keeps the offer. */
+                if (rnet_sig_hold_push(&g_lc.sig_hold, from, -1, &sig,
+                                       lobby_mono_ms()) != 0)
                     fprintf(stderr, "rnet_lobby: ICE hold buffer full; "
                                     "dropping a candidate\n");
-                }
             }
             return;
         }
@@ -2778,7 +3358,34 @@ static void handle_server_json(const char *json)
     if (strcmp(op, "automatch_rtt_ok") == 0) {
         return;   /* acknowledgement only */
     }
+    if (strcmp(op, "pong") == 0) {
+        uint64_t now = lobby_mono_ms();
+        if (g_srv_ping_sent_ms && now >= g_srv_ping_sent_ms) {
+            int ms = (int)(now - g_srv_ping_sent_ms);
+            if (ms > 2000) ms = 2000; /* the server clamps reports here too */
+            g_srv_rtt_ms = g_srv_rtt_ms < 0 ? ms : (g_srv_rtt_ms * 3 + ms + 2) / 4;
+            g_srv_ping_sent_ms = 0;
+            /* Report the first figure, then only real changes. */
+            if (g_srv_rtt_reported < 0 || g_srv_rtt_ms > g_srv_rtt_reported + 5 ||
+                g_srv_rtt_ms + 5 < g_srv_rtt_reported) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "{\"op\":\"automatch_rtt\",\"rtt_ms\":%d}", g_srv_rtt_ms);
+                queue_send(msg);
+                g_srv_rtt_reported = g_srv_rtt_ms;
+            }
+        }
+        return;
+    }
     if (strcmp(op, "error") == 0) {
+        char detail[32];
+        detail[0] = '\0';
+        json_get_str(json, "detail", detail, sizeof(detail));
+        if (strcmp(detail, "probe_signal") == 0) {
+            /* A server that predates the list probe: not a join failure, and
+             * not worth asking again on this connection. The estimate stands. */
+            list_probe_unsupported();
+            return;
+        }
         json_get_str(json, "code", g_lc.join.last_error, sizeof(g_lc.join.last_error));
         /* An automatch refusal arrives as a plain error, so it has to be
          * claimed here or it would be filed as a join failure and the queue
@@ -2830,6 +3437,7 @@ static void handle_server_json(const char *json)
          * reset on `joined` above should already have done this; repeating it
          * here means a missed or reordered `joined` cannot strand the gate. */
         automatch_reset_queue_state();
+        ice_launch_discard();
         g_am.in_automatch_room = 0;   /* no longer seated anywhere */
         g_lc.swap_in_valid = 0;
         g_lc.swap_out = 0;
@@ -2975,6 +3583,8 @@ void rnet_lobby_disconnect(void)
          * first is the difference between ending a transfer and leaking a
          * live UDP socket every time the lobby reconnects. */
         if (g_lc.xfer) rnet_ice_xfer_close(&g_lc.xfer);
+        rnet_sig_hold_clear(&g_lc.sig_hold);   /* buckets are heap */
+        host_ice_leave();                      /* agents + any launch bundle */
         strncpy(dname, g_lc.display_name, sizeof(dname) - 1);
         dname[sizeof(dname) - 1] = '\0';
         /* The game identity is what this BUILD is, not what this connection
@@ -3054,6 +3664,7 @@ void rnet_lobby_pump(void)
     /* Host relay: hold / probe / report to match the room. Before the
      * connected() check so a dropped WS releases the port the same pump. */
     host_relay_step();
+    host_ice_step();
     /* Driven from the lobby pump so a transfer runs while the player sits in
      * the waiting room -- which is the only time one happens. Deliberately
      * before the connected() check: an agent mid-handshake still has to be
@@ -3064,8 +3675,24 @@ void rnet_lobby_pump(void)
      * nothing else would drive it. Before the connected() check so an
      * outstanding probe still times out cleanly if the WS drops. */
     automatch_probe_poll();
+    list_probe_pump();
     if (!rnet_lobby_connected()) {
+        g_srv_ping_sent_ms = 0;
+        g_srv_ping_wanted = 1;   /* time the next connection once */
+        g_srv_rtt_reported = -1; /* a new connection is a new record */
+        list_probe_reset();
         return;
+    }
+    {
+        uint64_t now = lobby_mono_ms();
+        if (g_srv_ping_sent_ms && now - g_srv_ping_sent_ms > SERVER_PING_TIMEOUT_MS)
+            g_srv_ping_sent_ms = 0; /* lost: the next list request asks again */
+        if (g_srv_ping_wanted && !g_srv_ping_sent_ms) {
+            queue_send("{\"op\":\"ping\"}");
+            flush_pending();
+            g_srv_ping_sent_ms = now;
+            g_srv_ping_wanted = 0;
+        }
     }
     if (g_lc.tx_failed) {
         rnet_lobby_disconnect();
@@ -3273,11 +3900,47 @@ void rnet_lobby_request_list(void)
 {
     queue_list_request();
     flush_pending();
+    /* An explicit request (first open, Refresh) is the one moment the list's
+     * latencies are measured; the server's change pushes are not. */
+    g_srv_ping_wanted = 1;
+    g_list_probe_armed = 1;
 }
 
 int rnet_lobby_list_count(void)
 {
     return g_lc.list_count;
+}
+
+int rnet_lobby_server_rtt_ms(void)
+{
+    return rnet_lobby_connected() ? g_srv_rtt_ms : -1;
+}
+
+int rnet_lobby_list_latency_estimate_ms(int index)
+{
+    int host;
+    if (index < 0 || index >= g_lc.list_count)
+        return -1;
+    host = g_list_host_rtt[index];
+    if (host < 0 || rnet_lobby_server_rtt_ms() < 0)
+        return -1;
+    return g_srv_rtt_ms + host;
+}
+
+int rnet_lobby_list_latency_ms(int index, int *is_direct)
+{
+    const ListProbe *lp;
+    if (is_direct)
+        *is_direct = 0;
+    if (index < 0 || index >= g_lc.list_count)
+        return -1;
+    lp = list_probe_find(g_lc.list[index].lobby_id);
+    if (lp && lp->rtt_ms >= 0) {
+        if (is_direct)
+            *is_direct = 1;
+        return lp->rtt_ms;
+    }
+    return rnet_lobby_list_latency_estimate_ms(index);
 }
 
 int rnet_lobby_list_get(int index, RNetLobbyRow *out)
@@ -3357,7 +4020,7 @@ int rnet_lobby_create(const char *name, const char *game_name,
     strncpy(g_lc.my_bind, host_bind && host_bind[0] ? host_bind : "0.0.0.0:7777",
             sizeof(g_lc.my_bind) - 1);
     g_lc.join.last_error[0] = '\0';
-    if (match_caps && match_caps->valid) g_lc.match_caps = *match_caps;
+    remember_published_caps(match_caps);
     caps_json_build(caps_json, sizeof(caps_json), match_caps, "create");
     json_escape(name && name[0] ? name : "Lobby", name_esc, sizeof(name_esc));
     json_escape(gn, gn_esc, sizeof(gn_esc));
@@ -3454,7 +4117,11 @@ int rnet_lobby_join(const char *lobby_id, const char *password, const char *gues
 
 int rnet_lobby_leave(void)
 {
+    g_lc.match_active = 0;
+    g_lc.join.transport_ice_hub = g_lc.join.transport_ice_pair = 0;
     host_relay_leave(); /* unmap the router, close the port, forget reports */
+    ice_launch_discard();
+    g_il.error[0] = '\0';
     queue_send("{\"op\":\"leave\"}");
     flush_pending();
     g_lc.in_lobby = 0;
@@ -3568,7 +4235,7 @@ int rnet_lobby_set_match_caps(const RNetLobbyMatchCaps *caps)
     int n;
     if (!rnet_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host || !caps || !caps->valid)
         return -1;
-    g_lc.match_caps = *caps;
+    remember_published_caps(caps);
     caps_json_build(caps_json, sizeof(caps_json), caps, "set_match_caps");
     n = snprintf(msg, sizeof(msg), "{\"op\":\"set_match_caps\"%s}", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
@@ -3809,15 +4476,31 @@ int rnet_lobby_member_get(int index, RNetLobbyMember *out)
 int rnet_lobby_member_latency_ms(int slot)
 {
     const int idx = rtt_index_for_slot(slot);
-    if (idx < 0)
-        return -1;
+    const int me = local_member_slot();
+    int host_row = 0;
+    if (idx < 0 || slot == me)
+        return -1; /* our own row: no latency to ourselves */
     if (g_lc.host_player_id[0]) {
         int i;
         for (i = 0; i < g_lc.member_count; ++i) {
             if (g_lc.members[i].slot == slot &&
                 strcmp(g_lc.members[i].player_id, g_lc.host_player_id) == 0)
-                return -1; /* host row */
+                host_row = 1;
         }
+    }
+    /* The direct link's round trip to that peer when the waiting room has
+     * one; the server-relayed ping only stands in until then. */
+    {
+        const int ice_ms = rnet_host_ice_peer_rtt_ms(g_host_ice, slot);
+        if (ice_ms >= 0)
+            return ice_ms;
+    }
+    /* A guest's row for the host used to read nothing at all: the only
+     * figure it had (its own ping to the host, through the server) was kept
+     * on the guest's own row. Show it where it belongs. */
+    if (host_row) {
+        const int mine = me >= 0 ? rtt_index_for_slot(me) : -1;
+        return mine >= 0 ? g_lc.member_rtt_ms[mine] : -1;
     }
     return g_lc.member_rtt_ms[idx];
 }
@@ -3855,6 +4538,9 @@ static void send_set_ready(int ready)
     char offer[RNET_LOBBY_MAX_MODS * 256 + 64];
     int n;
 
+    /* Every caller, the auto-arms included: a peer with nothing to boot is
+     * not ready, whoever asks. */
+    if (g_launch_blocked) ready = 0;
     offer[0] = '\0';
     if (g_mod_offer_fn && !append_mod_offer(offer, sizeof(offer))) {
         /* Ready without the offer rather than not ready at all: the host's
@@ -3883,6 +4569,42 @@ int rnet_lobby_set_ready(int ready)
     send_set_ready(ready);
     flush_pending();
     return 0;
+}
+
+void rnet_lobby_set_launch_blocked(int blocked)
+{
+    blocked = blocked ? 1 : 0;
+    if (blocked == g_launch_blocked) return;
+    g_launch_blocked = blocked;
+    fprintf(stderr, "rnet_lobby: %s\n",
+            blocked ? "no bootable game image; announcing not ready"
+                    : "game image ready; announcing ready");
+    /* A spectator's ready is never read back (see lobby_update). */
+    if (!rnet_lobby_connected() || !g_lc.in_lobby ||
+        g_lc.join.local_is_spectator)
+        return;
+    send_set_ready(!blocked);
+    flush_pending();
+}
+
+int rnet_lobby_match_blocked_by_unready(char *who, size_t who_cap)
+{
+    int n;
+    int blocked = 0;
+
+    if (who && who_cap) who[0] = '\0';
+    if (!g_lc.in_lobby)
+        return 0;
+    for (n = 0; n < g_lc.member_count; ++n) {
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            continue;              /* the host checks its own image locally */
+        if (g_lc.members[n].is_spectator || g_lc.members[n].ready)
+            continue;
+        ++blocked;
+        if (who && who_cap && !who[0])
+            snprintf(who, who_cap, "%s", g_lc.members[n].display_name);
+    }
+    return blocked;
 }
 
 /*
@@ -4044,12 +4766,120 @@ int rnet_lobby_local_missing_mods(void)
     return 0;
 }
 
+/* Is `item` one of the entries of the comma-separated `list`? */
+static int csv_has(const char *list, const char *item, size_t item_len)
+{
+    const char *p = list;
+    if (!list || !item || !item_len) return 0;
+    while (*p) {
+        const char *end = strchr(p, ',');
+        const size_t len = end ? (size_t)(end - p) : strlen(p);
+        if (len == item_len && !strncmp(p, item, len)) return 1;
+        if (!end) break;
+        p = end + 1;
+    }
+    return 0;
+}
+
+/* Plan features the member at `n` holds the package for but has not provided
+ * the required files for, by its own offer. Appends "package/feature" pairs,
+ * ';'-separated, to `what` when given. A package the peer lacks entirely is
+ * counted by member_missing_count instead -- it cannot have files for code it
+ * does not have, and the remedy (download it) is a different one. */
+static int member_files_missing_count(int n, char *what, size_t what_cap)
+{
+    const RNetLobbyMatchCaps *caps = &g_lc.match_caps;
+    int missing = 0;
+    int i;
+    int j;
+
+    if (what && what_cap) what[0] = '\0';
+    if (n < 0 || n >= RNET_LOBBY_MAX_MEMBERS)
+        return 0;
+    for (i = 0; i < caps->mod_count; ++i) {
+        const RNetLobbyModPkg *offer = NULL;
+        const char *p;
+        for (j = 0; j < g_lc.member_offer_count[n]; ++j)
+            if (!strcmp(g_lc.member_offer[n][j].id, caps->mods[i].id)) {
+                offer = &g_lc.member_offer[n][j];
+                break;
+            }
+        if (!offer || !offer->nf[0])
+            continue;
+        for (p = caps->mods[i].feats; *p;) {
+            const char *end = strchr(p, ',');
+            const size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (csv_has(offer->nf, p, len)) {
+                missing++;
+                if (what && what_cap) {
+                    const size_t used = strlen(what);
+                    snprintf(what + used, what_cap - used, "%s%s/%.*s",
+                             used ? ";" : "", caps->mods[i].id, (int)len, p);
+                }
+            }
+            if (!end) break;
+            p = end + 1;
+        }
+    }
+    return missing;
+}
+
+int rnet_lobby_match_blocked_by_files(char *who, size_t who_cap,
+                                      char *what, size_t what_cap)
+{
+    int n;
+    int blocked = 0;
+
+    if (who && who_cap) who[0] = '\0';
+    if (what && what_cap) what[0] = '\0';
+    if (!g_lc.in_lobby || g_lc.match_caps.mod_count <= 0)
+        return 0;
+    for (n = 0; n < g_lc.member_count; ++n) {
+        char pairs[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_FEATS_LEN + 2];
+        int missing;
+        if (!strcmp(g_lc.members[n].player_id, g_lc.player_id))
+            continue;              /* the host checks its own files locally */
+        if (g_lc.members[n].is_spectator)
+            continue;
+        missing = member_files_missing_count(n, pairs, sizeof(pairs));
+        if (missing <= 0)
+            continue;
+        blocked += missing;
+        if (who && who_cap && !who[0])
+            snprintf(who, who_cap, "%s", g_lc.members[n].display_name);
+        if (what && what_cap && !what[0]) {
+            const char *semi = strchr(pairs, ';');
+            snprintf(what, what_cap, "%.*s",
+                     semi ? (int)(semi - pairs) : (int)strlen(pairs), pairs);
+        }
+    }
+    return blocked;
+}
+
+int rnet_lobby_member_mod_readiness(int index, int *mods_missing,
+                                    int *files_missing, char *files,
+                                    size_t files_cap)
+{
+    if (mods_missing) *mods_missing = 0;
+    if (files_missing) *files_missing = 0;
+    if (files && files_cap) files[0] = '\0';
+    if (!g_lc.in_lobby || index < 0 || index >= g_lc.member_count ||
+        g_lc.match_caps.mod_count <= 0)
+        return 0;
+    if (mods_missing) *mods_missing = member_missing_count(index);
+    if (files_missing)
+        *files_missing = member_files_missing_count(index, files, files_cap);
+    else
+        (void)member_files_missing_count(index, files, files_cap);
+    return 1;
+}
+
 int rnet_lobby_request_start(const RNetLobbyMatchCaps *match_caps)
 {
     char msg[RNET_LOBBY_MAX_MODS * 256 + 1024];
     char caps_json[RNET_LOBBY_MAX_MODS * 256 + 512];
     char who[RNET_LOBBY_NAME_LEN];
-    char what[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_VER_LEN + 2];
+    char what[RNET_LOBBY_MOD_ID_LEN + RNET_LOBBY_MOD_FEATS_LEN + 2];
     int n;
     if (!rnet_lobby_connected() || !g_lc.in_lobby || !g_lc.is_host) {
         return -1;
@@ -4070,7 +4900,39 @@ int rnet_lobby_request_start(const RNetLobbyMatchCaps *match_caps)
                 who[0] ? who : "a player", what[0] ? what : "a required mod");
         return -1;
     }
-    if (match_caps && match_caps->valid) g_lc.match_caps = *match_caps;
+    /* Having the package is not enough when one of its enabled features runs
+     * on an owner-supplied file (another game's ROM, say): the peer's commit
+     * would refuse the plan at launch. Hold here instead, where the host can
+     * see who is still choosing a file. */
+    if (rnet_lobby_match_blocked_by_files(who, sizeof(who), what,
+                                          sizeof(what)) > 0) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "peer_needs_files");
+        fprintf(stderr,
+                "rnet_lobby: not starting -- %s has not selected the files %s "
+                "needs (and possibly more).\n",
+                who[0] ? who : "a player", what[0] ? what : "a required mod");
+        return -1;
+    }
+    /* Nothing above helps a peer that has no game to boot: it would be
+     * launched into a match it never joins. It says so by staying not ready
+     * (rnet_lobby_set_launch_blocked). */
+    if (g_launch_blocked) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "local_not_ready");
+        fprintf(stderr, "rnet_lobby: not starting -- this peer has no "
+                        "bootable game image.\n");
+        return -1;
+    }
+    if (rnet_lobby_match_blocked_by_unready(who, sizeof(who)) > 0) {
+        snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error),
+                 "peer_not_ready");
+        fprintf(stderr, "rnet_lobby: not starting -- %s is not ready (no "
+                        "game image selected, or still settling).\n",
+                who[0] ? who : "a player");
+        return -1;
+    }
+    remember_published_caps(match_caps);
     caps_json_build(caps_json, sizeof(caps_json), match_caps, "start");
     n = snprintf(msg, sizeof(msg), "{\"op\":\"start\"%s}", caps_json);
     if (n < 0 || (size_t)n >= sizeof(msg)) return -1;
@@ -4089,10 +4951,109 @@ void rnet_lobby_clear_launch_pending(void)
     g_lc.launch_pending = 0;
 }
 
+void rnet_lobby_set_match_active(int active)
+{
+    g_lc.match_active = active != 0;
+}
+
 void rnet_lobby_clear_last_error(void)
 {
     g_lc.join.last_error[0] = '\0';
 }
+
+/* ---- host relay over ICE: the launch handover ---------------------------
+ * Built from the agents the waiting room already connected. A seat that is
+ * not COMPLETED is a refused launch with a reason, never a smaller room. */
+static void ice_launch_capture(void)
+{
+    int i;
+    ice_launch_discard();
+    g_il.error[0] = '\0';
+    g_il.is_host = g_lc.is_host ? 1 : 0;
+    g_il.born_ms = lobby_mono_ms();
+    if (!g_host_ice) {
+        snprintf(g_il.error, sizeof(g_il.error),
+                 "no ICE agents exist (this build cannot run ICE, or the room was "
+                 "not seated)");
+        return;
+    }
+    if (g_il.is_host) {
+        for (i = 0; i < g_lc.member_count; ++i) {
+            const RNetLobbyMember *m = &g_lc.members[i];
+            RNetIceAgent *a;
+            if (m->is_spectator || !m->player_id[0] ||
+                strcmp(m->player_id, g_lc.player_id) == 0)
+                continue;
+            if (g_il.n >= RNET_HOST_ICE_MAX_PEERS) {
+                snprintf(g_il.error, sizeof(g_il.error), "too many guests for the ICE hub");
+                break;
+            }
+            a = rnet_host_ice_take_completed(g_host_ice, m->player_id);
+            if (!a) {
+                snprintf(g_il.error, sizeof(g_il.error),
+                         "\"%s\" (seat %d) is not connected over ICE",
+                         m->display_name[0] ? m->display_name : m->player_id, m->slot);
+                break;
+            }
+            g_il.seat[g_il.n].lobby_slot = m->slot;
+            snprintf(g_il.seat[g_il.n].player_id, sizeof(g_il.seat[g_il.n].player_id),
+                     "%s", m->player_id);
+            g_il.seat[g_il.n].agent = a;
+            g_il.n++;
+        }
+        if (!g_il.error[0] && g_il.n == 0)
+            snprintf(g_il.error, sizeof(g_il.error), "no guest is seated");
+    } else {
+        g_il.guest = rnet_host_ice_take_completed(g_host_ice, g_lc.host_player_id);
+        if (!g_il.guest)
+            snprintf(g_il.error, sizeof(g_il.error),
+                     "this client is not connected to the host over ICE");
+    }
+    if (g_il.error[0]) {
+        char why[sizeof(g_il.error)];
+        snprintf(why, sizeof(why), "%s", g_il.error);
+        ice_launch_discard();
+        snprintf(g_il.error, sizeof(g_il.error), "%s", why);
+        return;
+    }
+    g_il.valid = 1;
+}
+
+int rnet_lobby_ice_take_hub(RNetLobbyIceSeat *out, int max)
+{
+    int n;
+    if (!out || max < 1) return -1;
+    if (!g_il.valid || !g_il.is_host) {
+        if (!g_il.error[0])
+            snprintf(g_il.error, sizeof(g_il.error), "no ICE hub handover is pending");
+        return -1;
+    }
+    if (max < g_il.n) {
+        snprintf(g_il.error, sizeof(g_il.error), "output array too small for %d seats", g_il.n);
+        return -1;
+    }
+    n = g_il.n;
+    memcpy(out, g_il.seat, sizeof(out[0]) * (size_t)n);
+    memset(&g_il, 0, offsetof(IceLaunch, error));   /* ownership is the caller's */
+    return n;
+}
+
+RNetIceAgent *rnet_lobby_ice_take_guest_agent(void)
+{
+    RNetIceAgent *a;
+    if (!g_il.valid || g_il.is_host || !g_il.guest) {
+        if (!g_il.error[0])
+            snprintf(g_il.error, sizeof(g_il.error), "no ICE guest handover is pending");
+        return NULL;
+    }
+    a = g_il.guest;
+    memset(&g_il, 0, offsetof(IceLaunch, error));
+    return a;
+}
+
+const char *rnet_lobby_ice_launch_error(void) { return g_il.error; }
+
+void rnet_lobby_ice_discard(void) { ice_launch_discard(); }
 
 int rnet_lobby_try_fill_launch(RNetLobbyJoinInfo *out)
 {
@@ -4104,7 +5065,8 @@ int rnet_lobby_try_fill_launch(RNetLobbyJoinInfo *out)
         return 0;
     /* Guests need a concrete host peer. Host may leave peer empty so transport
      * learns the guest from the first UDP packet. */
-    if (join->local_slot != 0 && !join->peer_hostport[0])
+    if (join->local_slot != 0 && !join->peer_hostport[0] &&
+        !join->transport_ice_hub && !join->transport_ice_pair)
         return 0;
     *out = *join;
     return 1;
@@ -4211,8 +5173,7 @@ static void mod_xfer_reset(void)
     g_lc.xfer_hold_len = 0;
     g_lc.xfer_hold_hdr[0] = '\0';
     g_lc.xfer_path_priced = 0;
-    g_lc.sig_hold_n = 0;
-    g_lc.sig_hold_from[0] = '\0';
+    rnet_sig_hold_clear(&g_lc.sig_hold);
 }
 
 static void mod_xfer_fail(const char *why)
@@ -4288,16 +5249,21 @@ static int mod_xfer_open(const char *peer, int controlling)
     /* Replay anything that arrived while we were still getting ready, but
      * only from the peer this agent is for -- a hold from an abandoned
      * exchange would poison the new one. */
-    if (g_lc.sig_hold_n > 0) {
-        if (g_lc.xfer_peer[0] && !strcmp(g_lc.sig_hold_from, g_lc.xfer_peer)) {
+    {
+        const int held = rnet_sig_hold_count(&g_lc.sig_hold, g_lc.xfer_peer);
+        if (held > 0) {
             int i;
-            fprintf(stderr, "rnet_lobby: replaying %d held ICE signal(s)\n",
-                    g_lc.sig_hold_n);
-            for (i = 0; i < g_lc.sig_hold_n; ++i)
-                rnet_ice_xfer_push_signal(g_lc.xfer, &g_lc.sig_hold[i]);
+            fprintf(stderr, "rnet_lobby: replaying %d held ICE signal(s)\n", held);
+            for (i = 0; i < held; ++i) {
+                const RNetSigHoldEntry *e =
+                    rnet_sig_hold_get(&g_lc.sig_hold, g_lc.xfer_peer, i);
+                if (e) rnet_ice_xfer_push_signal(g_lc.xfer, &e->sig);
+            }
         }
-        g_lc.sig_hold_n = 0;
-        g_lc.sig_hold_from[0] = '\0';
+        /* Only this peer's bucket is consumed; a hold from an abandoned
+         * exchange with someone else ages out rather than poisoning this one. */
+        rnet_sig_hold_drop(&g_lc.sig_hold, g_lc.xfer_peer);
+        rnet_sig_hold_expire(&g_lc.sig_hold, lobby_mono_ms(), 30000u);
     }
     return 0;
 }

@@ -7,6 +7,11 @@
 extern "C" {
 #endif
 
+/* Opaque libjuice-backed ICE agent. Obtained from the lobby client's
+ * waiting-room handover (rnet_lobby_ice_take_*) and passed to
+ * rnet_session_adopt_ice_agent / rnet_session_start_ice_hub_adopt. */
+typedef struct RNetIceAgent RNetIceAgent;
+
 typedef enum RNetIceState
 {
     RNET_ICE_STATE_IDLE = 0,
@@ -36,6 +41,9 @@ typedef struct RNetSignal
     RNetSignalType type;
     /* For SET_CONTROLLING: non-zero = controlling (gather-order hint; libjuice has no set_role API). */
     rnet_u8 flag;
+    /* Host ICE hub: guest seat this signal is from/for. 0xFF = unaddressed
+     * (legacy single-peer sessions). */
+    rnet_u8 peer_slot;
     /* NUL-terminated SDP or candidate line (truncated if longer). */
     char text[2048];
 } RNetSignal;

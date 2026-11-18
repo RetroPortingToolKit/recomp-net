@@ -48,6 +48,38 @@ int rnet_session_start_lan_hub(RNetSession *s, const char *bind_hostport);
  */
 int rnet_session_start_ice(RNetSession *s, const RNetIceConfig *ice);
 
+/*
+ * Host-as-relay over ICE: one libjuice agent per guest seat (host answers,
+ * guests offer) and the host fans each guest's datagrams out to the other
+ * guests. guest_slot_mask bit i (1..RNET_MAX_SLOTS-1) = seat i gets an agent.
+ * ice->bind_port is ignored (always 0); there is no TURN/force-relay fallback
+ * in hub mode. on_signal delivers RNetSignal with peer_slot = the seat; feed
+ * guest signals back with rnet_session_push_signal_from. Returns 0 / -1.
+ */
+int rnet_session_start_ice_hub(RNetSession *s, const RNetIceConfig *ice, rnet_u32 guest_slot_mask);
+
+/*
+ * Handover from the waiting room (recomp_net/host_ice.h): the agents are
+ * ALREADY COMPLETED, so nothing is renegotiated. The session takes ownership
+ * of every agent on success (destroying them in rnet_session_destroy) and the
+ * caller must forget them; on -1 nothing was taken and the caller still owns
+ * them. Dead-path timers (ICE attempt / completion / peer-rx) measure from the
+ * moment of adoption, not from when the agent connected.
+ *
+ * rnet_session_start_ice_hub_adopt (HOST): seats[i].slot is the SESSION slot
+ * (1..RNET_MAX_SLOTS-1) the agent serves; the hub mask is built from exactly
+ * these seats. Fails (-1) if any agent is NULL, duplicated, out of range, or
+ * not COMPLETED -- a seat that is not connected never yields a smaller room.
+ * rnet_session_adopt_ice_agent (GUEST): the one agent connected to the host.
+ */
+typedef struct RNetIceAdoptSeat
+{
+    int slot;
+    RNetIceAgent *agent;
+} RNetIceAdoptSeat;
+int rnet_session_start_ice_hub_adopt(RNetSession *s, const RNetIceAdoptSeat *seats, int n);
+int rnet_session_adopt_ice_agent(RNetSession *s, RNetIceAgent *agent);
+
 /* Recv datagrams, poll ICE, send pending INPUT, drive bootstrap. */
 void rnet_session_pump(RNetSession *s);
 
@@ -124,6 +156,8 @@ rnet_u32 rnet_session_disconnected_peers(const RNetSession *s, rnet_u64 timeout_
 
 /* Deliver an inbound signaling message from the lobby. */
 void rnet_session_push_signal(RNetSession *s, const RNetSignal *msg);
+/* Hub mode: route an inbound signal to seat `slot`'s agent. 0 ok, -1 if no such agent. */
+int rnet_session_push_signal_from(RNetSession *s, int slot, const RNetSignal *sig);
 
 rnet_u8 rnet_session_committed_delay(const RNetSession *s);
 /*
@@ -184,6 +218,7 @@ typedef struct RNetSessionStats
     char ice_path[16];   /* host|srflx|prflx|relay|lan|pending|failed|unknown */
     char ice_local[96];
     char ice_remote[96];
+    rnet_u32 ice_recv_drops; /* datagrams lost to ICE recv-queue overflow (all agents) */
     int state_busy;
     rnet_u8 state_op;
     int state_sender;          /* 1 while local peer is the STATE sender */
@@ -210,6 +245,7 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
 #define RNET_STATE_OP_LOAD 1 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_SRAM 2 /* stalls admit until guest has blob */
 #define RNET_STATE_OP_RB_KF 3 /* rollback FMV media keyframe (raw boot_state snap) */
+#define RNET_STATE_OP_MENU 6 /* host-authoritative paused snapshot */
 #define RNET_STATE_OP_BOOT 4 /* post-BIOS host snap barrier (boot_state blob) */
 /* Guest-owned memory card upload. The ONLY peer→host op: a seated guest sends
  * its card to the host before the host's SRAM broadcast, so the host can fold
@@ -432,6 +468,10 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * Needed when one UDP commit is lost and the hash-chain frontier has only
  * its local half. No episode or input row is changed by this request. */
 #define RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST 6u
+/* Immutable execution startup barrier (startup_profiles.h). Reserved by the
+ * session; never forwarded to the episode driver's RB_SYNC receive queue. */
+#define RNET_RB_SYNC_OP_PROFILE_OFFER 7u
+#define RNET_RB_SYNC_OP_PROFILE_ACK 8u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */
@@ -483,6 +523,10 @@ int rnet_session_take_rb_post(RNetSession *s, rnet_u32 *epoch_id, rnet_u32 *targ
  * only let a stale set win a race against the current one.
  */
 int rnet_session_send_modset(RNetSession *s, const char *text);
+/* Nonzero once a peer's HELLO carried another wire version (RNET_WIRE_VERSION
+ * in src/protocol): that peer's version, or -1 for a peer that predates the
+ * field. The session never links with it; a host can say why it stalled. */
+int rnet_session_peer_wire_version_mismatch(const RNetSession *s);
 /* 1 and fills `out` when a set has arrived since the last take, else 0. */
 int rnet_session_take_modset(RNetSession *s, char *out, rnet_u32 cap);
 int rnet_session_send_modset_ack(RNetSession *s, rnet_u8 status,
@@ -496,7 +540,7 @@ int rnet_session_take_modset_ack(RNetSession *s, rnet_u8 *status, char *reason,
 
 /* Sender slot (packet header) of the rb_* message most recently returned by
  * take_rb_sync / take_rb_seal_rows / take_rb_baseline / take_rb_post /
- * take_rb_frame_commit / take_modset_ack, or -1 before any. Call it right after the take it describes. With two seats there
+ * take_rb_frame_commit / take_modset_ack / take_rb_resolved, or -1 before any. Call it right after the take it describes. With two seats there
  * is one peer and this is redundant; with more, an episode needs a BASELINE
  * and a POST from EVERY peer, and without the sender the first reply to
  * arrive would answer for all of them. */
@@ -507,6 +551,9 @@ int rnet_session_rb_last_take_from(const RNetSession *s);
 rnet_u32 rnet_session_rb_ctrl_dropped(const RNetSession *s);
 
 int rnet_session_send_rb_resolved(RNetSession *s, rnet_u32 resolved_through);
+/* One entry per sender (its highest advert since the last take);
+ * rnet_session_rb_last_take_from() names the seat. A receiver with more than
+ * one peer keeps a frontier per seat and trusts only the lowest. */
 int rnet_session_take_rb_resolved(RNetSession *s, rnet_u32 *resolved_through);
 
 #ifdef __cplusplus

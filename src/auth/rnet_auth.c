@@ -8,6 +8,7 @@
 #include "recomp_net/auth.h"
 #include "rnet_open_url.h"
 #include "rnet_sha256.h"
+#include "../platform/rnet_platform.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -298,6 +299,9 @@ static int http_post(const char *path, const char *json, char *body, size_t cap)
     const char *hdr_end;
 
     if (body && cap) body[0] = '\0';
+    /* Sign-in can precede any lobby, LAN or debug socket. Initialize the
+     * shared transport here so first-use HTTP also works on Windows. */
+    rnet_os_startup();
     snprintf(portstr, sizeof(portstr), "%d", g.port);
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;

@@ -1,4 +1,4 @@
-# api_link_test: every function a public header declares must link.
+# api_link_test: every public static-library function must link.
 #
 # The frame-atomic WebSocket buffer (snesrecomp#104) deleted
 # rnet_ws_read_text from rnet_ws.c but left it declared in rnet_ws.h. Nothing
@@ -24,6 +24,12 @@ function(rnet_add_api_link_test)
   set(_names "")
   foreach(_h IN LISTS _headers)
     get_filename_component(_base "${_h}" NAME)
+    # module.h describes the optional shared-library loader contract. Its
+    # rnet_module_info export belongs to recomp_net_module, not recomp_net;
+    # module_test checks it through the loader when that target is enabled.
+    if(_base STREQUAL "module.h")
+      continue()
+    endif()
     string(APPEND _includes "#include \"recomp_net/${_base}\"\n")
     file(READ "${_h}" _t)
 

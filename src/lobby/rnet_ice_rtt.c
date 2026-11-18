@@ -7,8 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define RNET_ICE_RTT_MAGIC "RNETIR1"
-#define RNET_ICE_RTT_PING_MS 2000ULL
+/* Same wire form as the waiting room's link timing (rnet_host_ice.c):
+ * MAGIC 'P'|'Q' <sender's monotonic ms> <ms the replier held the ping>. */
+#define RNET_ICE_RTT_MAGIC "RNETIR2"
+#define RNET_ICE_RTT_MAGIC_LEN 7
+/* Short: a probe takes a handful of samples and closes. */
+#define RNET_ICE_RTT_PING_MS 250ULL
 #define RNET_ICE_RTT_RELAY_FALLBACK_MS 3500ULL
 
 struct RNetIceRttProbe
@@ -16,7 +20,9 @@ struct RNetIceRttProbe
     RNetIceAgent *agent;
     RNetIceRttSignalEmitFn emit;
     void *user;
-    int rtt_ms;
+    int pinger; /* the offerer pings; the answerer only replies */
+    int rtt_ms; /* best sample */
+    int samples;
     rnet_u64 next_ping_ms;
     rnet_u64 open_ms;
     int relay_fallback_tried;
@@ -33,89 +39,41 @@ static void ice_rtt_emit_bridge(const RNetSignal *msg, void *user)
     p->emit(msg, p->user);
 }
 
-static int parse_pong_ts(const char *ts, int *out_rtt_ms)
+static void ice_rtt_send(RNetIceRttProbe *p, char kind, unsigned long long ts, unsigned hold)
 {
-    unsigned long long sent = 0;
-    rnet_u64 now;
-    int ms;
-    if (!ts || !out_rtt_ms || sscanf(ts, "%llu", &sent) != 1)
-        return 0;
-    now = rnet_os_monotonic_ms();
-    if ((rnet_u64)sent > now)
-        return 0;
-    ms = (int)(now - (rnet_u64)sent);
-    if (ms < 0)
-        ms = 0;
-    if (ms > 60000)
-        ms = 60000;
-    *out_rtt_ms = ms;
-    return 1;
+    char buf[48];
+    int n = snprintf(buf, sizeof(buf), "%s%c%llu %u", RNET_ICE_RTT_MAGIC, kind, ts, hold);
+    if (n > 0 && (size_t)n < sizeof(buf))
+        (void)rnet_ice_agent_send(p->agent, (const rnet_u8 *)buf, (size_t)n);
 }
 
-static void ice_rtt_send_ping(RNetIceRttProbe *p)
+/* Timed from the datagram's arrival on libjuice's thread, less the time the
+ * far end held the ping before its pump replied: the figure is the link's,
+ * not either side's frame cadence. */
+static void ice_rtt_drain(RNetIceRttProbe *p, rnet_u64 now)
 {
-    char buf[96];
-    int n;
-    rnet_u64 now;
-    if (!p || !p->agent)
-        return;
-    now = rnet_os_monotonic_ms();
-    n = snprintf(buf, sizeof(buf), "%s\nPING\n%llu\n", RNET_ICE_RTT_MAGIC,
-                 (unsigned long long)now);
-    if (n <= 0 || (size_t)n >= sizeof(buf))
-        return;
-    if (rnet_ice_agent_send(p->agent, (const rnet_u8 *)buf, (size_t)n) >= 0)
-        p->next_ping_ms = now + RNET_ICE_RTT_PING_MS;
-}
-
-static void ice_rtt_handle_app(RNetIceRttProbe *p, const char *msg, size_t len)
-{
-    char copy[160];
-    char *cursor;
-    const char *magic;
-    const char *op;
-    const char *ts;
-    if (!p || !msg || len == 0 || len >= sizeof(copy))
-        return;
-    memcpy(copy, msg, len);
-    copy[len] = '\0';
-    cursor = copy;
-    magic = cursor;
-    {
-        char *nl = strchr(cursor, '\n');
-        if (!nl)
-            return;
-        *nl = '\0';
-        cursor = nl + 1;
-    }
-    if (strcmp(magic, RNET_ICE_RTT_MAGIC) != 0)
-        return;
-    op = cursor;
-    {
-        char *nl = strchr(cursor, '\n');
-        if (!nl)
-            return;
-        *nl = '\0';
-        cursor = nl + 1;
-    }
-    ts = cursor;
-    {
-        char *nl = strchr(cursor, '\n');
-        if (nl)
-            *nl = '\0';
-    }
-    if (strcmp(op, "PING") == 0) {
-        char reply[96];
-        int n = snprintf(reply, sizeof(reply), "%s\nPONG\n%s\n", RNET_ICE_RTT_MAGIC,
-                         ts ? ts : "0");
-        if (n > 0 && (size_t)n < sizeof(reply))
-            (void)rnet_ice_agent_send(p->agent, (const rnet_u8 *)reply, (size_t)n);
-        return;
-    }
-    if (strcmp(op, "PONG") == 0) {
-        int ms = 0;
-        if (parse_pong_ts(ts, &ms))
-            p->rtt_ms = ms;
+    rnet_u8 buf[64];
+    size_t n = 0;
+    rnet_u64 arrival = 0;
+    while (rnet_ice_agent_recv_at(p->agent, buf, sizeof(buf) - 1, &n, &arrival) == 0 && n > 0) {
+        unsigned long long ts;
+        unsigned long hold = 0;
+        char *end;
+        if (n <= RNET_ICE_RTT_MAGIC_LEN || memcmp(buf, RNET_ICE_RTT_MAGIC, RNET_ICE_RTT_MAGIC_LEN) != 0)
+            continue;
+        buf[n] = '\0';
+        ts = strtoull((const char *)buf + RNET_ICE_RTT_MAGIC_LEN + 1, &end, 10);
+        if (end && *end == ' ')
+            hold = strtoul(end + 1, NULL, 10);
+        if (buf[RNET_ICE_RTT_MAGIC_LEN] == 'P') {
+            ice_rtt_send(p, 'Q', ts, now >= arrival ? (unsigned)(now - arrival) : 0u);
+        } else if (buf[RNET_ICE_RTT_MAGIC_LEN] == 'Q' && ts <= arrival && arrival - ts < 60000u) {
+            rnet_u64 span = arrival - ts;
+            int ms = (int)(span > hold ? span - hold : 0);
+            if (p->rtt_ms < 0 || ms < p->rtt_ms)
+                p->rtt_ms = ms;
+            p->samples++;
+        }
     }
 }
 
@@ -133,6 +91,7 @@ int rnet_ice_rtt_open(RNetIceRttProbe **out, const RNetIceConfig *ice,
     local = *ice;
     p->emit = emit;
     p->user = user;
+    p->pinger = ice->controlling ? 1 : 0;
     p->rtt_ms = -1;
     p->open_ms = rnet_os_monotonic_ms();
     p->next_ping_ms = 0;
@@ -171,8 +130,6 @@ void rnet_ice_rtt_pump(RNetIceRttProbe *probe)
 {
     RNetIceState st;
     rnet_u64 now;
-    rnet_u8 buf[256];
-    size_t n = 0;
 
     if (!probe || !probe->agent)
         return;
@@ -192,6 +149,7 @@ void rnet_ice_rtt_pump(RNetIceRttProbe *probe)
             probe->relay_fallback_tried = 1;
             probe->open_ms = now;
             probe->rtt_ms = -1;
+            probe->samples = 0;
             snprintf(probe->path, sizeof(probe->path), "pending");
         } else {
             probe->relay_fallback_tried = 1;
@@ -203,12 +161,11 @@ void rnet_ice_rtt_pump(RNetIceRttProbe *probe)
     if (st == RNET_ICE_STATE_CONNECTED || st == RNET_ICE_STATE_COMPLETED) {
         rnet_ice_agent_selected_info(probe->agent, probe->path, sizeof(probe->path),
                                      NULL, 0, NULL, 0);
-        while (rnet_ice_agent_recv(probe->agent, buf, sizeof(buf) - 1, &n) == 0 && n > 0) {
-            buf[n] = '\0';
-            ice_rtt_handle_app(probe, (const char *)buf, n);
+        ice_rtt_drain(probe, now);
+        if (probe->pinger && now >= probe->next_ping_ms) {
+            ice_rtt_send(probe, 'P', (unsigned long long)rnet_os_monotonic_ms(), 0u);
+            probe->next_ping_ms = now + RNET_ICE_RTT_PING_MS;
         }
-        if (probe->next_ping_ms == 0 || now >= probe->next_ping_ms)
-            ice_rtt_send_ping(probe);
     } else if (st == RNET_ICE_STATE_FAILED) {
         snprintf(probe->path, sizeof(probe->path), "failed");
     }
@@ -224,6 +181,11 @@ RNetIceState rnet_ice_rtt_state(const RNetIceRttProbe *probe)
 int rnet_ice_rtt_ms(const RNetIceRttProbe *probe)
 {
     return probe ? probe->rtt_ms : -1;
+}
+
+int rnet_ice_rtt_samples(const RNetIceRttProbe *probe)
+{
+    return probe ? probe->samples : 0;
 }
 
 void rnet_ice_rtt_selected_path(const RNetIceRttProbe *probe, char *path_out,
@@ -278,6 +240,12 @@ int rnet_ice_rtt_ms(const RNetIceRttProbe *probe)
 {
     (void)probe;
     return -1;
+}
+
+int rnet_ice_rtt_samples(const RNetIceRttProbe *probe)
+{
+    (void)probe;
+    return 0;
 }
 
 void rnet_ice_rtt_selected_path(const RNetIceRttProbe *probe, char *path_out,

@@ -126,6 +126,14 @@ void rnet_host_relay_destroy(RNetHostRelay **hr);
 void rnet_host_relay_update(RNetHostRelay *hr, const RNetHostRelayView *view);
 /* Before the game binds the port (launch): close the socket, keep the mapping. */
 void rnet_host_relay_release_port(RNetHostRelay *hr);
+/* Guest: the server forgot this seat's path report. It clears every report on
+ * any roster change (a join, a leave, a seat move) without telling the guests,
+ * so the lobby client calls this when a lobby_update shows our own seat with
+ * no path. A report already sent is proven again at once instead of at the
+ * next refresh, which would leave the host's Start refused for up to 45 s
+ * after the last player joined. No-op for a host, an idle relay, a probe in
+ * flight or a guest that has not reported yet. */
+void rnet_host_relay_path_cleared(RNetHostRelay *hr);
 /* Leaving the room / disconnecting: unmap, close, forget. */
 void rnet_host_relay_leave(RNetHostRelay *hr);
 void rnet_host_relay_status(const RNetHostRelay *hr, RNetHostRelayStatus *out);

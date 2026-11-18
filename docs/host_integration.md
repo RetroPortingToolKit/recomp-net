@@ -57,6 +57,91 @@ probe barriers) is specified in `docs/protocol.md` "Multi-seat STATE".
 | `now_ms` | Optional; defaults to platform monotonic ms |
 | `on_signal` | ICE SDP/candidates toward your lobby (LAN-only may leave NULL) |
 
+## Online launch: choosing the transport
+
+`rnet_lobby_try_fill_launch` fills an `RNetLobbyJoinInfo`. Branch on it in this
+order:
+
+1. `transport_ice_hub == 1` -- **host relay over ICE** (below).
+2. `transport_host == 1` -- host relay over the advertised UDP port: the host
+   binds `bind_hostport` and runs `rnet_session_start_lan_hub` (3+ seats) /
+   accepts the guest; guests dial `host_endpoint`.
+3. `force_input_relay == 1` -- the lobby server's UDP relay (dial `peer_hostport`).
+4. otherwise peer-to-peer ICE / LAN as before.
+
+`transport_ice_hub` implies `transport_host == 1` (test `transport_ice_hub`
+first), `host_endpoint` is empty, and `bind_hostport` is a placeholder: **no UDP
+socket is bound and nothing is dialled.** Old servers and old clients never see
+`relay_via`, so path 2-4 are unchanged.
+
+### Host relay over ICE: what the engine calls
+
+```c
+rnet_lobby_set_relay_via_ice(1);          /* host pref, default 1; publishes relay_via "ice" */
+...
+RNetLobbyJoinInfo ji;
+if (rnet_lobby_try_fill_launch(&ji) && ji.transport_ice_hub) {
+    RNetSession *s = rnet_session_create(&cfg, &vt);   /* cfg.local_slot as for any match */
+    if (rnet_lobby_is_host()) {
+        RNetLobbyIceSeat seat[8];
+        RNetIceAdoptSeat adopt[8];
+        int n = rnet_lobby_ice_take_hub(seat, 8);       /* ownership of each agent -> you */
+        if (n < 1) { report(rnet_lobby_ice_launch_error()); /* abort the match */ }
+        for (i = 0; i < n; ++i) {
+            adopt[i].slot  = /* YOUR session slot for lobby seat seat[i].lobby_slot */;
+            adopt[i].agent = seat[i].agent;
+        }
+        if (rnet_session_start_ice_hub_adopt(s, adopt, n) != 0) { /* nothing adopted: */
+            for (i = 0; i < n; ++i) rnet_host_ice_destroy_agent(seat[i].agent);
+            /* abort */ }
+    } else {
+        RNetIceAgent *a = rnet_lobby_ice_take_guest_agent();   /* ownership -> you */
+        if (!a || rnet_session_adopt_ice_agent(s, a) != 0) { /* destroy a if non-NULL; abort */ }
+    }
+    rnet_lobby_clear_launch_pending();                  /* after the take */
+    /* then pump / try_admit exactly as for any session; on_signal may stay NULL */
+}
+```
+
+Rules the engine must respect:
+
+- **Take before `rnet_lobby_clear_launch_pending()`.** The client captured the
+  agents when `launch` arrived; an untaken bundle is destroyed after 60 s, at the
+  next launch, or on leave / disconnect (`rnet_lobby_ice_discard()` drops it now).
+- **You own the session-slot mapping.** `RNetLobbyIceSeat.lobby_slot` is the
+  guest's seat in the *lobby's* namespace; `RNetIceAdoptSeat.slot` is the
+  *session* slot (1..`RNET_MAX_SLOTS`-1) your engine maps it to (host
+  gallery-hosting offsets etc.). Slot 0 is the host and is never an adopted seat.
+  The hub mask is built from exactly the seats you pass, and
+  `rnet_session_start_ice_hub_adopt` fails (-1, nothing adopted) if any agent
+  is NULL, duplicated, out of range or not COMPLETED.
+- **No renegotiation, no signals.** Adopted agents are frozen; the session's
+  dead-path timers start at adoption. Do not call `rnet_session_push_signal*`
+  for them.
+- **A not-connected seat refuses the launch.** If any seated guest (or a guest's
+  own link to the host) is not COMPLETED, the client itself drops the launch:
+  `launch_pending` stays 0, `join.last_error == "ice_not_connected"` and
+  `rnet_lobby_ice_launch_error()` names the seat. Surface that string; never
+  start a smaller room.
+- Spectators are not on the ICE hub path in this version.
+- `rnet_lobby_host_ice_status(&st)` (`RNetHostIceStatus`, `recomp_net/host_ice.h`)
+  gives per-seat state for the waiting-room UI. Builds without
+  `RNET_ENABLE_ICE` never publish `relay_via` (a guest of such a build reports
+  `path: "fail"`).
+
+Handover API summary:
+
+| Call | Header |
+|------|--------|
+| `rnet_lobby_set_relay_via_ice(int)` / `rnet_lobby_relay_via_ice()` | `lobby_client.h` |
+| `RNetLobbyJoinInfo.transport_ice_hub`, `RNetLobbyMatchCaps.relay_via_ice` | `lobby_client.h` |
+| `rnet_lobby_ice_take_hub(RNetLobbyIceSeat *out, int max)` -> n or -1 | `lobby_client.h` |
+| `rnet_lobby_ice_take_guest_agent(void)` -> `RNetIceAgent *` or NULL | `lobby_client.h` |
+| `rnet_lobby_ice_launch_error(void)`, `rnet_lobby_ice_discard(void)` | `lobby_client.h` |
+| `rnet_session_start_ice_hub_adopt(s, const RNetIceAdoptSeat *, n)` | `session.h` |
+| `rnet_session_adopt_ice_agent(s, RNetIceAgent *)` | `session.h` |
+| `rnet_host_ice_destroy_agent(RNetIceAgent *)` (release a taken, unused agent) | `host_ice.h` |
+
 ## N64 / PSX recomp notes
 
 - Hook pad read so the runtime **does not** inject local-only input into the

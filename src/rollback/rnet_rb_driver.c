@@ -234,6 +234,13 @@ struct RNetRbDriver {
     int      missing_slot;
     uint32_t missing_tick;
 
+    /* Session hold (rnet_rb_driver_set_hold): Live admits no tick at or past
+     * hold_at, and nothing is predicted while the hold is set, so every row
+     * before hold_at is a real one by the time the sim reaches it. */
+    int      hold_active;
+    uint32_t hold_at;
+    int      hold_logged;
+
     /* Validation knobs, read once per start. */
     uint32_t lockstep_ticks;
     int      lockstep_pinned;
@@ -588,8 +595,8 @@ static void rb_request_missing_frame_commits(RNetRbDriver *d)
     if (!s || (d->stage != kRbIdle && d->stage != kRbTipHold))
         return;
     mask = rb_expect_mask(d);
-    if (rb_popcount(mask) <= 1)
-        return; /* retain two-seat wire traffic */
+    if (!mask)
+        return;
     now = rb_now(d);
     if ((uint32_t)(now - d->frame_commit_request_ms) < 50u)
         return;
@@ -1033,9 +1040,9 @@ static uint8_t rb_gate_episode_active(void *ctx)
  * agreement from a ring that no longer holds the tick would re-stall a session
  * that had already synced.
  *
- * Bounded, because an unbounded hold is the failure this codebase keeps
- * outlawing: a wedged match with nothing in the log. On timeout it releases
- * and says so, which is worse than agreeing and better than hanging.
+ * Missing FRAME_COMMITs are requested while this gate holds, including in
+ * two-seat sessions. Bound the wait by refusing the match on timeout: never
+ * admit play from a starting state that could not be verified.
  */
 #define RB_BOOT_DIGEST_TIMEOUT_MS 4000u
 
@@ -1143,11 +1150,10 @@ static int rb_boot_digest_gate(RNetRbDriver *d)
         if ((uint32_t)(now - d->boot_dig_hold_since_ms) >
             RB_BOOT_DIGEST_TIMEOUT_MS) {
             rb_log(d, "RB boot digest TIMED OUT after %u ms — "
-                      "starting UNVERIFIED (seats %x never sent tick 0). If this "
-                      "match desyncs, suspect the starting state, not the "
-                      "netcode.\n",
+                      "refusing match (missing tick 0 from seats %x).\n",
                    (unsigned)RB_BOOT_DIGEST_TIMEOUT_MS, (unsigned)missing);
             d->boot_dig_settled = 1u;
+            rb_refuse(d, "boot_digest_timeout");
             return 0;
         }
         return 1;
@@ -1424,7 +1430,7 @@ static void rb_enter_lockstep(RNetRbDriver *d, const char *why)
 static uint8_t rb_gate_lockstep_no_invent(void *ctx)
 {
     RNetRbDriver *d = (RNetRbDriver *)ctx;
-    if (d->lockstep_pinned)
+    if (d->lockstep_pinned || d->hold_active)
         return 1u;
     return (d->lockstep_until != 0u && d->sim < d->lockstep_until) ? 1u : 0u;
 }
@@ -1440,7 +1446,10 @@ static void rb_lockstep_tick(RNetRbDriver *d)
 
 static const char *rb_gate_lockstep_tag(void *ctx)
 {
-    return ((RNetRbDriver *)ctx)->lockstep_pinned ? "lockstep_pinned" : "desync_cooldown";
+    const RNetRbDriver *d = (const RNetRbDriver *)ctx;
+    if (d->hold_active)
+        return "session_hold";
+    return d->lockstep_pinned ? "lockstep_pinned" : "desync_cooldown";
 }
 
 static void rb_bind_sched(RNetRbDriver *d)
@@ -2967,7 +2976,12 @@ static void rb_drain_wire(RNetRbDriver *d)
                 uint32_t digest;
                 if (mask && a < d->sim) {
                     int first = rb_bit_slot(mask & (~mask + 1u));
-                    if (rnet_hc_local_digest(&d->hc[first], a, &digest))
+                    /* A peer may still be at its boot gate after we have
+                     * advanced beyond the digest ring. Reply with the exact
+                     * original tick-0 digest, never the current state. */
+                    if (a == 0u && d->boot_dig_local_valid)
+                        rnet_session_send_rb_frame_commit(s, a, d->boot_dig_local);
+                    else if (rnet_hc_local_digest(&d->hc[first], a, &digest))
                         rnet_session_send_rb_frame_commit(s, a, digest);
                 }
             }
@@ -3944,6 +3958,19 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
         return RNET_RB_ADMIT_STALL;
     }
 
+    /* A session hold stops Live before the local tip is sealed: a pad held
+     * while every peer is paused must not become input for any tick. The
+     * episode and wire pumps above keep running, so a late row before the
+     * hold is still reconciled and replayed while held. */
+    if (d->hold_active && d->sim >= d->hold_at) {
+        if (!d->hold_logged) {
+            rb_log(d, "RB hold reached at %u\n", (unsigned)d->sim);
+            d->hold_logged = 1;
+        }
+        d->stall_tag = "session_hold";
+        return RNET_RB_ADMIT_STALL;
+    }
+
     memset(&st, 0, sizeof(st));
     rnet_session_get_stats(s, &st);
     rb_stats_slowest_tip(d, s, &st);
@@ -4067,6 +4094,19 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
                     d->rows[slot] = row;
                     rnet_sched_note_remote_hit();
                     continue;
+                }
+                /* Same wedge as lockstep above: outside a grace wait (which
+                 * times out into an invent) the scheduler is waiting for a
+                 * REAL row -- cushion_rebuild, boot_tip_wait -- and that is
+                 * the row the injector is hiding. Release it; the retry
+                 * admits the real row. */
+                size_t wl = why ? strlen(why) : 0;
+                if (d->force_invent_slot == slot &&
+                    !(wl > 6 && !strcmp(why + wl - 6, "_grace"))) {
+                    rb_log_raw(d, "rbe: injected mispredict cancelled slot=%d "
+                                  "sim=%u — scheduler stalled (%s)\n", slot,
+                               (unsigned)d->sim, why ? why : "remote_miss");
+                    d->force_invent_slot = -1;
                 }
                 d->stall_tag = why ? why : "remote_miss";
                 return RNET_RB_ADMIT_STALL;
@@ -4279,6 +4319,51 @@ uint32_t rnet_rb_driver_promote_count(const RNetRbDriver *d) { return d ? d->ih.
 uint64_t rnet_rb_driver_resim_ticks(const RNetRbDriver *d) { return d ? d->resim_ticks : 0u; }
 uint32_t rnet_rb_driver_desync_count(const RNetRbDriver *d) { return d ? d->desync_count : 0u; }
 uint32_t rnet_rb_driver_rtt_estimate_ms(const RNetRbDriver *d) { return d ? d->rtt_ema_ms : 0u; }
+
+void rnet_rb_driver_set_hold(RNetRbDriver *d, uint32_t tick)
+{
+    if (!d)
+        return;
+    d->hold_active = 1;
+    d->hold_at = tick;
+    d->hold_logged = 0;
+    rb_log(d, "RB hold set at %u (sim %u)\n", (unsigned)tick, (unsigned)d->sim);
+}
+
+void rnet_rb_driver_clear_hold(RNetRbDriver *d)
+{
+    if (!d || !d->hold_active)
+        return;
+    d->hold_active = 0;
+    rb_log(d, "RB hold released at %u\n", (unsigned)d->sim);
+}
+
+int rnet_rb_driver_hold_settled(const RNetRbDriver *d)
+{
+    int slots, local, slot;
+    uint32_t t, from;
+    if (!d || !d->started || !d->hold_active || d->sim < d->hold_at)
+        return 0;
+    if (d->stage != kRbIdle)
+        return 0;
+    /* Every remote row the sim consumed before the hold must be real. A
+     * row predicted before the hold was set stays predicted until its wire
+     * arrives; a mismatch then opens an episode, which the check above waits
+     * out. Rows older than the history window are already settled. */
+    slots = rb_slot_count(d);
+    local = rb_local_slot(d);
+    from = d->sim > RNET_INPUT_HIST_DEPTH ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    for (slot = 0; slot < slots; ++slot) {
+        if (slot == local || !(rb_expect_mask(d) & (1u << slot)))
+            continue;
+        for (t = from; t < d->sim; ++t) {
+            RNetRbFrame row;
+            if (rnet_ih_get(&d->ih, slot, t, &row) && row.is_valid && row.is_predicted)
+                return 0;
+        }
+    }
+    return 1;
+}
 
 uint32_t rnet_rb_driver_confirmed_through(const RNetRbDriver *d)
 {

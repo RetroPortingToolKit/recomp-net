@@ -10,10 +10,12 @@ extern "C" {
 #endif
 
 /*
- * Lightweight ICE data-channel RTT probe for lobby waiting rooms.
- * Exchanges SDP/candidates via the host-supplied emit callback (WS lobby
- * signal), then measures application ping/pong over the selected ICE pair
- * (host / srflx / relay). Use force_relay in RNetIceConfig for Force TURN.
+ * Lightweight ICE RTT probe: the room list's direct latency to a host.
+ * Exchanges SDP/candidates via the caller's emit callback (the lobby's
+ * probe_signal), then times application ping/pong over the selected ICE pair
+ * (host / srflx / relay), from datagram arrival and less the replier's hold.
+ * The offerer (ice->controlling) pings every 250 ms; the answerer only
+ * replies. Use force_relay in RNetIceConfig for Force TURN.
  */
 typedef struct RNetIceRttProbe RNetIceRttProbe;
 
@@ -29,8 +31,10 @@ void rnet_ice_rtt_push_signal(RNetIceRttProbe *probe, const RNetSignal *msg);
 void rnet_ice_rtt_pump(RNetIceRttProbe *probe);
 
 RNetIceState rnet_ice_rtt_state(const RNetIceRttProbe *probe);
-/* Latest RTT in ms, or -1 if unknown. */
+/* Best (lowest) RTT sample in ms, or -1 if none yet. */
 int rnet_ice_rtt_ms(const RNetIceRttProbe *probe);
+/* Replies timed so far. */
+int rnet_ice_rtt_samples(const RNetIceRttProbe *probe);
 /* selected path: host|srflx|prflx|relay|pending|failed|unknown */
 void rnet_ice_rtt_selected_path(const RNetIceRttProbe *probe, char *path_out,
                                 size_t path_len);

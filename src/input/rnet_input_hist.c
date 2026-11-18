@@ -27,7 +27,9 @@ int rnet_ih_set_neutral(RNetInputHist *h, int slot, const RNetRbFrame *neutral)
     h->neutral[slot].buttons = neutral->buttons;
     h->neutral[slot].stick_x = neutral->stick_x;
     h->neutral[slot].stick_y = neutral->stick_y;
-    h->neutral[slot].analog = neutral->analog ? 1u : 0u;
+    h->neutral[slot].analog = neutral->analog;
+    h->neutral[slot].rx = neutral->rx;
+    h->neutral[slot].ry = neutral->ry;
     return 1;
 }
 
@@ -87,6 +89,8 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
     invented.stick_x = h->neutral[slot].stick_x;
     invented.stick_y = h->neutral[slot].stick_y;
     invented.analog = h->neutral[slot].analog;
+    invented.rx = h->neutral[slot].rx;
+    invented.ry = h->neutral[slot].ry;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
 
@@ -97,7 +101,9 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
             invented.buttons = prev.buttons;
             invented.stick_x = prev.stick_x;
             invented.stick_y = prev.stick_y;
-            invented.analog = prev.analog ? 1u : 0u;
+            invented.analog = prev.analog;
+            invented.rx = prev.rx;
+            invented.ry = prev.ry;
             break;
         }
     }
@@ -113,6 +119,8 @@ int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFr
 int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *out)
 {
     RNetRbFrame invented;
+    RNetRbFrame prev;
+    uint32_t look;
 
     if (!h || slot < 0 || slot >= h->slot_count)
         return 0;
@@ -123,8 +131,26 @@ int rnet_ih_invent_idle(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *
     invented.stick_x = h->neutral[slot].stick_x;
     invented.stick_y = h->neutral[slot].stick_y;
     invented.analog = h->neutral[slot].analog;
+    invented.rx = h->neutral[slot].rx;
+    invented.ry = h->neutral[slot].ry;
     invented.is_predicted = 1u;
     invented.is_valid = 1u;
+
+    /* Idle releases the buttons and centres the axes; it does not swap the
+     * controller. The device type (analog) comes from the seat's last row: a
+     * neutral "digital" fill switched an analog / NeGcon pad to digital for
+     * one replayed tick, the emulated pad answered a shorter poll, and the
+     * replay ran a few guest cycles short of the live tick (4-seat R4
+     * rollback: seats that sealed the gap themselves split from the seat
+     * that had its real row). */
+    for (look = 1; look < RNET_INPUT_HIST_DEPTH; look++) {
+        if (tick < look)
+            break;
+        if (rnet_ih_get(h, slot, tick - look, &prev)) {
+            invented.analog = prev.analog;
+            break;
+        }
+    }
 
     if (!rnet_ih_put(h, slot, &invented))
         return 0;

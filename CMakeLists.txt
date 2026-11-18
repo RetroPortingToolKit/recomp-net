@@ -14,6 +14,12 @@ set(RNET_LIBJUICE_ROOT "" CACHE PATH
   "Optional path to libjuice sources (skip FetchContent when set)")
 option(RNET_BUILD_EXAMPLES "Build example programs" ON)
 option(RNET_BUILD_TESTS "Build unit tests" ON)
+option(RNET_BUILD_MODULE
+  "Also build recomp_net_module: one shared library (recomp-net + rbengine) an engine loads at run time (recomp_net/module.h)" OFF)
+set(RNET_RBENGINE_DIR "" CACHE PATH "retcomm-rbengine checkout folded into the module (RNET_BUILD_MODULE)")
+set(RNET_BUILD_VERSION "" CACHE STRING "Release version (x.y.z) the module reports; empty: the library version (RNET_BUILD_MODULE)")
+set(RNET_BUILD_VERSION "" CACHE STRING "Release version (x.y.z) the module reports; empty: the library version (RNET_BUILD_MODULE)")
+set(RNET_BUILD_ID "unknown" CACHE STRING "Source id reported by rnet_module_info (RNET_BUILD_MODULE)")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -27,16 +33,21 @@ set(RNET_CORE_SOURCES
   src/input/rnet_input_hist.c
   src/rollback/rnet_rollback.c
   src/rollback/rnet_hash_confirm.c
+  src/rollback/rnet_rb_quorum.c
   src/rollback/rnet_rb_driver.c
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
+  src/lobby/rnet_lan_room.c
   src/lobby/rnet_lan_beacon.c
   src/lobby/rnet_rtt_probe.c
   # Host relay: the host's reachable port (UPnP / NAT-PMP / STUN), the
   # guest's probe, and the waiting-room orchestration every lobby client
   # drives (recomp_net/host_relay.h). One copy, for recomp-ui and the engines.
   src/nat/rnet_host_relay.c
+  # Host relay over ICE: the waiting-room agents (recomp_net/host_ice.h).
+  src/nat/rnet_host_ice.c
+  src/nat/rnet_sig_hold.c
   src/lobby/rnet_ice_rtt.c
   src/lobby/rnet_ice_xfer.c
   src/transport/rnet_netsim.c
@@ -216,6 +227,74 @@ else()
   target_compile_options(recomp_net PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+# ---- Loadable module ----
+if(RNET_BUILD_MODULE)
+  if(NOT RNET_RBENGINE_DIR)
+    message(FATAL_ERROR "RNET_BUILD_MODULE=ON needs RNET_RBENGINE_DIR (the module exports rbe_*)")
+  endif()
+  add_library(recomp_net_module SHARED ${RNET_CORE_SOURCES} module/rnet_module.c
+    ${RNET_RBENGINE_DIR}/src/snap/rbe_snap_ring.c
+    ${RNET_RBENGINE_DIR}/src/util/rbe_mono_ms.c)
+  target_include_directories(recomp_net_module
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${RNET_RBENGINE_DIR}/include)
+  target_compile_definitions(recomp_net_module PRIVATE
+    RNET_MODULE_HAS_RBENGINE=1 "RNET_BUILD_ID=\"${RNET_BUILD_ID}\""
+    $<$<PLATFORM_ID:Windows>:_CRT_SECURE_NO_WARNINGS>)
+  if(RNET_BUILD_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    target_compile_definitions(recomp_net_module PRIVATE
+      RNET_MODULE_VERSION_MAJOR=${CMAKE_MATCH_1} RNET_MODULE_VERSION_MINOR=${CMAKE_MATCH_2}
+      RNET_MODULE_VERSION_PATCH=${CMAKE_MATCH_3})
+  elseif(RNET_BUILD_VERSION)
+    message(FATAL_ERROR "RNET_BUILD_VERSION must be x.y.z, got '${RNET_BUILD_VERSION}'")
+  endif()
+  if(RNET_BUILD_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    target_compile_definitions(recomp_net_module PRIVATE
+      RNET_MODULE_VERSION_MAJOR=${CMAKE_MATCH_1} RNET_MODULE_VERSION_MINOR=${CMAKE_MATCH_2}
+      RNET_MODULE_VERSION_PATCH=${CMAKE_MATCH_3})
+  elseif(RNET_BUILD_VERSION)
+    message(FATAL_ERROR "RNET_BUILD_VERSION must be x.y.z, got '${RNET_BUILD_VERSION}'")
+  endif()
+  if(UNIX)
+    target_compile_definitions(recomp_net_module PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+    if(APPLE)
+      target_compile_definitions(recomp_net_module PRIVATE _DARWIN_C_SOURCE)
+    endif()
+  endif()
+  if(WIN32)
+    target_link_libraries(recomp_net_module PUBLIC ws2_32 iphlpapi bcrypt shell32)
+    set_target_properties(recomp_net_module PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+  elseif(NOT APPLE)
+    target_link_options(recomp_net_module PRIVATE
+      "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/module/exports.map")
+  endif()
+  if(RNET_ENABLE_ICE)
+    target_compile_definitions(recomp_net_module PRIVATE RNET_ENABLE_ICE=1)
+    foreach(_j IN ITEMS juice-static juice)
+      if(TARGET ${_j})
+        set_target_properties(${_j} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      endif()
+    endforeach()
+    target_link_libraries(recomp_net_module PRIVATE Libjuice::Libjuice)
+  endif()
+  if(UNIX AND NOT APPLE)
+    find_package(Threads REQUIRED)
+    target_link_libraries(recomp_net_module PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(recomp_net_module PRIVATE /W4)
+  else()
+    target_compile_options(recomp_net_module PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+  if(RNET_BUILD_TESTS AND UNIX)
+    add_executable(module_test tests/module_test.c)
+    target_include_directories(module_test PRIVATE include)
+    target_link_libraries(module_test PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME module_test COMMAND module_test $<TARGET_FILE:recomp_net_module>)
+  endif()
+  install(TARGETS recomp_net_module LIBRARY DESTINATION lib RUNTIME DESTINATION bin)
+endif()
+
 # ---- Examples ----
 if(RNET_BUILD_EXAMPLES)
   add_executable(lan_delay_2p examples/lan_delay_2p/main.c)
@@ -229,7 +308,17 @@ endif()
 if(RNET_BUILD_TESTS)
   enable_testing()
 
-  # Every function a public header declares links against recomp_net.
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_executable(auth_startup_probe tests/auth_startup_probe.c)
+    target_link_libraries(auth_startup_probe PRIVATE recomp_net)
+    add_test(NAME auth_startup_test COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/auth_startup_test.py"
+      --probe "$<TARGET_FILE:auth_startup_probe>")
+  endif()
+
+  # Every public static-library function links against recomp_net. The
+  # optional module's loader contract is checked by module_test above.
   include(RnetApiLinkTest)
   rnet_add_api_link_test()
 
@@ -257,10 +346,51 @@ if(RNET_BUILD_TESTS)
   target_include_directories(hostport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME hostport_test COMMAND hostport_test)
 
+  # Two-process end-to-end check of the host relay against a real lobby
+  # server (tools/host_relay_e2e.c says how to run it). Built, not a ctest:
+  # it needs the server.
+  add_executable(host_relay_e2e tools/host_relay_e2e.c)
+  target_link_libraries(host_relay_e2e PRIVATE recomp_net)
+  target_include_directories(host_relay_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
   add_executable(host_relay_test tests/host_relay_test.c)
   target_link_libraries(host_relay_test PRIVATE recomp_net)
   target_include_directories(host_relay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME host_relay_test COMMAND host_relay_test)
+
+  if(RNET_ENABLE_ICE)
+    # Host-as-relay over ICE: host + two guests through real libjuice agents
+    # on loopback (no STUN). Single process is deliberate; see the test header.
+    add_executable(ice_hub_test tests/ice_hub_test.c)
+    target_link_libraries(ice_hub_test PRIVATE recomp_net)
+    target_include_directories(ice_hub_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ice_hub_test COMMAND ice_hub_test)
+    set_tests_properties(ice_hub_test PROPERTIES TIMEOUT 120)
+
+    # Waiting-room agents (host_ice.h) and the handover into sessions.
+    add_executable(host_ice_test tests/host_ice_test.c)
+    target_link_libraries(host_ice_test PRIVATE recomp_net)
+    target_include_directories(host_ice_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME host_ice_test COMMAND host_ice_test)
+    set_tests_properties(host_ice_test PROPERTIES TIMEOUT 180)
+
+    # The room list's direct latency probe, pinger and responder on loopback.
+    add_executable(ice_rtt_test tests/ice_rtt_test.c)
+    target_link_libraries(ice_rtt_test PRIVATE recomp_net)
+    target_include_directories(ice_rtt_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ice_rtt_test COMMAND ice_rtt_test)
+
+    # The real lobby client (singleton, so this process is the host) driving
+    # waiting-room agents through a launch into adopting sessions.
+    if(UNIX)
+      add_executable(lobby_ice_launch_test tests/lobby_ice_launch_test.c)
+      target_link_libraries(lobby_ice_launch_test PRIVATE recomp_net)
+      target_include_directories(lobby_ice_launch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+      target_compile_definitions(lobby_ice_launch_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+      add_test(NAME lobby_ice_launch_test COMMAND lobby_ice_launch_test)
+      set_tests_properties(lobby_ice_launch_test PROPERTIES TIMEOUT 120)
+    endif()
+  endif()
 
   add_executable(lan_chat_test tests/lan_chat_test.c)
   target_link_libraries(lan_chat_test PRIVATE recomp_net)
@@ -276,6 +406,17 @@ if(RNET_BUILD_TESTS)
   add_executable(lan_lobby_test tests/lan_lobby_test.c)
   target_link_libraries(lan_lobby_test PRIVATE recomp_net)
   add_test(NAME lan_lobby_test COMMAND lan_lobby_test)
+  add_executable(lan_room_test tests/lan_room_test.c)
+  target_link_libraries(lan_room_test PRIVATE recomp_net)
+  if(MSVC)
+    target_compile_options(lan_room_test PRIVATE /UNDEBUG)
+  else()
+    target_compile_options(lan_room_test PRIVATE -UNDEBUG)
+  endif()
+  if(UNIX)
+    target_compile_definitions(lan_room_test PRIVATE _POSIX_C_SOURCE=200809L)
+  endif()
+  add_test(NAME lan_room_test COMMAND lan_room_test)
 
   add_executable(lan_beacon_test tests/lan_beacon_test.c)
   target_link_libraries(lan_beacon_test PRIVATE recomp_net)
@@ -297,6 +438,12 @@ if(RNET_BUILD_TESTS)
   add_test(NAME stun_test COMMAND stun_test)
 
   add_executable(session_state_test tests/session_state_test.c)
+  add_executable(startup_profiles_test tests/startup_profiles_test.c)
+  target_link_libraries(startup_profiles_test PRIVATE recomp_net)
+  add_test(NAME startup_profiles_test COMMAND startup_profiles_test)
+  add_test(NAME startup_profiles_loss_test COMMAND startup_profiles_test)
+  set_tests_properties(startup_profiles_loss_test PROPERTIES
+    ENVIRONMENT "RNET_SIM_LOSS_PCT=30;RNET_SIM_LATENCY_MS=2;RNET_SIM_JITTER_MS=1;RNET_SIM_SEED=42")
   # The multi-seat cases drive a lossy relay built on the internal transport.
   target_include_directories(session_state_test PRIVATE src)
   target_link_libraries(session_state_test PRIVATE recomp_net)
@@ -304,6 +451,20 @@ if(RNET_BUILD_TESTS)
     target_compile_definitions(session_state_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
   endif()
   add_test(NAME session_state_test COMMAND session_state_test)
+
+  add_executable(session_state_multipeer_test tests/session_state_multipeer_test.c)
+  target_link_libraries(session_state_multipeer_test PRIVATE recomp_net)
+  if(UNIX)
+    target_compile_definitions(session_state_multipeer_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
+  add_test(NAME session_state_multipeer_test COMMAND session_state_multipeer_test)
+
+  add_executable(rb_ctrl_multipeer_test tests/rb_ctrl_multipeer_test.c)
+  target_link_libraries(rb_ctrl_multipeer_test PRIVATE recomp_net)
+  if(UNIX)
+    target_compile_definitions(rb_ctrl_multipeer_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
+  add_test(NAME rb_ctrl_multipeer_test COMMAND rb_ctrl_multipeer_test)
 
   add_executable(state_replay_test tests/state_replay_test.c)
   target_include_directories(state_replay_test PRIVATE src)
@@ -323,6 +484,20 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(rb_driver_test PRIVATE recomp_net)
   add_test(NAME rb_driver_test COMMAND rb_driver_test)
 
+  # Deterministic datagram loss with a real driver in each process. Unlike
+  # the fork-based matrix above, this also executes on Windows.
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_executable(rb_boot_peer tests/rb_boot_peer.c)
+    target_include_directories(rb_boot_peer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(rb_boot_peer PRIVATE recomp_net)
+    add_test(NAME rb_boot_digest_test COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/rb_boot_digest_test.py --peer $<TARGET_FILE:rb_boot_peer>)
+    set_tests_properties(rb_boot_digest_test PROPERTIES TIMEOUT 120)
+  else()
+    message(STATUS "Boot datagram regression requires a Python3 interpreter")
+  endif()
+
   add_executable(rollback_episode_test tests/rollback_episode_test.c)
   target_link_libraries(rollback_episode_test PRIVATE recomp_net)
   add_test(NAME rollback_episode_test COMMAND rollback_episode_test)
@@ -340,6 +515,10 @@ if(RNET_BUILD_TESTS)
   add_executable(hash_confirm_test tests/hash_confirm_test.c)
   target_link_libraries(hash_confirm_test PRIVATE recomp_net)
   add_test(NAME hash_confirm_test COMMAND hash_confirm_test)
+
+  add_executable(rb_quorum_test tests/rb_quorum_test.c)
+  target_link_libraries(rb_quorum_test PRIVATE recomp_net)
+  add_test(NAME rb_quorum_test COMMAND rb_quorum_test)
 
   add_executable(input_hist_test tests/input_hist_test.c)
   target_link_libraries(input_hist_test PRIVATE recomp_net)
@@ -361,7 +540,10 @@ if(RNET_BUILD_TESTS)
       src/chat/rnet_chat_report.c
       src/platform/rnet_platform.c
       src/platform/rnet_stun.c
-      src/nat/rnet_host_relay.c)
+      src/nat/rnet_host_relay.c
+      src/nat/rnet_host_ice.c
+      src/nat/rnet_sig_hold.c
+      src/lobby/rnet_ice_rtt.c)
     target_include_directories(lobby_client_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_client_test PRIVATE
@@ -378,7 +560,10 @@ if(RNET_BUILD_TESTS)
       src/chat/rnet_chat_report.c
       src/platform/rnet_platform.c
       src/platform/rnet_stun.c
-      src/nat/rnet_host_relay.c)
+      src/nat/rnet_host_relay.c
+      src/nat/rnet_host_ice.c
+      src/nat/rnet_sig_hold.c
+      src/lobby/rnet_ice_rtt.c)
     target_include_directories(lobby_ws_backlog_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_definitions(lobby_ws_backlog_test PRIVATE

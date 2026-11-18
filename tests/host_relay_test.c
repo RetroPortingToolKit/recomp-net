@@ -234,6 +234,22 @@ static void test_orchestration(void)
     for (i = 0; i < 20; ++i) rnet_host_relay_update(guest, &gv);
     expect_true(g_sent_n == 1, "no repeated report within the refresh window");
 
+    /* The server dropped our report (a roster change): proven again at once,
+     * not at the refresh. */
+    rnet_host_relay_path_cleared(guest);
+    rnet_host_relay_status(guest, &gs);
+    expect_true(gs.last_report[0] == '\0', "a cleared report is forgotten");
+    for (i = 0; i < 400 && g_sent_n == 1; ++i) {
+        rnet_host_relay_update(host, &hv);
+        rnet_host_relay_update(guest, &gv);
+        rnet_os_sleep_micros(5000);
+    }
+    expect_true(g_sent_n == 2 && strstr(g_sent[1], "\"direct\""),
+                "the guest reports direct again after the server cleared it");
+    rnet_host_relay_path_cleared(host);
+    rnet_host_relay_status(host, &hs);
+    expect_true(hs.role == 1, "path_cleared is a no-op for the host");
+
     /* The host releases the port for the game: the mapping/advert stays known. */
     rnet_host_relay_release_port(host);
     rnet_host_relay_status(host, &hs);

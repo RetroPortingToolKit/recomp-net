@@ -48,9 +48,11 @@ int main(void)
         rows[i].buttons = (rnet_u16)(0x300u + i);
         rows[i].stick_x = (rnet_s8)(20 + i);
         rows[i].stick_y = (rnet_s8)-15;
-        rows[i].source = 1u;
+        rows[i].source = (i == 2) ? 2u : (i == 0 ? 3u : 1u);
         rows[i].is_predicted = 0u;
         rows[i].is_valid = 1u;
+        rows[i].rx = (rnet_u8)(0x10u + i);   /* NeGcon I / right stick */
+        rows[i].ry = (rnet_u8)(0xF0u - i);   /* NeGcon II */
     }
     n = rnet_proto_encode_rb_seal_rows(buf, sizeof(buf), MAGIC, 0xABCD, 1, 7u, 50u, 56u, 1u, 0u, rows, 3u);
     expect_true(n > 0, "rb_seal_rows encodes");
@@ -59,6 +61,20 @@ int main(void)
     expect_true(dec.rb_slot == 1u && dec.rb_row_count == 3u && dec.rb_row_begin == 0u, "rb_seal_rows meta");
     expect_true(dec.rb_rows[0].buttons == 0x300u && dec.rb_rows[2].buttons == 0x302u, "rb_seal_rows payload");
     expect_true(dec.rb_rows[1].stick_x == 21 && dec.rb_rows[1].is_valid == 1u, "rb_seal_rows sticks");
+    expect_true(dec.rb_rows[2].source == 2u, "rb_seal_rows preserves JogCon source");
+    expect_true(dec.rb_rows[0].source == 3u, "rb_seal_rows preserves NeGcon source");
+    expect_true(dec.rb_rows[1].source == 1u, "rb_seal_rows preserves DualShock source");
+    expect_true(dec.rb_rows[0].rx == 0x10u && dec.rb_rows[2].rx == 0x12u &&
+                    dec.rb_rows[1].ry == 0xEFu,
+                "rb_seal_rows carries the rest of the pad (rx/ry)");
+    expect_true(rnet_proto_decode(buf, (size_t)n - 2u, MAGIC, &dec) != 0,
+                "a seal row short of its 9 bytes is rejected");
+
+    /* HELLO carries the wire version */
+    n = rnet_proto_encode_hello(buf, sizeof(buf), MAGIC, 0xABCD, 1, 2, 4);
+    expect_true(n > 0 && rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0 &&
+                    dec.wire_version == RNET_WIRE_VERSION && dec.delay == 4u,
+                "hello carries the wire version");
 
     /* Truncated seal rows rejected */
     expect_true(rnet_proto_decode(buf, 12u, MAGIC, &dec) != 0, "truncated packet rejected");
@@ -92,6 +108,18 @@ int main(void)
     expect_true(n > 0, "rb_resolved encodes");
     expect_true(rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0, "rb_resolved decodes");
     expect_true(dec.type == RNET_PKT_RB_RESOLVED && dec.rb_resolved_through == 61u, "rb_resolved payload");
+
+    /* Generation trailer survives transport and is checksummed. */
+    expect_true(dec.input_epoch == 0, "legacy rollback packet is generation zero");
+    n = rnet_proto_tag_rb_epoch(buf, (size_t)n, sizeof(buf), 513);
+    expect_true(n > 0 && rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) == 0,
+                "tagged rollback packet decodes");
+    expect_true(dec.input_epoch == 513 && dec.rb_resolved_through == 61u,
+                "generation and payload survive");
+    buf[n - 6] ^= 1;
+    expect_true(rnet_proto_decode(buf, (size_t)n, MAGIC, &dec) != 0,
+                "generation corruption rejected");
+    buf[n - 6] ^= 1;
 
     /* Bad magic rejected */
     expect_true(rnet_proto_decode(buf, (size_t)n, 0xBADu, &dec) != 0, "bad magic rejected");

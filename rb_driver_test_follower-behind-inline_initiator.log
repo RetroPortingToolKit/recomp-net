@@ -1,0 +1,118 @@
+rbe: FORCE MISPREDICT every 15 remote row (validation only)
+rb_test: ROLLBACK start slot=0 slots=2 D=8 P=12 snap_interval=1 snap_depth=128 (reach 128 ticks) tip_runway=12
+rb_test: RB boot digest agreed (a4a1963a)
+rbe: forced late row slot=1 sim=15 (invent + corrupt)
+rbe: RESIM episode #1 initiator slot=1 mismatch=15 load=15 target=15 (rewind 1 frames, replay 1) epoch=8
+rb_test: RB committed epoch=8 span=15..15 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=8 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=30 (invent + corrupt)
+rbe: RESIM episode #2 initiator slot=1 mismatch=30 load=30 target=30 (rewind 1 frames, replay 1) epoch=16
+rb_test: RB committed epoch=16 span=30..30 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=16 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=45 (invent + corrupt)
+rbe: RESIM episode #3 initiator slot=1 mismatch=45 load=45 target=45 (rewind 1 frames, replay 1) epoch=24
+rb_test: RB committed epoch=24 span=45..45 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=24 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=60 (invent + corrupt)
+rbe: RESIM episode #4 initiator slot=1 mismatch=60 load=60 target=60 (rewind 1 frames, replay 1) epoch=32
+rb_test: RB committed epoch=32 span=60..60 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=32 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=75 (invent + corrupt)
+rbe: RESIM episode #5 initiator slot=1 mismatch=75 load=75 target=75 (rewind 1 frames, replay 1) epoch=40
+rb_test: RB committed epoch=40 span=75..75 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=40 held=2 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=90 (invent + corrupt)
+rbe: RESIM episode #6 initiator slot=1 mismatch=90 load=90 target=90 (rewind 1 frames, replay 1) epoch=48
+rb_test: RB committed epoch=48 span=90..90 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=48 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=105 (invent + corrupt)
+rbe: RESIM episode #7 initiator slot=1 mismatch=105 load=105 target=105 (rewind 1 frames, replay 1) epoch=56
+rb_test: RB committed epoch=56 span=105..105 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=56 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=120 (invent + corrupt)
+rbe: RESIM episode #8 initiator slot=1 mismatch=120 load=120 target=120 (rewind 1 frames, replay 1) epoch=64
+rb_test: RB committed epoch=64 span=120..120 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=64 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=135 (invent + corrupt)
+rbe: RESIM episode #9 initiator slot=1 mismatch=135 load=135 target=135 (rewind 1 frames, replay 1) epoch=72
+rb_test: RB committed epoch=72 span=135..135 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=72 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=150 (invent + corrupt)
+rbe: RESIM episode #10 initiator slot=1 mismatch=150 load=150 target=150 (rewind 1 frames, replay 1) epoch=80
+rb_test: RB committed epoch=80 span=150..150 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=80 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=165 (invent + corrupt)
+rbe: RESIM episode #11 initiator slot=1 mismatch=165 load=165 target=165 (rewind 1 frames, replay 1) epoch=88
+rb_test: RB committed epoch=88 span=165..165 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=88 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=180 (invent + corrupt)
+rbe: RESIM episode #12 initiator slot=1 mismatch=180 load=180 target=180 (rewind 1 frames, replay 1) epoch=96
+rb_test: RB committed epoch=96 span=180..180 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=96 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=195 (invent + corrupt)
+rbe: RESIM episode #13 initiator slot=1 mismatch=195 load=195 target=195 (rewind 1 frames, replay 1) epoch=104
+rb_test: RB committed epoch=104 span=195..195 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=104 held=2 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=210 (invent + corrupt)
+rbe: RESIM episode #14 initiator slot=1 mismatch=210 load=210 target=210 (rewind 1 frames, replay 1) epoch=112
+rb_test: RB committed epoch=112 span=210..210 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=112 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=225 (invent + corrupt)
+rbe: RESIM episode #15 initiator slot=1 mismatch=225 load=225 target=225 (rewind 1 frames, replay 1) epoch=120
+rb_test: RB committed epoch=120 span=225..225 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=120 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=240 (invent + corrupt)
+rbe: RESIM episode #16 initiator slot=1 mismatch=240 load=240 target=240 (rewind 1 frames, replay 1) epoch=128
+rb_test: RB committed epoch=128 span=240..240 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=128 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=255 (invent + corrupt)
+rbe: RESIM episode #17 initiator slot=1 mismatch=255 load=255 target=255 (rewind 1 frames, replay 1) epoch=136
+rb_test: RB committed epoch=136 span=255..255 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=136 held=2 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=270 (invent + corrupt)
+rbe: RESIM episode #18 initiator slot=1 mismatch=270 load=270 target=270 (rewind 1 frames, replay 1) epoch=144
+rb_test: RB committed epoch=144 span=270..270 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=144 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=285 (invent + corrupt)
+rbe: RESIM episode #19 initiator slot=1 mismatch=285 load=285 target=285 (rewind 1 frames, replay 1) epoch=152
+rb_test: RB committed epoch=152 span=285..285 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=152 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=300 (invent + corrupt)
+rbe: RESIM episode #20 initiator slot=1 mismatch=300 load=300 target=300 (rewind 1 frames, replay 1) epoch=160
+rb_test: RB committed epoch=160 span=300..300 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=160 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=315 (invent + corrupt)
+rbe: RESIM episode #21 initiator slot=1 mismatch=315 load=315 target=315 (rewind 1 frames, replay 1) epoch=168
+rb_test: RB committed epoch=168 span=315..315 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=168 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=330 (invent + corrupt)
+rbe: RESIM episode #22 initiator slot=1 mismatch=330 load=330 target=330 (rewind 1 frames, replay 1) epoch=176
+rb_test: RB committed epoch=176 span=330..330 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=176 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=345 (invent + corrupt)
+rbe: RESIM episode #23 initiator slot=1 mismatch=345 load=345 target=345 (rewind 1 frames, replay 1) epoch=184
+rb_test: RB committed epoch=184 span=345..345 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=184 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=360 (invent + corrupt)
+rbe: RESIM episode #24 initiator slot=1 mismatch=360 load=360 target=360 (rewind 1 frames, replay 1) epoch=192
+rb_test: RB committed epoch=192 span=360..360 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=192 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=375 (invent + corrupt)
+rbe: RESIM episode #25 initiator slot=1 mismatch=375 load=375 target=375 (rewind 1 frames, replay 1) epoch=200
+rb_test: RB committed epoch=200 span=375..375 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=200 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=390 (invent + corrupt)
+rbe: RESIM episode #26 initiator slot=1 mismatch=390 load=390 target=390 (rewind 1 frames, replay 1) epoch=208
+rb_test: RB committed epoch=208 span=390..390 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=208 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=405 (invent + corrupt)
+rbe: RESIM episode #27 initiator slot=1 mismatch=405 load=405 target=405 (rewind 1 frames, replay 1) epoch=216
+rb_test: RB committed epoch=216 span=405..405 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=216 held=1 ticks (runway 12) — every peer committed
+rbe: forced late row slot=1 sim=420 (invent + corrupt)
+rbe: RESIM episode #28 initiator slot=1 mismatch=420 load=420 target=420 (rewind 1 frames, replay 1) epoch=224
+rb_test: RB quiesce requested at sim=421 (host request) — stage=verifying; no new episode or local tip-extend opens from here, open ones finish, peer BEGINs are still followed
+rb_test: RB committed epoch=224 span=420..420 — tip-hold for 12 ticks
+rb_test: RB tip-hold ended epoch=224 held=1 ticks (runway 12) — every peer committed
+rb_test: RB quiesce: seat 1 will open no more episodes (its sim=433, ours=437)
+rb_test: RB quiesced at sim=437 after 256 ms (requested at sim=421: host request) — no episode open here and every peer has promised to open none. Opened here: 28 as initiator, 0 as follower; corrections not opened while draining: 0; still owed: 0; peers acknowledged 2 of 2; follows that waited for their load tick: 0, that took it at our tip: 0; POSTs re-sent: 12, BEGINs re-sent: 12

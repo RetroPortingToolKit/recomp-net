@@ -165,6 +165,14 @@ typedef struct RNetLobbyModPkg {
      * row, which claims possession only. Never part of the seat decision --
      * the server matches on (id, ver). */
     char feats[RNET_LOBBY_MOD_FEATS_LEN];
+    /* Offer rows only: comma-separated ids of this package's features whose
+     * required owner files (a source ROM, say) this peer has not provided.
+     * Every such feature, not just the ones the host enabled, so the claim
+     * stays true when the host changes the plan and the host intersects it
+     * with its own. Empty on a plan row, and on the wire only when non-empty:
+     * an offer without it reads as "nothing missing", which is what an older
+     * peer that cannot tell would have said. */
+    char nf[RNET_LOBBY_MOD_FEATS_LEN];
 } RNetLobbyModPkg;
 
 /* Fills `out` with the packages this peer already has, returning the count.
@@ -199,6 +207,23 @@ int rnet_lobby_match_blocked_by_mods(char *who, size_t who_cap,
  * and our own announced offer see it. */
 int rnet_lobby_local_missing_mods(void);
 
+/* The second half of the launch gate: plan features whose required owner files
+ * a seated peer says it has not provided (RNetLobbyModPkg.nf), counted over the
+ * OTHER seated players. Names the first offender and its first "package/feature"
+ * pair. A package the peer does not have at all is the mods gate's business
+ * and is not counted here. */
+int rnet_lobby_match_blocked_by_files(char *who, size_t who_cap,
+                                      char *what, size_t what_cap);
+
+/* Mod readiness of member `index` (as rnet_lobby_member_get indexes it)
+ * against the published plan: plan packages it does not have, and plan
+ * features it has the package for but lacks required files for. `files`, when
+ * given, receives those features as ';'-separated "package/feature" pairs.
+ * Returns 1 when filled, 0 for a bad index or no plan. */
+int rnet_lobby_member_mod_readiness(int index, int *mods_missing,
+                                    int *files_missing, char *files,
+                                    size_t files_cap);
+
 /*
  * Host-authoritative sim settings negotiated over the lobby.
  * Guests apply these on launch so both peers boot with matching caps.
@@ -227,6 +252,12 @@ typedef struct RNetLobbyMatchCaps {
      * it; the server falls back to its relay unless every guest proved the
      * path (recomp_net/host_relay.h). Guests read it to know the room asks. */
     int  relay_host;
+    /* 0/1 -- match_caps.relay_via = "ice": with relay_host, the host carries
+     * the match over ICE agents the waiting room connects (one per guest;
+     * recomp_net/host_ice.h) instead of a UDP port it advertises. Published by
+     * a host whose rnet_lobby_relay_via_ice() is on and whose build has ICE;
+     * read by everyone. */
+    int  relay_via_ice;
     int  rollback;         /* 0/1 — session mode; lobby default ON */
     /* The host's required mod plan, one row per PACKAGE.
      *
@@ -374,11 +405,22 @@ typedef struct RNetLobbyJoinInfo {
      * guest (2 seats) or hubs (3+). 0 on an SFU launch and from a server that
      * predates the host relay. */
     int      transport_host;
+    /* The launch said transport "host" AND relay_via "ice": the match rides the
+     * ICE agents the waiting room already connected. host_endpoint is empty,
+     * bind_hostport / peer_hostport are not to be used (the transport_host UDP
+     * path must NOT be taken). Obtain the agents with rnet_lobby_ice_take_hub
+     * (host) or rnet_lobby_ice_take_guest_agent (guest) and give them to the
+     * session (rnet_session_start_ice_hub_adopt / rnet_session_adopt_ice_agent).
+     * transport_host is also 1 in this case; test transport_ice_hub first. */
+    int      transport_ice_hub;
     /* The launch said the host runs the match from the gallery (session slot
      * 0, pad muted, players at lobby seat + 1). 0 from a server that predates
      * it and on every launch where the host holds a player seat. */
     int      host_spectates;
     char     last_error[64]; /* need_password | bad_password | … */
+    /* Two-player transport "ice" in a relay_via "ice" room: adopt its waiting-room pair
+     * with the same take_hub / take_guest_agent handover, never UDP endpoints. */
+    int      transport_ice_pair;
 } RNetLobbyJoinInfo;
 
 /* RNET_LOBBY_URL (or <legacy_env_prefix>LOBBY_URL), else
@@ -397,6 +439,10 @@ const char *rnet_lobby_player_id(void);
 
 /* Non-blocking pump — call every frame from the launcher. */
 void rnet_lobby_pump(void);
+/* The engine owns the handed-over match agents while active. Keep pumping
+ * lobby keepalive/chat, but do not create replacement waiting-room links.
+ * Clear on match shutdown before preparing the next room. */
+void rnet_lobby_set_match_active(int active);
 /* 1 once the server's `welcome` has assigned a player id: the WebSocket
  * upgrade is done and ops will be answered. */
 int  rnet_lobby_ready(void);
@@ -433,6 +479,23 @@ int rnet_lobby_version_filter_strict(void);
 void rnet_lobby_request_list(void);
 int  rnet_lobby_list_count(void);
 int  rnet_lobby_list_get(int index, RNetLobbyRow *out);
+
+/* Room-list latency in ms, before joining. Each rnet_lobby_request_list
+ * (first open, Refresh) probes every listed room without a password once:
+ * a short direct ICE link to its host, a few pings, closed. That figure is
+ * returned with *is_direct = 1 (is_direct may be NULL). Until it lands, or
+ * for a room it could not reach, the estimate below stands in (*is_direct
+ * = 0). -1 when neither is known. */
+int  rnet_lobby_list_latency_ms(int index, int *is_direct);
+/* Through-the-server estimate: our round trip to the lobby server plus the
+ * room host's (the server's per-row host_rtt_ms). Overstates a direct link.
+ * -1 when either half is unknown (or an older server). */
+int  rnet_lobby_list_latency_estimate_ms(int index);
+/* Our round trip to the lobby server, timed once per connection and once per
+ * list request; -1 until measured or when offline. */
+int  rnet_lobby_server_rtt_ms(void);
+#define RNET_LOBBY_HAS_LIST_LATENCY 1
+#define RNET_LOBBY_HAS_LIST_DIRECT_LATENCY 1
 /* Players connected to the hub, refreshed with every lobby_list. */
 int  rnet_lobby_online_count(void);
 int  rnet_lobby_online_get(int index, RNetLobbyOnlinePlayer *out);
@@ -562,6 +625,51 @@ const RNetLobbyJoinInfo *rnet_lobby_join_info(void);
  */
 void rnet_lobby_set_relay_host_pref(int on);
 int  rnet_lobby_relay_host_pref(void);
+/*
+ * Host relay over ICE (recomp_net/host_ice.h). The host's preference, default
+ * ON: with relay_host, publish match_caps.relay_via = "ice" (only when this
+ * build has ICE; otherwise the legacy advertised-port relay is used). In that
+ * room the host holds NO port (no set_host_endpoint, no UPnP / NAT-PMP / STUN):
+ * every seated guest proves the path with an ICE agent pair and reports
+ * path_report direct. Also sent as "ice_relay": true in automatch_queue.
+ */
+void rnet_lobby_set_relay_via_ice(int on);
+int  rnet_lobby_relay_via_ice(void);
+/* Live state of the waiting-room agents (RNetHostIceStatus, host_ice.h).
+ * Returns 1 when the room runs them, 0 when idle. */
+struct RNetHostIceStatus;
+int  rnet_lobby_host_ice_status(struct RNetHostIceStatus *out);
+
+/*
+ * Launch handover for transport_ice_hub (see RNetLobbyJoinInfo). The agents
+ * are captured by the client when `launch` arrives, and are the engine's to
+ * take once -- BEFORE rnet_lobby_clear_launch_pending(), though an untaken
+ * bundle is kept for 60 s, until the next launch, or until leave/disconnect.
+ *
+ * HOST: fills out[0..n) and returns n >= 1; ownership of each agent passes to
+ * the caller, who must pass it to rnet_session_start_ice_hub_adopt with the
+ * SESSION slot it maps lobby_slot to (this library does not know the engine's
+ * slot mapping, host_spectates offset, etc.). Returns -1 when no handover is
+ * pending or max is too small; see rnet_lobby_ice_launch_error.
+ * GUEST: returns the one agent connected to the host (ownership to the
+ * caller: rnet_session_adopt_ice_agent), or NULL.
+ * A launch in which any seated guest (or the guest's own link to the host) is
+ * not COMPLETED is refused by the client itself: launch_pending stays 0,
+ * join.last_error = "ice_not_connected" and rnet_lobby_ice_launch_error()
+ * names the seat -- never a silently smaller room.
+ */
+typedef struct RNetLobbyIceSeat {
+    int  lobby_slot;                       /* the guest's seat in the lobby */
+    char player_id[RNET_LOBBY_ID_LEN];
+    struct RNetIceAgent *agent;            /* COMPLETED, opaque, owned by caller */
+} RNetLobbyIceSeat;
+int  rnet_lobby_ice_take_hub(RNetLobbyIceSeat *out, int max);
+struct RNetIceAgent *rnet_lobby_ice_take_guest_agent(void);
+/* Why the last ICE launch was refused or a take failed ("" when none). */
+const char *rnet_lobby_ice_launch_error(void);
+/* Destroy an untaken bundle now (the engine will not start this match). */
+void rnet_lobby_ice_discard(void);
+
 /* Live state for the waiting room (see RNetHostRelayStatus). Returns 1 when
  * the orchestration is doing anything (host or guest role), 0 when idle. */
 struct RNetHostRelayStatus;
@@ -597,6 +705,20 @@ int  rnet_lobby_all_ready(void);
 
 /* Toggle ready in the current lobby. */
 int  rnet_lobby_set_ready(int ready);
+
+/* This peer cannot launch at all right now -- it has no verified copy of the
+ * game to boot. While blocked, every set_ready this client sends says false
+ * (the join and lobby_update auto-arm included), so the host's launch gate
+ * holds the match and names this player until the block lifts; lifting it
+ * re-announces ready. A local fact, not per-connection state: it survives a
+ * disconnect. The launcher sets it from the same check that enables PLAY. */
+#define RNET_HAS_LAUNCH_BLOCKED 1
+void rnet_lobby_set_launch_blocked(int blocked);
+
+/* Seated players, other than this one, whose last set_ready said false. Names
+ * the first. The host's start gate: a peer that cannot boot the game must not
+ * be launched into a match it would never join. */
+int  rnet_lobby_match_blocked_by_unready(char *who, size_t who_cap);
 
 /*
  * Host: ask server to broadcast launch. When match_caps is non-NULL and valid,
