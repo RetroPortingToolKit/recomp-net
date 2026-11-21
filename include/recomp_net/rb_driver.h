@@ -351,6 +351,7 @@ uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d);
  * correction is pending through that tick. This is stricter than the
  * confirmation watermark, which can advance across discarded history.
  * On failure, leave the output untouched. */
+#define RNET_RB_HAS_CONFIRMED_DIGEST 1
 int rnet_rb_driver_confirmed_digest(const RNetRbDriver *d, uint32_t tick,
                                     uint32_t *digest);
 int rnet_rb_driver_episode_active(const RNetRbDriver *d);
