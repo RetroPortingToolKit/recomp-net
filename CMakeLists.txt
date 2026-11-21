@@ -306,6 +306,9 @@ endif()
 
 # ---- Tests ----
 if(RNET_BUILD_TESTS)
+  add_executable(netsim_burst_test tests/netsim_burst_test.c src/transport/rnet_netsim.c)
+  target_include_directories(netsim_burst_test PRIVATE include src)
+  add_test(NAME netsim_burst_test COMMAND netsim_burst_test)
   enable_testing()
 
   find_package(Python3 QUIET COMPONENTS Interpreter)

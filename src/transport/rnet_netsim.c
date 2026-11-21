@@ -6,9 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 60 Hz x ~4 packets/frame x 250 ms of hold is ~60 entries. 256 is ~4x that,
- * and the whole table only exists when the simulator is engaged. */
-#define RNET_NETSIM_SLOTS 256u
+/* Seal/baseline keepalives also arrive while simulation is parked, so frame
+ * rate does not bound this queue. Real delayed rollback bursts exceed 256
+ * packets and previously escaped the configured delay. Keep bounded burst
+ * headroom; allocation still exists only when the simulator is engaged. */
+#define RNET_NETSIM_SLOTS 1024u
 #define RNET_NETSIM_BANNER_MS 10000u
 /* Latency past this is a typo, not a test (a 5 s hold would look like a hang
  * and time out every handshake in the stack). */
