@@ -88,7 +88,7 @@ int main(int argc, char **argv) {
     RNetSession *session; RNetRbDriver *driver;
     int slot, slots, delay = 3, started = 0, ready = 0, draining = 0, late_sent = 0;
     unsigned mismatch, late, target = 220, live_after_refusal = 0;
-    uint32_t start, refused_at = 0, sim_at_refusal = 0;
+    uint32_t refused_at = 0, sim_at_refusal = 0;
     char ready_path[2048], stop_path[2048], reason[64] = "";
     const char *expected;
     if (argc != 10) return 2;
@@ -119,8 +119,9 @@ int main(int argc, char **argv) {
     host.digest_master = digest; host.digest_parts = parts;
     host.decode_sample = decode; host.neutral_row = neutral;
     host.request_return_to_lobby = refused; host.log = log_line; host.now_ms = now;
-    start = now(NULL);
-    while ((uint32_t)(now(NULL) - start) < 15000u) {
+    /* The ready/stop markers bound the tick workload; a refused session is
+     * observed below. Do not replace either contract with a host-time kill. */
+    for (;;) {
         RNetRbAdmit admit; FILE *marker;
         rnet_session_pump(session);
         if (!started) {

@@ -500,7 +500,6 @@ if(RNET_BUILD_TESTS)
     target_link_libraries(rb_boot_peer PRIVATE recomp_net)
     add_test(NAME rb_boot_digest_test COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/rb_boot_digest_test.py --peer $<TARGET_FILE:rb_boot_peer>)
-    set_tests_properties(rb_boot_digest_test PROPERTIES TIMEOUT 120)
   else()
     message(STATUS "Boot datagram regression requires a Python3 interpreter")
   endif()
