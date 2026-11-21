@@ -6,11 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Seal/baseline keepalives also arrive while simulation is parked, so frame
- * rate does not bound this queue. Real delayed rollback bursts exceed 256
- * packets and previously escaped the configured delay. Keep bounded burst
- * headroom; allocation still exists only when the simulator is engaged. */
-#define RNET_NETSIM_SLOTS 1024u
+/* A legal state transfer spans up to RNET_STATE_MAX_CHUNKS datagrams.
+ * Rollback baseline/seal traffic also arrives while simulation is parked;
+ * frame rate does not bound the burst (the 80 ms path exceeded 1024).
+ * Bound storage by one full protocol-sized transfer plus the previous 1024
+ * control slots. This is about 10 MiB per engaged simulator on 64-bit hosts;
+ * the ordinary, simulator-off receive path still allocates nothing. */
+#define RNET_NETSIM_SLOTS (RNET_STATE_MAX_CHUNKS + 1024u)
 #define RNET_NETSIM_BANNER_MS 10000u
 /* Latency past this is a typo, not a test (a 5 s hold would look like a hang
  * and time out every handshake in the stack). */
@@ -250,8 +252,8 @@ int rnet_netsim_due(RNetNetSim *sim, rnet_u8 *buf, size_t cap,
     }
     now = rnet_os_monotonic_ms();
     /* Earliest DUE, not oldest held: jitter is allowed to reorder, and a
-     * linear scan of 256 slots a few times a frame is free next to the
-     * emulation it is measuring. */
+     * bounded scan also preserves deterministic due-time ordering; it
+     * does not release any packet before its configured delay. */
     for (i = 0u; i < RNET_NETSIM_SLOTS; ++i)
     {
         if (sim->slot[i].in_use == 0)
