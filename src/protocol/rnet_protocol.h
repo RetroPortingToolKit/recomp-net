@@ -101,8 +101,9 @@ typedef struct RNetRbWireFrame
 #define RNET_RB_SEAL_ROWS_WIRE_FRAME_BYTES 9u
 /* Wire version, sent in HELLO's former reserved byte (0 from a peer that
  * predates it). Peers of different versions refuse to link: version 2 widened
- * the seal-row frame, which an older peer would misparse. */
-#define RNET_WIRE_VERSION 2u
+ * the seal-row frame. Version 3 adds a required safe-load meaning to prefix
+ * NACKs; older drivers cannot recover those refusals correctly. */
+#define RNET_WIRE_VERSION 3u
 /* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
  * chunks its own seal rows has to know the bound the send path enforces. */
 

@@ -158,6 +158,48 @@ int main(void)
     d = rnet_input_contract_stick_replace_decide(&pub, &wire, 1, &params, &gates);
     CHECK(d == nRNetInputContractPromoteHashConfirm, "hash_confirm → promote");
 
+    /* The live-tip baseline at 2313 already depends on invented input2312.
+     * Detect that BEFORE its late wire arrives/marks a correction owed. A
+     * separate seat and the ring's physical order must not hide the earliest
+     * dependency, and authoritative promotion must remove it without altering
+     * the other rows. */
+    {
+        RNetInputHist prefix;
+        RNetRbFrame row;
+        uint32_t tick = 123u;
+        int slot = -1;
+        rnet_ih_reset(&prefix, 4);
+        CHECK(rnet_ih_invent_idle(&prefix, 1, 2312u, &row), "baseline: invent prior input");
+        CHECK(rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2313u, &tick, &slot) &&
+              tick == 2312u && slot == 1, "baseline detects unknown earlier wire before live-tip snapshot");
+        CHECK(!rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2312u, &tick, &slot),
+              "input at the load tick does not affect the before-load baseline");
+        CHECK(!rnet_ih_first_predicted(&prefix, 0x8u, 2200u, 2313u, &tick, &slot),
+              "empty/unoccupied seats are excluded by the settled mask");
+        CHECK(rnet_ih_invent_idle(&prefix, 3, 2300u, &row), "baseline: earlier second seat");
+        CHECK(rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2313u, &tick, &slot) &&
+              tick == 2300u && slot == 3, "earliest input wins across seats and ring indices");
+        row.is_predicted = 0;
+        CHECK(rnet_ih_promote(&prefix, 3, &row), "baseline: authoritative earlier row");
+        CHECK(rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2313u, &tick, &slot) &&
+              tick == 2312u && slot == 1, "promotion leaves the other unsettled dependency visible");
+        CHECK(rnet_ih_get(&prefix, 1, 2312u, &row), "baseline: get remaining prediction");
+        row.is_predicted = 0;
+        CHECK(rnet_ih_promote(&prefix, 1, &row), "baseline: remaining wire arrives");
+        tick = 99u; slot = 7;
+        CHECK(!rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2313u, &tick, &slot) &&
+              tick == 99u && slot == 7, "settled prefix leaves no dependency and does not mutate outputs");
+        CHECK(rnet_ih_invent_idle(&prefix, 1, 2312u, &row), "baseline: recreate stale ring row");
+        row.tick += RNET_INPUT_HIST_DEPTH;
+        row.is_predicted = 0;
+        CHECK(rnet_ih_put(&prefix, 1, &row), "baseline: overwrite physical ring slot");
+        CHECK(!rnet_ih_first_predicted(&prefix, 0xau, 2200u, 2313u, NULL, NULL),
+              "ring reuse cannot resurrect an old prediction");
+        CHECK(!rnet_ih_first_predicted(NULL, 0xffu, 0u, 1u, NULL, NULL) &&
+              !rnet_ih_first_predicted(&prefix, 0xffu, 2313u, 2200u, NULL, NULL),
+              "invalid or empty intervals are bounded no-ops");
+    }
+
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;

@@ -74,6 +74,33 @@ int rnet_ih_get(const RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *ou
     return 1;
 }
 
+int rnet_ih_first_predicted(const RNetInputHist *h, uint32_t slot_mask,
+                             uint32_t from, uint32_t before,
+                             uint32_t *tick, int *slot)
+{
+    uint32_t first = before, i;
+    int seat, found = -1;
+    if (!h || from >= before)
+        return 0;
+    for (seat = 0; seat < h->slot_count; ++seat) {
+        if (!(slot_mask & (1u << seat)))
+            continue;
+        for (i = 0; i < RNET_INPUT_HIST_DEPTH; ++i) {
+            const RNetRbFrame *row = &h->rows[seat][i];
+            if (row->is_valid && row->is_predicted &&
+                row->tick >= from && row->tick < first) {
+                first = row->tick;
+                found = seat;
+            }
+        }
+    }
+    if (found < 0)
+        return 0;
+    if (tick) *tick = first;
+    if (slot) *slot = found;
+    return 1;
+}
+
 int rnet_ih_invent_hold_last(RNetInputHist *h, int slot, uint32_t tick, RNetRbFrame *out)
 {
     RNetRbFrame invented;
