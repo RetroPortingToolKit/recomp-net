@@ -3533,7 +3533,7 @@ static int rb_stage_expired(RNetRbDriver *d)
 #define RB_POST_RESEND_MIN_MS 50u
 
 /* See begin_resend_ms. Initiator only, while the episode waits on peers. */
-static void rb_begin_resend(RNetRbDriver *d)
+static void rb_begin_resend(RNetRbDriver *d, int immediate)
 {
     RNetSession *s = rb_session(d);
     uint32_t now = rb_now(d);
@@ -3541,7 +3541,7 @@ static void rb_begin_resend(RNetRbDriver *d)
     uint32_t every = d->rtt_ema_ms > RB_POST_RESEND_MIN_MS ? d->rtt_ema_ms
                                                             : RB_POST_RESEND_MIN_MS;
     if (!s || !d->initiator || (d->answered_mask & expect) == expect ||
-        (uint32_t)(now - d->begin_resend_ms) < every)
+        (!immediate && (uint32_t)(now - d->begin_resend_ms) < every))
         return;
     rnet_session_send_rb_sync(s, d->corr.epoch_id, d->corr.mismatch_tick,
                               d->corr.load_tick, d->corr.target_tick,
@@ -3554,18 +3554,47 @@ static void rb_begin_resend(RNetRbDriver *d)
 }
 
 /* See post_resend_ms. */
-static void rb_post_resend(RNetRbDriver *d)
+static void rb_post_resend(RNetRbDriver *d, int immediate)
 {
     RNetSession *s = rb_session(d);
     uint32_t now = rb_now(d);
     uint32_t every = d->rtt_ema_ms > RB_POST_RESEND_MIN_MS ? d->rtt_ema_ms
                                                             : RB_POST_RESEND_MIN_MS;
-    if (!s || (uint32_t)(now - d->post_resend_ms) < every)
+    if (!s || (!immediate && (uint32_t)(now - d->post_resend_ms) < every))
         return;
     rnet_session_send_rb_post(s, d->corr.epoch_id, d->corr.target_tick,
                               d->local_post_digest, 0u, 1u);
     d->post_resend_ms = now;
     d->n_post_resent++;
+}
+
+void rnet_rb_driver_peer_reconnected(RNetRbDriver *d)
+{
+    RNetSession *s;
+    if (!d || !d->started)
+        return;
+    switch (d->stage) {
+    case kRbSealing:
+    case kRbVerifying:
+    case kRbTipHold:
+        d->stage_entered_ms = rb_now(d);
+        rb_begin_resend(d, 1);
+        /* A peer may have missed the rows and baseline sent with BEGIN. */
+        rb_send_local_seal_rows(d);
+        break;
+    default:
+        return;
+    }
+    s = rb_session(d);
+    if (s && d->local_base_valid) {
+        const RNetRbDigestParts *p = &d->local_base;
+        rnet_session_send_rb_baseline(s, d->corr.epoch_id, d->corr.load_tick,
+                                      p->master, p->part[0], p->part[1], p->part[2]);
+    }
+    if (d->stage == kRbVerifying || d->stage == kRbTipHold) {
+        d->post_sent_ms = 0u; /* Do not sample RTT across the interruption. */
+        rb_post_resend(d, 1);
+    }
 }
 
 /* A snapshot before load includes every earlier predicted input. Resolve
@@ -3623,7 +3652,7 @@ static void rb_pump_episode(RNetRbDriver *d)
             rb_episode_abort(d, RNET_RB_ABORT_CLASS_ABORT,
                              "timed out waiting for peer seal rows");
         } else {
-            rb_begin_resend(d);
+            rb_begin_resend(d, 0);
         }
         break;
     case kRbVerifying: {
@@ -3670,8 +3699,8 @@ static void rb_pump_episode(RNetRbDriver *d)
             rb_episode_abort(d, RNET_RB_ABORT_CLASS_ABORT,
                              "timed out waiting for peer POST");
         } else {
-            rb_begin_resend(d);
-            rb_post_resend(d);
+            rb_begin_resend(d, 0);
+            rb_post_resend(d, 0);
         }
         break;
     }
@@ -3697,7 +3726,7 @@ static void rb_pump_episode(RNetRbDriver *d)
         } else {
             /* A peer that lost our POST is still verifying; every peer that
              * has committed has told us so, and tip-hold ends when all have. */
-            rb_post_resend(d);
+            rb_post_resend(d, 0);
         }
         break;
     default:

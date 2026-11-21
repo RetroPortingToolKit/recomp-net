@@ -334,6 +334,12 @@ void rnet_rb_driver_set_hold(RNetRbDriver *d, uint32_t tick);
 void rnet_rb_driver_clear_hold(RNetRbDriver *d);
 int rnet_rb_driver_hold_settled(const RNetRbDriver *d);
 
+/* The host resumed traffic with the same negotiated peers after suspending
+ * admission. Retry the outstanding exchange with a fresh timeout. This
+ * changes no seats, snapshots or agreed input rows. */
+#define RNET_RB_HAS_PEER_RECONNECTED 1
+void rnet_rb_driver_peer_reconnected(RNetRbDriver *d);
+
 /* Diagnostics. */
 uint32_t rnet_rb_driver_sim_tick(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_episode_count(const RNetRbDriver *d);
