@@ -106,10 +106,13 @@ def run(peer, name, slots=2, drops=0, mismatch=False, late=False, permanent=Fals
             if permanent or mismatch:
                 reason = 'boot_digest_timeout' if permanent else 'boot_digest_mismatch'
                 assert all(r['reason'] == reason and r['refused'] == 1 and r['sim_at_refusal'] == 1 and
-                           r['live_after_refusal'] == 0 for r in reports), (name, reports)
+                           r['live_after_refusal'] == 0 and not r['proof_seen']
+                           for r in reports), (name, reports)
             else:
                 assert all(r['agreed'] == 1 and not r['refused'] and r['sim'] >= 220 and
-                           r['confirmed'] >= 215 and not r['desync'] for r in reports), (name, reports)
+                           r['confirmed'] >= 215 and not r['desync'] and r['proof_seen']
+                           for r in reports), (name, reports)
+                assert len({r['proof_digest'] for r in reports}) == 1, (name, reports)
             if drops:
                 assert dropped == drops and requests > 0, (name, dropped, requests)
             if late:

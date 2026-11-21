@@ -4538,6 +4538,38 @@ uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d)
     return (d && d->sim > through) ? (d->sim - through) : 0u;
 }
 
+int rnet_rb_driver_confirmed_digest(const RNetRbDriver *d, uint32_t tick,
+                                    uint32_t *digest)
+{
+    uint32_t mask, from, owed, agreed = 0;
+    int slot, owed_slot;
+
+    if (!d || !d->started || !d->rb || d->refusal || d->stage != kRbIdle ||
+        d->in_resim || d->pending_admit != RNET_RB_ADMIT_STALL ||
+        tick >= d->sim || d->sim - tick > RNET_INPUT_HIST_DEPTH ||
+        tick > rnet_rb_resolved_through(d->rb) || !rb_hc_confirm_through(d, tick))
+        return 0;
+
+    mask = rb_expect_mask(d);
+    for (slot = 0; slot < RB_MAX_SLOTS; ++slot) {
+        uint32_t peer;
+        if (!(mask & (1u << slot)))
+            continue;
+        if (!rnet_hc_local_digest(&d->hc[slot], tick, &agreed) ||
+            !rnet_hc_peer_digest(&d->hc[slot], tick, &peer) || agreed != peer)
+            return 0;
+    }
+
+    from = d->sim > RNET_INPUT_HIST_DEPTH ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    if ((rb_owed_first(d, &owed, &owed_slot) && owed <= tick) ||
+        rnet_ih_first_predicted(&d->ih, mask, from, tick + 1u, NULL, NULL))
+        return 0;
+
+    if (digest)
+        *digest = agreed;
+    return 1;
+}
+
 int rnet_rb_driver_episode_active(const RNetRbDriver *d)
 {
     return d && d->stage != kRbIdle;

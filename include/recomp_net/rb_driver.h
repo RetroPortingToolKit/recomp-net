@@ -346,6 +346,13 @@ uint32_t rnet_rb_driver_rtt_estimate_ms(const RNetRbDriver *d);
 /* Digest-agreed watermark, and how far the local sim runs past it. */
 uint32_t rnet_rb_driver_confirmed_through(const RNetRbDriver *d);
 uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d);
+/* Return 1 and optionally write the exact post-tick digest when every
+ * occupied remote seat has agreed to that retained revision and no input
+ * correction is pending through that tick. This is stricter than the
+ * confirmation watermark, which can advance across discarded history.
+ * On failure, leave the output untouched. */
+int rnet_rb_driver_confirmed_digest(const RNetRbDriver *d, uint32_t tick,
+                                    uint32_t *digest);
 int rnet_rb_driver_episode_active(const RNetRbDriver *d);
 /* Bounded snapshot for a stalled match report. */
 void rnet_rb_driver_debug_state(const RNetRbDriver *d, char *out, size_t cap);
