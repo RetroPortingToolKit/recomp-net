@@ -192,6 +192,7 @@ struct RNetRbDriver {
     uint8_t  ident_sent;
     uint8_t  ident_owed;         /* a peer repeated its IDENT: it may lack ours */
     uint32_t ident_sent_ms;
+    uint32_t ident_hold_since_ms;
     /* Per peer seat, like the chains they watch. */
     uint32_t chain_fork_tick[RB_MAX_SLOTS];    /* last frame-commit fork reported */
     uint32_t chain_pending_tick[RB_MAX_SLOTS]; /* mismatch under observation, 0 = none */
@@ -1278,6 +1279,20 @@ static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
     if (d->local_modset && !d->modset_settled && d->stage == kRbIdle) {
         if (tag_out)
             *tag_out = "modset_wait";
+        return 1u;
+    }
+    if (sim == 0u && d->stage == kRbIdle &&
+        (d->local_build_fp || d->local_content_fp) &&
+        (rb_expect_mask(d) & ~d->peer_ident_mask)) {
+        const uint32_t now = rb_now(d);
+        if (d->ident_hold_since_ms == 0u)
+            d->ident_hold_since_ms = now;
+        /* IDENT compares the immutable match before tick zero. The boot
+         * digest below needs that first tick to observe the initial state. */
+        if ((uint32_t)(now - d->ident_hold_since_ms) > RB_BOOT_DIGEST_TIMEOUT_MS)
+            rb_refuse(d, "startup_identity_missing");
+        if (tag_out)
+            *tag_out = "startup_identity_wait";
         return 1u;
     }
     if (sim == 1u && d->stage == kRbIdle && rb_boot_digest_gate(d)) {

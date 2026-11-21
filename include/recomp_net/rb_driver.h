@@ -236,7 +236,9 @@ void rnet_rb_driver_destroy(RNetRbDriver *d);
 
 /* Identity and mod set are properties of the PROCESS, not of a match: they
  * survive start()'s cold reset. Set them before start(). Fingerprints are
- * opaque and compared for equality; 0 = not supplied. */
+ * opaque and compared for equality. Supply 0 for an unused fingerprint.
+ * A driver that supplies an identity waits for every occupied peer before
+ * the first simulated tick. */
 void rnet_rb_driver_set_identity(RNetRbDriver *d, uint32_t build_fp, uint32_t content_fp);
 void rnet_rb_driver_set_modset(RNetRbDriver *d, const char *text, RNetRbModSetCheckFn check,
                                RNetRbModSetAdoptFn adopt);
