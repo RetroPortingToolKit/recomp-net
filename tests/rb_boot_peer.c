@@ -89,6 +89,9 @@ int main(int argc, char **argv) {
     int slot, slots, delay = 3, started = 0, ready = 0, draining = 0, late_sent = 0;
     unsigned mismatch, late, target = 220, live_after_refusal = 0;
     uint32_t refused_at = 0, sim_at_refusal = 0;
+    const uint32_t proof_tick = 100u;
+    uint32_t proof_expected = 0, proof_digest = 0;
+    int proof_seen = 0;
     char ready_path[2048], stop_path[2048], reason[64] = "";
     const char *expected;
     if (argc != 10) return 2;
@@ -141,7 +144,19 @@ int main(int argc, char **argv) {
             fclose(marker); rnet_rb_driver_request_quiesce(driver); draining = 1;
         }
         admit = rnet_rb_driver_poll_admit(driver);
+        {
+            uint32_t untouched = 0xfeedfaceu;
+            if (rnet_rb_driver_confirmed_digest(driver, rnet_rb_driver_sim_tick(driver),
+                                                &untouched) ||
+                untouched != 0xfeedfaceu ||
+                (admit != RNET_RB_ADMIT_STALL &&
+                 rnet_rb_driver_confirmed_digest(driver, proof_tick, NULL)) ||
+                (p.state.tick >= target &&
+                 rnet_rb_driver_confirmed_digest(driver, 0u, NULL)))
+                ++p.failed;
+        }
         if (rnet_rb_driver_refusal(driver)) {
+            if (rnet_rb_driver_confirmed_digest(driver, 0u, NULL)) ++p.failed;
             if (!refused_at) {
                 refused_at = now(NULL); sim_at_refusal = rnet_rb_driver_sim_tick(driver);
                 snprintf(reason, sizeof(reason), "%s", rnet_rb_driver_refusal(driver));
@@ -150,7 +165,14 @@ int main(int argc, char **argv) {
             if ((uint32_t)(now(NULL) - refused_at) >= 200) break;
         }
         if (admit != RNET_RB_ADMIT_STALL) {
-            step(&p, p.state.tick); rnet_rb_driver_finish_frame(driver);
+            const uint32_t tick = p.state.tick;
+            step(&p, tick);
+            if (tick == proof_tick) proof_expected = digest(&p);
+            rnet_rb_driver_finish_frame(driver);
+        }
+        if (!proof_seen && rnet_rb_driver_confirmed_digest(driver, proof_tick, &proof_digest)) {
+            proof_seen = 1;
+            if (proof_digest != proof_expected) ++p.failed;
         }
         if (p.unverified || rnet_rb_driver_quiesce_state(driver) == RNET_RB_QUIESCE_DRAINED ||
             rnet_rb_driver_quiesce_state(driver) == RNET_RB_QUIESCE_TIMED_OUT) break;
@@ -162,9 +184,11 @@ int main(int argc, char **argv) {
     }
     printf("{\"slot\":%d,\"sim\":%u,\"confirmed\":%u,\"agreed\":%u,\"unverified\":%u,"
            "\"refused\":%u,\"reason\":\"%s\",\"sim_at_refusal\":%u,\"live_after_refusal\":%u,"
-           "\"desync\":%u,\"failed\":%u,\"late_sent\":%d}\n", slot, p.state.tick,
+           "\"desync\":%u,\"failed\":%u,\"late_sent\":%d,\"proof_seen\":%d,\"proof_digest\":%u}\n",
+           slot, p.state.tick,
            rnet_rb_driver_confirmed_through(driver), p.agreed, p.unverified, p.refused, reason,
-           sim_at_refusal, live_after_refusal, rnet_rb_driver_desync_count(driver), p.failed, late_sent);
+           sim_at_refusal, live_after_refusal, rnet_rb_driver_desync_count(driver), p.failed,
+           late_sent, proof_seen, proof_digest);
     rnet_rb_driver_destroy(driver); rnet_session_destroy(session);
     return started && !p.failed ? 0 : 1;
 }

@@ -1012,6 +1012,11 @@ static void run_scenario(const Scenario *sc, unsigned port_base)
                          who, r->sim_at_refusal);
                 expect_true(r->sim_at_refusal <= 1u, msg);
             }
+            if (sc->force_mod_mismatch) {
+                snprintf(msg, sizeof(msg), "%s: %s refused before tick 0 (sim %u)",
+                         sc->name, who, r->sim_at_refusal);
+                expect_true(r->sim_at_refusal == 0u, msg);
+            }
             snprintf(msg, sizeof(msg), "%s: %s opened no episode", sc->name, who);
             expect_true(r->n_ep_init + r->n_ep_follow == 0u, msg);
         }

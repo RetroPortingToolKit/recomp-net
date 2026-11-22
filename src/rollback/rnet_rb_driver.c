@@ -192,6 +192,7 @@ struct RNetRbDriver {
     uint8_t  ident_sent;
     uint8_t  ident_owed;         /* a peer repeated its IDENT: it may lack ours */
     uint32_t ident_sent_ms;
+    uint32_t ident_hold_since_ms;
     /* Per peer seat, like the chains they watch. */
     uint32_t chain_fork_tick[RB_MAX_SLOTS];    /* last frame-commit fork reported */
     uint32_t chain_pending_tick[RB_MAX_SLOTS]; /* mismatch under observation, 0 = none */
@@ -1278,6 +1279,20 @@ static uint8_t rb_gate_pre_admit_hold(void *ctx, uint32_t sim, uint32_t wire,
     if (d->local_modset && !d->modset_settled && d->stage == kRbIdle) {
         if (tag_out)
             *tag_out = "modset_wait";
+        return 1u;
+    }
+    if (sim == 0u && d->stage == kRbIdle &&
+        (d->local_build_fp || d->local_content_fp) &&
+        (rb_expect_mask(d) & ~d->peer_ident_mask)) {
+        const uint32_t now = rb_now(d);
+        if (d->ident_hold_since_ms == 0u)
+            d->ident_hold_since_ms = now;
+        /* IDENT compares the immutable match before tick zero. The boot
+         * digest below needs that first tick to observe the initial state. */
+        if ((uint32_t)(now - d->ident_hold_since_ms) > RB_BOOT_DIGEST_TIMEOUT_MS)
+            rb_refuse(d, "startup_identity_missing");
+        if (tag_out)
+            *tag_out = "startup_identity_wait";
         return 1u;
     }
     if (sim == 1u && d->stage == kRbIdle && rb_boot_digest_gate(d)) {
@@ -3518,7 +3533,7 @@ static int rb_stage_expired(RNetRbDriver *d)
 #define RB_POST_RESEND_MIN_MS 50u
 
 /* See begin_resend_ms. Initiator only, while the episode waits on peers. */
-static void rb_begin_resend(RNetRbDriver *d)
+static void rb_begin_resend(RNetRbDriver *d, int immediate)
 {
     RNetSession *s = rb_session(d);
     uint32_t now = rb_now(d);
@@ -3526,7 +3541,7 @@ static void rb_begin_resend(RNetRbDriver *d)
     uint32_t every = d->rtt_ema_ms > RB_POST_RESEND_MIN_MS ? d->rtt_ema_ms
                                                             : RB_POST_RESEND_MIN_MS;
     if (!s || !d->initiator || (d->answered_mask & expect) == expect ||
-        (uint32_t)(now - d->begin_resend_ms) < every)
+        (!immediate && (uint32_t)(now - d->begin_resend_ms) < every))
         return;
     rnet_session_send_rb_sync(s, d->corr.epoch_id, d->corr.mismatch_tick,
                               d->corr.load_tick, d->corr.target_tick,
@@ -3539,18 +3554,47 @@ static void rb_begin_resend(RNetRbDriver *d)
 }
 
 /* See post_resend_ms. */
-static void rb_post_resend(RNetRbDriver *d)
+static void rb_post_resend(RNetRbDriver *d, int immediate)
 {
     RNetSession *s = rb_session(d);
     uint32_t now = rb_now(d);
     uint32_t every = d->rtt_ema_ms > RB_POST_RESEND_MIN_MS ? d->rtt_ema_ms
                                                             : RB_POST_RESEND_MIN_MS;
-    if (!s || (uint32_t)(now - d->post_resend_ms) < every)
+    if (!s || (!immediate && (uint32_t)(now - d->post_resend_ms) < every))
         return;
     rnet_session_send_rb_post(s, d->corr.epoch_id, d->corr.target_tick,
                               d->local_post_digest, 0u, 1u);
     d->post_resend_ms = now;
     d->n_post_resent++;
+}
+
+void rnet_rb_driver_peer_reconnected(RNetRbDriver *d)
+{
+    RNetSession *s;
+    if (!d || !d->started)
+        return;
+    switch (d->stage) {
+    case kRbSealing:
+    case kRbVerifying:
+    case kRbTipHold:
+        d->stage_entered_ms = rb_now(d);
+        rb_begin_resend(d, 1);
+        /* A peer may have missed the rows and baseline sent with BEGIN. */
+        rb_send_local_seal_rows(d);
+        break;
+    default:
+        return;
+    }
+    s = rb_session(d);
+    if (s && d->local_base_valid) {
+        const RNetRbDigestParts *p = &d->local_base;
+        rnet_session_send_rb_baseline(s, d->corr.epoch_id, d->corr.load_tick,
+                                      p->master, p->part[0], p->part[1], p->part[2]);
+    }
+    if (d->stage == kRbVerifying || d->stage == kRbTipHold) {
+        d->post_sent_ms = 0u; /* Do not sample RTT across the interruption. */
+        rb_post_resend(d, 1);
+    }
 }
 
 /* A snapshot before load includes every earlier predicted input. Resolve
@@ -3608,7 +3652,7 @@ static void rb_pump_episode(RNetRbDriver *d)
             rb_episode_abort(d, RNET_RB_ABORT_CLASS_ABORT,
                              "timed out waiting for peer seal rows");
         } else {
-            rb_begin_resend(d);
+            rb_begin_resend(d, 0);
         }
         break;
     case kRbVerifying: {
@@ -3655,8 +3699,8 @@ static void rb_pump_episode(RNetRbDriver *d)
             rb_episode_abort(d, RNET_RB_ABORT_CLASS_ABORT,
                              "timed out waiting for peer POST");
         } else {
-            rb_begin_resend(d);
-            rb_post_resend(d);
+            rb_begin_resend(d, 0);
+            rb_post_resend(d, 0);
         }
         break;
     }
@@ -3682,7 +3726,7 @@ static void rb_pump_episode(RNetRbDriver *d)
         } else {
             /* A peer that lost our POST is still verifying; every peer that
              * has committed has told us so, and tip-hold ends when all have. */
-            rb_post_resend(d);
+            rb_post_resend(d, 0);
         }
         break;
     default:
@@ -4521,6 +4565,38 @@ uint32_t rnet_rb_driver_confirmed_remaining(const RNetRbDriver *d)
 {
     uint32_t through = rnet_rb_driver_confirmed_through(d);
     return (d && d->sim > through) ? (d->sim - through) : 0u;
+}
+
+int rnet_rb_driver_confirmed_digest(const RNetRbDriver *d, uint32_t tick,
+                                    uint32_t *digest)
+{
+    uint32_t mask, from, owed, agreed = 0;
+    int slot, owed_slot;
+
+    if (!d || !d->started || !d->rb || d->refusal || d->stage != kRbIdle ||
+        d->in_resim || d->pending_admit != RNET_RB_ADMIT_STALL ||
+        tick >= d->sim || d->sim - tick > RNET_INPUT_HIST_DEPTH ||
+        tick > rnet_rb_resolved_through(d->rb) || !rb_hc_confirm_through(d, tick))
+        return 0;
+
+    mask = rb_expect_mask(d);
+    for (slot = 0; slot < RB_MAX_SLOTS; ++slot) {
+        uint32_t peer;
+        if (!(mask & (1u << slot)))
+            continue;
+        if (!rnet_hc_local_digest(&d->hc[slot], tick, &agreed) ||
+            !rnet_hc_peer_digest(&d->hc[slot], tick, &peer) || agreed != peer)
+            return 0;
+    }
+
+    from = d->sim > RNET_INPUT_HIST_DEPTH ? d->sim - RNET_INPUT_HIST_DEPTH : 0u;
+    if ((rb_owed_first(d, &owed, &owed_slot) && owed <= tick) ||
+        rnet_ih_first_predicted(&d->ih, mask, from, tick + 1u, NULL, NULL))
+        return 0;
+
+    if (digest)
+        *digest = agreed;
+    return 1;
 }
 
 int rnet_rb_driver_episode_active(const RNetRbDriver *d)
