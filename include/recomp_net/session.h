@@ -494,6 +494,9 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * session; never forwarded to the episode driver's RB_SYNC receive queue. */
 #define RNET_RB_SYNC_OP_PROFILE_OFFER 7u
 #define RNET_RB_SYNC_OP_PROFILE_ACK 8u
+/* 9/10 carry the experiment's path echo. Identity is three immutable startup
+ * fragments, never an episode or a room-wide correction handshake. */
+#define RNET_RB_SYNC_OP_PROFILE_IDENTITY 11u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */

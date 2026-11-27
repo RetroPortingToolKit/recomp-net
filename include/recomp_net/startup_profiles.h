@@ -28,6 +28,13 @@ typedef struct RNetProfileCaps {
  * Returns 0 on success, -1 for invalid/repeated/late setup. */
 int rnet_session_profiles_begin(RNetSession *s, rnet_u32 qualification,
                                 const RNetProfileCaps *caps);
+/* Same barrier, additionally requiring every occupied peer to provide the
+ * exact same 32-byte build/content/mod compatibility identity. All bytes are
+ * compared; qualification/transcript hashes never replace this check. Missing
+ * data waits, a changed/mismatched identity or a legacy-only offer refuses.
+ * identity is copied. This must also run before transport start, once. */
+int rnet_session_profiles_begin_full(RNetSession *s,rnet_u32 qualification,
+                                     const RNetProfileCaps *caps,const rnet_u8 identity[32]);
 
 /* pump() exchanges the immutable offers and acknowledgements. Status is 0
  * pending, 1 agreed, -1 refused. Outputs are the chosen bit INDEX and a

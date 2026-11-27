@@ -64,6 +64,8 @@ typedef struct RNetLocalControlState {
  * A mode disagreement refuses startup instead of falling back. */
 int rnet_experiment_profiles_begin(RNetSession *, rnet_u32 qualification,
                                    const RNetProfileCaps *, RNetSyncMode mode);
+int rnet_experiment_profiles_begin_full(RNetSession *,rnet_u32 qualification,
+    const RNetProfileCaps *,RNetSyncMode mode,const rnet_u8 identity[32]);
 RNetLocalDriver *rnet_local_create(const RNetLocalConfig *, const RNetLocalHost *);
 void rnet_local_destroy(RNetLocalDriver *);
 /* 0 stalled, 1 live tick, 2 replay tick. Host completes exactly one admitted

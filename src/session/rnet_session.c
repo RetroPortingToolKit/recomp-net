@@ -105,6 +105,8 @@ struct RNetSession
         rnet_u32 qualification, occupied, offers, acks, acknowledged_by;
         rnet_u32 selected, transcript;
         RNetProfileCaps caps[RNET_MAX_SLOTS];
+        int full_identity;
+        rnet_u8 identity[32], identity_parts[RNET_MAX_SLOTS];
         rnet_u64 last_tx;
         int dirty;
     } profiles;
@@ -403,6 +405,13 @@ static void send_raw(RNetSession *s, const rnet_u8 *buf, int len);
  * Offers are copied once. Retries do not observe or change host capabilities. */
 #define PROFILE_OFFER RNET_RB_SYNC_OP_PROFILE_OFFER
 #define PROFILE_ACK RNET_RB_SYNC_OP_PROFILE_ACK
+#define PROFILE_IDENTITY RNET_RB_SYNC_OP_PROFILE_IDENTITY
+
+static rnet_u32 profile_identity_word(const rnet_u8 *bytes)
+{
+    return (rnet_u32)bytes[0] | ((rnet_u32)bytes[1]<<8) |
+        ((rnet_u32)bytes[2]<<16) | ((rnet_u32)bytes[3]<<24);
+}
 
 static rnet_u32 profile_fold(rnet_u32 h, rnet_u32 word)
 {
@@ -419,6 +428,11 @@ static void profiles_choose(RNetSession *s)
     rnet_u32 common = ~(rnet_u32)0, h = 2166136261u;
     int i;
     if (s->profiles.offers != s->profiles.occupied || s->profiles.acks) return;
+    if(s->profiles.full_identity) {
+        for(i=0;i<s->cfg.slot_count;++i)
+            if((s->profiles.occupied&(1u<<i)) && s->profiles.identity_parts[i]!=7u)return;
+        for(i=0;i<8;++i)h=profile_fold(h,profile_identity_word(s->profiles.identity+i*4));
+    }
     h = profile_fold(h, s->profiles.qualification);
     h = profile_fold(h, s->cfg.slot_count);
     h = profile_fold(h, s->profiles.occupied);
@@ -449,9 +463,26 @@ static void profiles_receive(RNetSession *s, const RNetDecodedPacket *p)
         return;
     bit = 1u << p->local_slot;
     if (!(s->profiles.occupied & bit)) return;
-    if (p->rb_epoch_id != s->profiles.qualification || p->rb_flags != 0u) {
+    if (p->rb_epoch_id != s->profiles.qualification) {
         s->profiles.refused = 1;
         return;
+    }
+    if(p->rb_initiator==PROFILE_IDENTITY) {
+        const rnet_u32 words[3]={p->rb_mismatch_tick,p->rb_load_tick,p->rb_target_tick};
+        unsigned word;
+        if(!s->profiles.full_identity || p->rb_flags>2u || p->rb_corrected_slot) {
+            s->profiles.refused=1;return;
+        }
+        for(word=0;word<3;++word) {
+            const unsigned offset=p->rb_flags*12u+word*4u;
+            const rnet_u32 expected=offset<32u?profile_identity_word(s->profiles.identity+offset):0u;
+            if(words[word]!=expected) {s->profiles.refused=1;return;}
+        }
+        s->profiles.identity_parts[p->local_slot]|=(rnet_u8)(1u<<p->rb_flags);
+        profiles_choose(s);return;
+    }
+    if(p->rb_flags!=(rnet_u16)s->profiles.full_identity) {
+        s->profiles.refused=1;return;
     }
     if (p->rb_initiator == PROFILE_OFFER) {
         RNetProfileCaps caps;
@@ -467,7 +498,7 @@ static void profiles_receive(RNetSession *s, const RNetDecodedPacket *p)
         s->profiles.caps[p->local_slot] = caps;
         s->profiles.offers |= bit;
         profiles_choose(s);
-    } else if (s->profiles.offers == s->profiles.occupied) {
+    } else if (s->profiles.acks) {
         if (p->rb_mismatch_tick != s->profiles.selected ||
             p->rb_load_tick != s->profiles.transcript ||
             p->rb_corrected_slot != 0u ||
@@ -496,16 +527,28 @@ static void profiles_drive(RNetSession *s)
         return;
     c = &s->profiles.caps[s->cfg.local_slot];
     rnet_session_send_rb_sync(s, s->profiles.qualification, c->cpu_features,
-        c->backends, c->profiles, (rnet_u8)c->architecture, PROFILE_OFFER, 0u);
+        c->backends, c->profiles, (rnet_u8)c->architecture, PROFILE_OFFER,(rnet_u16)s->profiles.full_identity);
+    if(s->profiles.full_identity) {
+        unsigned part,word;
+        for(part=0;part<3;++part) {
+            rnet_u32 words[3]={0};
+            for(word=0;word<3;++word) {
+                const unsigned offset=part*12u+word*4u;
+                if(offset<32u)words[word]=profile_identity_word(s->profiles.identity+offset);
+            }
+            rnet_session_send_rb_sync(s,s->profiles.qualification,words[0],words[1],words[2],
+                0u,PROFILE_IDENTITY,(rnet_u16)part);
+        }
+    }
     if (s->profiles.acks)
         rnet_session_send_rb_sync(s, s->profiles.qualification, s->profiles.selected,
-            s->profiles.transcript, s->profiles.acks, 0u, PROFILE_ACK, 0u);
+            s->profiles.transcript, s->profiles.acks, 0u, PROFILE_ACK,(rnet_u16)s->profiles.full_identity);
     s->profiles.last_tx = now ? now : 1u;
     s->profiles.dirty = 0;
 }
 
-int rnet_session_profiles_begin(RNetSession *s, rnet_u32 qualification,
-                                const RNetProfileCaps *caps)
+static int profiles_begin(RNetSession *s,rnet_u32 qualification,
+                           const RNetProfileCaps *caps,const rnet_u8 *identity)
 {
     int i;
     if (!s || !caps || !qualification || !(caps->profiles & 1u) ||
@@ -519,9 +562,22 @@ int rnet_session_profiles_begin(RNetSession *s, rnet_u32 qualification,
     s->profiles.qualification = qualification;
     s->profiles.caps[s->cfg.local_slot] = *caps;
     s->profiles.offers = 1u << s->cfg.local_slot;
+    if(identity) {
+        s->profiles.full_identity=1;memcpy(s->profiles.identity,identity,32);
+        s->profiles.identity_parts[s->cfg.local_slot]=7u;
+    }
     s->profiles.dirty = 1;
     profiles_choose(s);
     return 0;
+}
+int rnet_session_profiles_begin(RNetSession *s,rnet_u32 qualification,const RNetProfileCaps *caps)
+{
+    return profiles_begin(s,qualification,caps,NULL);
+}
+int rnet_session_profiles_begin_full(RNetSession *s,rnet_u32 qualification,
+                                     const RNetProfileCaps *caps,const rnet_u8 identity[32])
+{
+    return identity?profiles_begin(s,qualification,caps,identity):-1;
 }
 
 int rnet_session_profiles_status(const RNetSession *s, rnet_u32 *profile,
@@ -1035,7 +1091,8 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             experiment_echo_receive(s, pkt);
             break;
         }
-        if (pkt->rb_initiator == PROFILE_OFFER || pkt->rb_initiator == PROFILE_ACK)
+        if (pkt->rb_initiator == PROFILE_OFFER || pkt->rb_initiator == PROFILE_ACK ||
+            pkt->rb_initiator == PROFILE_IDENTITY)
         {
             profiles_receive(s, pkt);
             break;

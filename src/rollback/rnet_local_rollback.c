@@ -284,15 +284,24 @@ static int hashes(RNetLocalDriver *d) {
     }
     return 1;
 }
-int rnet_experiment_profiles_begin(RNetSession *s, rnet_u32 qualification,
-                                   const RNetProfileCaps *caps, RNetSyncMode mode) {
+static int experiment_profiles_begin(RNetSession *s,rnet_u32 qualification,
+    const RNetProfileCaps *caps,RNetSyncMode mode,const rnet_u8 *identity) {
     if (!s || !qualification || !caps || !(caps->profiles & 1u) ||
         caps->architecture > 255u || rnet_session_sim_tick(s)) return -1;
     if (mode != RNET_SYNC_EPISODE_V3 && mode != RNET_SYNC_LOCAL_V4) return -1;
     if (mode == RNET_SYNC_EPISODE_V3 && rnet_session_local_inputs_enabled(s)) return -1;
     if (mode == RNET_SYNC_LOCAL_V4 && rnet_session_enable_local_inputs(s)) return -1;
     qualification = (qualification ^ (0x4c523400u | (rnet_u32)mode)) * 16777619u;
-    return rnet_session_profiles_begin(s, qualification ? qualification : 1u, caps);
+    return identity?rnet_session_profiles_begin_full(s,qualification?qualification:1u,caps,identity):
+        rnet_session_profiles_begin(s,qualification?qualification:1u,caps);
+}
+int rnet_experiment_profiles_begin(RNetSession *s,rnet_u32 qualification,
+    const RNetProfileCaps *caps,RNetSyncMode mode) {
+    return experiment_profiles_begin(s,qualification,caps,mode,NULL);
+}
+int rnet_experiment_profiles_begin_full(RNetSession *s,rnet_u32 qualification,
+    const RNetProfileCaps *caps,RNetSyncMode mode,const rnet_u8 identity[32]) {
+    return identity?experiment_profiles_begin(s,qualification,caps,mode,identity):-1;
 }
 RNetLocalDriver *rnet_local_create(const RNetLocalConfig *cfg, const RNetLocalHost *host) {
     RNetLocalDriver *d;
