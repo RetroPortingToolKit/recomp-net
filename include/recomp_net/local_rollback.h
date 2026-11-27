@@ -45,6 +45,12 @@ typedef struct RNetLocalHost {
      * now_us remains the wall clock for stalls, latency and transport timers.
      * NULL uses now_us. Never rewind this clock with simulation state. */
     rnet_u64 (*work_us)(void *);
+    /* Optional owned end-of-tick boundary replacing digest(). It may capture
+     * the next before-tick snapshot and hash that same immutable state once.
+     * save(next_tick) must still validate any intervening host/mod mutations.
+     * Return 0 on failure. checkpoint_us partitions measured callback work
+     * into snapshot vs digest cost, using the same work clock as work_us. */
+    int (*finish_tick)(void *,rnet_u32 tick,rnet_u32 *digest,rnet_u64 *checkpoint_us);
 } RNetLocalHost;
 typedef struct RNetLocalControlConfig {
     rnet_u32 frame_budget_us;

@@ -314,7 +314,7 @@ RNetLocalDriver *rnet_local_create(const RNetLocalConfig *cfg, const RNetLocalHo
         cfg->local_seat >= cfg->seats || !cfg->row_size || cfg->row_size > RNET_INPUT_MAX ||
         !cfg->tick_us || !cfg->rollback_depth || cfg->rollback_depth > 64u || cfg->delay > 20u ||
         !host->save || !host->load || !host->drop_after || !host->publish ||
-        !host->resim_begin || !host->resim_end || !host->digest || !host->neutral ||
+        !host->resim_begin || !host->resim_end || (!host->digest && !host->finish_tick) || !host->neutral ||
         (!cfg->session && (!host->input || !host->sample)) ||
         (cfg->session && !rnet_session_local_inputs_enabled(cfg->session))) return NULL;
     if (cfg->session) {
@@ -407,15 +407,21 @@ int rnet_local_poll(RNetLocalDriver *d) {
     return make_tick(d, d->tick, 0);
 }
 int rnet_local_finish(RNetLocalDriver *d) {
-    LocalTick *h; rnet_u64 now, work_now, begin; int replay;
+    LocalTick *h; rnet_u64 now, work_now, begin, checkpoint_us=0,elapsed; int replay;
     if (!d || !d->pending || d->refusal) return 0;
     replay = d->pending == 2u;
     h = history(d, replay ? d->replay_next : d->tick);
     if (!h) return refuse(d, "completed tick history unavailable");
     now = clock_us(d); work_now = work_clock_us(d); begin = work_now;
     h->consumed = d->host.consumed_seats ? d->host.consumed_seats(d->host.ctx, h->tick) : d->occupied;
-    h->digest = d->host.digest(d->host.ctx); h->complete = 1;
-    d->work.digest_us += work_clock_us(d) - begin;
+    if(d->host.finish_tick) {
+        if(!d->host.finish_tick(d->host.ctx,h->tick,&h->digest,&checkpoint_us))
+            return refuse(d,"end-tick sealing failed");
+    } else h->digest=d->host.digest(d->host.ctx);
+    h->complete = 1;
+    elapsed=work_clock_us(d)-begin;
+    if(checkpoint_us>elapsed)checkpoint_us=elapsed; // Coarse clocks cannot prove sub-tick partitions.
+    d->work.snapshot_us+=checkpoint_us;d->work.digest_us+=elapsed-checkpoint_us;
     if (d->control_enabled) {
         rnet_u64 cost = work_now - d->run_work_at + d->tick_snapshot_us + work_clock_us(d) - begin;
         if (replay) d->control.replay_tick_us = measured_cost(d->control.replay_tick_us, cost);
