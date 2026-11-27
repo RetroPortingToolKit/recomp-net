@@ -41,6 +41,8 @@ struct RNetTransport
      * before the process has finished reading its own configuration. */
     RNetNetSim *netsim;
     int netsim_probed;
+    RNetNetSim *send_netsim;
+    int send_netsim_probed;
 };
 
 void rnet_transport_init(RNetTransport *t);

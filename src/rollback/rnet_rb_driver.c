@@ -55,6 +55,10 @@ static const char *rb_stage_name(RbEpisodeStage st)
 }
 
 struct RNetRbDriver {
+    RNetTelemetry *telemetry;
+    RNetTickTelemetry telemetry_work;
+    uint32_t telemetry_wait_ms, telemetry_run_ms;
+    int telemetry_waiting;
     RNetRbDriverConfig cfg;
     RNetRbHost         host;
     RNetRbSession     *rb;
@@ -654,7 +658,8 @@ static void rb_row_neutral(RNetRbDriver *d, int slot, uint32_t tick, RNetRbFrame
 static int rb_rows_equal(const RNetRbFrame *a, const RNetRbFrame *b)
 {
     return a->buttons == b->buttons && a->stick_x == b->stick_x &&
-           a->stick_y == b->stick_y;
+           a->stick_y == b->stick_y && a->rx == b->rx && a->ry == b->ry &&
+           a->analog == b->analog;
 }
 
 /* ── corrections owed ────────────────────────────────────────────────── */
@@ -712,9 +717,12 @@ static int rb_owed_first(const RNetRbDriver *d, uint32_t *tick, int *slot)
  */
 static void rb_snap_take(RNetRbDriver *d, uint32_t tick)
 {
+    uint32_t before;
     if (d->snap_interval > 1u && (tick % d->snap_interval) != 0u)
         return;
+    before = rb_now(d);
     (void)d->host.snap_save(d->host.ctx, tick);
+    d->telemetry_work.snapshot_us += (uint32_t)(rb_now(d) - before) * 1000ull;
 }
 
 static int rb_snap_has(RNetRbDriver *d, uint32_t tick)
@@ -1581,6 +1589,7 @@ void rnet_rb_driver_destroy(RNetRbDriver *d)
     if (!d)
         return;
     rnet_rb_driver_shutdown(d);
+    rnet_telemetry_destroy(d->telemetry);
     free(d);
 }
 
@@ -1660,6 +1669,7 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
         const char *keep_modset = d->local_modset;
         RNetRbModSetCheckFn keep_check = d->modset_check;
         RNetRbModSetAdoptFn keep_adopt = d->modset_adopt;
+        rnet_telemetry_destroy(d->telemetry);
         memset(d, 0, sizeof(*d));
         d->local_build_fp = keep_build_fp;
         d->local_content_fp = keep_content_fp;
@@ -1817,6 +1827,8 @@ int rnet_rb_driver_start(RNetRbDriver *d, const RNetRbDriverConfig *cfg, const R
 
     d->sim = 0;
     d->stage = kRbIdle;
+    d->telemetry = rnet_telemetry_create(RNET_SYNC_EPISODE_V3, 16667u);
+    if (!d->telemetry) return 0;
     d->started = 1;
     d->stall_tag = NULL;
     rb_log(d, "ROLLBACK start slot=%d slots=%d D=%d P=%d "
@@ -3833,18 +3845,16 @@ static void rb_reconcile_wire(RNetRbDriver *d)
             }
 
             {
-                RNetInputContractFrame pub_c, wire_c;
                 RNetInputContractDecision dec;
-                rnet_ih_frame_to_contract(&published, &pub_c);
-                rnet_ih_frame_to_contract(&wire, &wire_c);
-                dec = rnet_rb_decide_stick_replace(d->rb, &pub_c, &wire_c,
-                                                   1 /* completed sim */);
+                dec = rnet_rb_decide_row_replace(d->rb, &published, &wire,
+                                                 1 /* completed sim */);
                 rnet_ih_promote(&d->ih, slot, &wire);
                 if (!rnet_input_contract_decision_is_rewind(dec))
                     continue;
             }
 
             rnet_sched_note_mispredict(d->sim > t ? d->sim - t : 0u);
+            ++d->telemetry_work.mispredicts;
             /* Owed until an episode that replays t commits. */
             rb_owed_mark(d, t, slot);
             if (d->stage == kRbIdle) {
@@ -4073,7 +4083,7 @@ static RNetRbAdmit rb_replay_step(RNetRbDriver *d)
 
 static void rb_check_chain_fork(RNetRbDriver *d);
 
-RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
+static RNetRbAdmit rb_poll_admit_inner(RNetRbDriver *d)
 {
     RNetSession *s;
     RNetSessionStats st;
@@ -4428,6 +4438,31 @@ static void rb_check_chain_fork(RNetRbDriver *d)
     }
 }
 
+RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
+{
+    RNetRbAdmit a;
+    uint32_t now;
+    uint64_t replay_before;
+    if (!d || !d->started) return RNET_RB_ADMIT_STALL;
+    now = rb_now(d);
+    if (d->telemetry_waiting)
+        d->telemetry_work.stall_us += (uint32_t)(now - d->telemetry_wait_ms) * 1000ull;
+    replay_before = d->resim_ticks;
+    a = rb_poll_admit_inner(d);
+    d->telemetry_work.replay_ticks += (uint32_t)(d->resim_ticks - replay_before);
+    if (d->resim_ticks != replay_before)
+        d->telemetry_work.replay_us += (uint32_t)(rb_now(d) - now) * 1000ull;
+    d->telemetry_waiting = a == RNET_RB_ADMIT_STALL;
+    d->telemetry_wait_ms = rb_now(d);
+    d->telemetry_run_ms = rb_now(d);
+    d->telemetry_work.episode_stage = (uint32_t)d->stage;
+    d->telemetry_work.episode_id = d->episode_count;
+    if (a == RNET_RB_ADMIT_STALL)
+        d->telemetry_work.stall_reason = d->refusal ? RNET_TICK_REFUSED :
+            d->stage == kRbSealing || d->stage == kRbVerifying ? RNET_TICK_EPISODE : RNET_TICK_INPUT;
+    return a;
+}
+
 void rnet_rb_driver_finish_frame(RNetRbDriver *d)
 {
     RNetSession *s;
@@ -4440,6 +4475,8 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
     d->pending_admit = RNET_RB_ADMIT_STALL;
 
     if (admitted == RNET_RB_ADMIT_REPLAY) {
+        ++d->telemetry_work.replay_ticks;
+        d->telemetry_work.replay_us += (uint32_t)(rb_now(d) - d->telemetry_run_ms) * 1000ull;
         /* INCREMENTAL: the host ran replayed tick replay_next. Its digest is
          * kept, and every replayed tick's goes into the chain (and out as a
          * FRAME_COMMIT) together when the replay completes -- exactly as the
@@ -4459,7 +4496,27 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
         return;
 
     s = rb_session(d);
-    master = d->host.digest_master(d->host.ctx);
+    {
+        uint32_t before = rb_now(d);
+        master = d->host.digest_master(d->host.ctx);
+        d->telemetry_work.digest_us += (uint32_t)(rb_now(d) - before) * 1000ull;
+    }
+    {
+        int seat;
+        d->telemetry_work.tick = d->sim;
+        d->telemetry_work.at_us = rb_now(d) * 1000ull;
+        d->telemetry_work.delay = s ? rnet_session_committed_delay(s) : 0u;
+        for (seat = 0; seat < rb_slot_count(d); ++seat) {
+            RNetPeerTelemetry peer;
+            if (d->rows[seat].is_predicted) d->telemetry_work.guessed_seats |= 1u << seat;
+            if (s && rnet_session_get_peer_telemetry(s, seat, &peer))
+                rnet_telemetry_peer(d->telemetry, seat, &peer);
+        }
+        if (s) d->telemetry_work.input_latency_valid =
+            rnet_session_input_age_us(s, d->sim, &d->telemetry_work.input_latency_us);
+        rnet_telemetry_record(d->telemetry, &d->telemetry_work);
+        memset(&d->telemetry_work, 0, sizeof(d->telemetry_work));
+    }
     /* Validation (FORCE_BOOT_FORK=1): publish a wrong digest for tick 0 only,
      * so the two peers genuinely disagree about the state they booted from.
      * This is what proves rb_boot_digest_gate can fail — an agreement check
@@ -4504,6 +4561,7 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
 /* ── diagnostics ─────────────────────────────────────────────────────── */
 
 uint32_t rnet_rb_driver_sim_tick(const RNetRbDriver *d) { return d ? d->sim : 0u; }
+const RNetTelemetry *rnet_rb_driver_telemetry(const RNetRbDriver *d) { return d ? d->telemetry : NULL; }
 uint32_t rnet_rb_driver_episode_count(const RNetRbDriver *d) { return d ? d->episode_count : 0u; }
 uint32_t rnet_rb_driver_invent_count(const RNetRbDriver *d) { return d ? d->ih.invent_count : 0u; }
 uint32_t rnet_rb_driver_promote_count(const RNetRbDriver *d) { return d ? d->ih.promote_count : 0u; }

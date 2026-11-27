@@ -116,6 +116,12 @@ typedef struct RNetRbFrame
     uint8_t ry;
 } RNetRbFrame;
 
+/* Full legacy pad replacement: fields outside the optional left-stick
+ * deadband contract (right axes/device mode) always require correction. */
+struct RNetRbSession;
+RNetInputContractDecision rnet_rb_decide_row_replace(struct RNetRbSession *,
+    const RNetRbFrame *published, const RNetRbFrame *wire, uint8_t completed_sim);
+
 typedef struct RNetRbEvent
 {
     RNetRbEventType type;

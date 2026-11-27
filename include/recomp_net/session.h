@@ -6,6 +6,7 @@
 #include "recomp_net/input.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/types.h"
+#include "recomp_net/telemetry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -239,6 +240,18 @@ typedef struct RNetSessionStats
 } RNetSessionStats;
 
 void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
+
+/* Experimental local input policy. Enable BEFORE transport/profile setup.
+ * HELLO/DELAY_SYNC cannot change this peer's D. Published rows stay immutable;
+ * decreases drain the existing pipeline. */
+int rnet_session_enable_local_inputs(RNetSession *s);
+int rnet_session_local_inputs_enabled(const RNetSession *s);
+int rnet_session_set_local_delay(RNetSession *s, rnet_u8 delay);
+typedef void (*RNetCanonicalizeFn)(void *ctx, RNetInputSample *sample);
+/* Runs once before publication, never on receipt. */
+int rnet_session_set_input_transform(RNetSession *, RNetCanonicalizeFn, void *ctx);
+int rnet_session_input_age_us(const RNetSession *, rnet_u32 tick, rnet_u64 *age);
+int rnet_session_get_peer_telemetry(const RNetSession *, int seat, RNetPeerTelemetry *out);
 
 /* Savestate / SRAM transfer ops for rnet_session_state_begin / probe. */
 #define RNET_STATE_OP_SAVE 0 /* peer stores file; admit stalls until probe/xfer done */

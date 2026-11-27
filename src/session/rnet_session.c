@@ -88,6 +88,16 @@ typedef struct RNetIceHubBridge
 
 struct RNetSession
 {
+    int local_inputs;
+    RNetCanonicalizeFn canonicalize;
+    void *canonicalize_ctx;
+    rnet_u32 sample_tick[RNET_HISTORY_LENGTH];
+    rnet_u64 sample_ms[RNET_HISTORY_LENGTH];
+    rnet_u8 sample_valid[RNET_HISTORY_LENGTH];
+    RNetPeerTelemetry echo_peer[RNET_MAX_SLOTS];
+    struct { rnet_u32 seq, expected, seen; rnet_u64 sent_ms; } echo[32];
+    rnet_u32 echo_seq;
+    rnet_u64 echo_last_ms;
     /* Fixed startup agreement. Reserved RB_SYNC ops are consumed here, never
      * by the rollback driver's episode queue. Kept across rollback/resync. */
     struct {
@@ -744,6 +754,8 @@ static void send_input_confirm_tick(RNetSession *s, rnet_u32 tick,
     s->confirm_last_sent_ms[tick % RNET_HISTORY_LENGTH] = now;
 }
 
+#include "rnet_experiment.inc"
+
 static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
 {
     int i;
@@ -783,7 +795,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             s->phase = RNET_PHASE_READY;
         }
         /* Guest adopts host delay before RUNNING (host slot 0 is authoritative). */
-        if (s->cfg.local_slot != 0 && pkt->local_slot == 0)
+        if (!s->local_inputs && s->cfg.local_slot != 0 && pkt->local_slot == 0)
         {
             rnet_u8 hello_delay = pkt->delay;
             if (hello_delay >= 2 && hello_delay <= 20 && hello_delay != s->delay)
@@ -872,6 +884,7 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_DELAY_SYNC:
+        if (s->local_inputs) break;
         /* Immediate when already past effective_tick (or not RUNNING yet).
          * Otherwise queue so both peers commit on the same sim tick. */
         if (pkt->effective_tick <= s->sim_tick || s->phase != RNET_PHASE_RUNNING)
@@ -1017,6 +1030,11 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_SYNC:
+        if (pkt->rb_initiator == 9u || pkt->rb_initiator == 10u)
+        {
+            experiment_echo_receive(s, pkt);
+            break;
+        }
         if (pkt->rb_initiator == PROFILE_OFFER || pkt->rb_initiator == PROFILE_ACK)
         {
             profiles_receive(s, pkt);
@@ -3208,6 +3226,7 @@ void rnet_session_pump(RNetSession *s)
     pump_recv(s);
     maybe_bootstrap(s);
     profiles_drive(s);
+    experiment_echo_drive(s);
     if (s->state_probe_active)
     {
         state_drive_probe(s);
@@ -3327,6 +3346,7 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
         {
             memset(&local_future, 0, sizeof(local_future));
             s->host.sample_local(sim_tick, &local_future, s->host.ctx);
+            experiment_canonicalize(s, &local_future);
             local_future.tick = sample_wire;
             local_future.valid = 1;
             if (local_future.size > RNET_INPUT_MAX)
@@ -3334,6 +3354,7 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
                 local_future.size = RNET_INPUT_MAX;
             }
             rnet_ring_store(&s->local_ring, &local_future);
+            experiment_sample_stamp(s, sample_wire);
         }
 
         send_input_bundle(s);
@@ -4705,6 +4726,7 @@ int rnet_session_prepare_local_tip(RNetSession *s, rnet_u32 sim_tick)
                 if (s->host.sample_local)
                 {
                     s->host.sample_local(sim_tick, &local_future, s->host.ctx);
+                    experiment_canonicalize(s, &local_future);
                 }
                 local_future.valid = 1;
                 if (local_future.size > RNET_INPUT_MAX)
@@ -4715,6 +4737,7 @@ int rnet_session_prepare_local_tip(RNetSession *s, rnet_u32 sim_tick)
             }
             local_future.tick = w;
             rnet_ring_store(&s->local_ring, &local_future);
+            experiment_sample_stamp(s, w);
         }
     }
     send_input_bundle(s);

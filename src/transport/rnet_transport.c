@@ -43,6 +43,9 @@ void rnet_transport_shutdown(RNetTransport *t)
     rnet_netsim_destroy(t->netsim);
     t->netsim = NULL;
     t->netsim_probed = 0;
+    rnet_netsim_destroy(t->send_netsim);
+    t->send_netsim = NULL;
+    t->send_netsim_probed = 0;
 }
 
 static int sockaddr_equal(const struct sockaddr_in *a, const struct sockaddr_in *b)
@@ -238,7 +241,7 @@ static void hub_learn_and_forward(RNetTransport *t, const rnet_u8 *buf, int n, c
     }
 }
 
-int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len)
+static int transport_send_raw(RNetTransport *t, const rnet_u8 *buf, size_t len)
 {
     if ((t == NULL) || (buf == NULL) || (len == 0))
     {
@@ -328,6 +331,23 @@ int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len)
  * the pending peer belongs to the datagram the session actually decodes, and
  * under the link simulator those are different datagrams. Leaving it here
  * would have let a packet still sitting in the hold queue name the peer. */
+static void transport_flush_send(RNetTransport *t)
+{
+    rnet_u8 packet[RNET_MAX_PACKET]; int n;
+    if (!t->send_netsim) return;
+    while ((n = rnet_netsim_due(t->send_netsim, packet, sizeof(packet), NULL)) > 0)
+        (void)transport_send_raw(t, packet, (size_t)n);
+}
+int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len)
+{
+    if (!t || !buf || !len || len > RNET_MAX_PACKET) return -1;
+    if (!t->send_netsim_probed) {
+        t->send_netsim = rnet_netsim_create_send(); t->send_netsim_probed = 1;
+    }
+    transport_flush_send(t);
+    if (t->send_netsim && rnet_netsim_hold(t->send_netsim, buf, len, NULL)) return (int)len;
+    return transport_send_raw(t, buf, len);
+}
 static int transport_recv_raw(RNetTransport *t, rnet_u8 *buf, size_t cap,
                               struct sockaddr_in *out_src, int *out_have_src)
 {
@@ -447,6 +467,7 @@ int rnet_transport_recv(RNetTransport *t, rnet_u8 *buf, size_t cap)
     {
         return -1;
     }
+    transport_flush_send(t);
     if (t->mode == RNET_TRANSPORT_ICE_HUB)
     {
         /* Link simulator is not applied to the ICE hub. */

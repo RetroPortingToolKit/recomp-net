@@ -35,7 +35,7 @@ For sim tick `T` and committed delay `D`:
 1. Host calls `rnet_session_try_admit(s, T)`.
 2. Library samples local input and stores it at **wire tick** `T + D`.
 3. Admission succeeds only when every **remote** slot has a valid ring row for
-   wire tick `T + D`.
+   wire tick `T` and the resolved input confirmations agree.
 4. On success, `publish(T, by_slot, …)` is invoked with gameplay-indexed
    samples; host runs one sim step, then `rnet_session_advance`.
 5. On failure, return `0` and keep calling `rnet_session_pump` (ingress /

@@ -1,12 +1,19 @@
 # recomp-net
 
-Portable **delay-sync** netcode library for recompilation / modern-runtime hosts
-(N64Recomp, PSX recomp, and similar). Classic lockstep: every peer stalls until
-remote inputs for `wire = sim + D` arrive. Optional **ICE** transport via
+Portable **delay-sync and rollback** netcode library for recompilation hosts.
+Delay-sync simulates wire tick T and samples local input for T+D. Optional
+**ICE** transport via
 [libjuice](https://github.com/paullouisageneau/libjuice).
 
 BattleShip’s netplay stack is a **design reference only** — this repo does not
-vendor SSB64 code and does not implement rollback, automatch, or game UI.
+vendor SSB64 code. Hosts own game UI and simulation/snapshot implementations.
+
+This experimental branch also provides local rollback with opaque input rows,
+confirmed-state checks and match telemetry. It is not merge-qualified. See
+[the RFC](docs/rfc-local-rollback.md) and
+[Echoes integration assessment](docs/echoes-integration.md).
+The [consumer feasibility review](docs/host-feasibility.md) covers the other
+engines, shared snapshots, UI and distributed GBA linking.
 
 ## Features (v0.1)
 
@@ -188,9 +195,10 @@ SNES-oriented checklist: snesrecomp `docs/RECOMP_NET.md` (“Per-game patches”
 ## Modes
 
 - **Delay-sync (main, v0.1):** shipped `RNetSession` lockstep used by MotK / snes / psx.
-- **Rollback (`feat/rollback` branch):** shared rollback architecture; first layer is the
-  portable input contract (`recomp_net/input_contract.h`), with episode orchestration over
-  a host snapshot/hash vtable planned next. See [docs/rollback.md](docs/rollback.md).
+- **Episode rollback:** shared driver (`recomp_net/rb_driver.h`) over the host's
+  snapshots, simulation and digests. See [docs/rollback.md](docs/rollback.md).
+- **Experimental local rollback:** `recomp_net/local_rollback.h`; each peer
+  corrects its own prediction. Wire 4 isolates this branch from release peers.
 
 ## Non-goals
 

@@ -35,6 +35,8 @@ set(RNET_CORE_SOURCES
   src/rollback/rnet_hash_confirm.c
   src/rollback/rnet_rb_quorum.c
   src/rollback/rnet_rb_driver.c
+  src/rollback/rnet_local_rollback.c
+  src/rollback/rnet_telemetry.c
   src/sched/rnet_sched.c
   src/lobby/rnet_lan_lobby.c
   src/lobby/rnet_lan_direct.c
@@ -286,7 +288,7 @@ if(RNET_BUILD_MODULE)
   else()
     target_compile_options(recomp_net_module PRIVATE -Wall -Wextra -Wpedantic)
   endif()
-  if(RNET_BUILD_TESTS AND UNIX)
+  if(RNET_BUILD_TESTS)
     add_executable(module_test tests/module_test.c)
     target_include_directories(module_test PRIVATE include)
     target_link_libraries(module_test PRIVATE ${CMAKE_DL_LIBS})
@@ -310,6 +312,25 @@ if(RNET_BUILD_TESTS)
   target_include_directories(netsim_burst_test PRIVATE include src)
   add_test(NAME netsim_burst_test COMMAND netsim_burst_test)
   enable_testing()
+
+  add_executable(local_rollback_test tests/local_rollback_test.c)
+  target_link_libraries(local_rollback_test PRIVATE recomp_net)
+  add_test(NAME local_rollback_test COMMAND local_rollback_test)
+  add_executable(telemetry_test tests/telemetry_test.c)
+  target_link_libraries(telemetry_test PRIVATE recomp_net)
+  add_test(NAME telemetry_test COMMAND telemetry_test)
+  add_executable(netsim_features_test tests/netsim_features_test.c src/transport/rnet_netsim.c)
+  target_include_directories(netsim_features_test PRIVATE include src)
+  if(UNIX)
+    target_compile_definitions(netsim_features_test PRIVATE _POSIX_C_SOURCE=200809L _DEFAULT_SOURCE)
+  endif()
+  add_test(NAME netsim_features_test COMMAND netsim_features_test)
+  add_executable(local_session_test tests/local_session_test.c)
+  target_link_libraries(local_session_test PRIVATE recomp_net)
+  target_include_directories(local_session_test PRIVATE src)
+  add_test(NAME local_session_test COMMAND local_session_test)
+  set_tests_properties(local_session_test PROPERTIES ENVIRONMENT
+    "RNET_SIM_LATENCY_MS=40;RNET_SIM_JITTER_MS=12;RNET_SIM_LOSS_PCT=2;RNET_SIM_DUPLICATE_PCT=3")
 
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)

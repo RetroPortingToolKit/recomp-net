@@ -288,6 +288,8 @@ is not waiting on it).
 
 ## Wire vs sim
 
-Hosts reason in **sim ticks**. Inputs on the wire are indexed by
-`wire = sim + D`. Admission for sim `T` requires remote rows at wire `T + D`,
-then INPUT_CONFIRM hash agreement on the resolved set.
+Hosts reason in **sim ticks**. A local sample taken at sim T is published for
+wire T+D; gameplay at sim T consumes wire T. Delay-sync admission requires
+remote rows at wire T, then INPUT_CONFIRM agreement on that resolved set.
+Experimental local rollback uses the same indexed rows, predicts missing
+remote rows, and verifies confirmed state separately.

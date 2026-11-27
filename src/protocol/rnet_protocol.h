@@ -103,7 +103,7 @@ typedef struct RNetRbWireFrame
  * predates it). Peers of different versions refuse to link: version 2 widened
  * the seal-row frame. Version 3 adds a required safe-load meaning to prefix
  * NACKs; older drivers cannot recover those refusals correctly. */
-#define RNET_WIRE_VERSION 3u
+#define RNET_WIRE_VERSION 4u /* isolated local-rollback experiment */
 /* RNET_RB_SEAL_ROWS_CHUNK_MAX is public (recomp_net/rollback.h): a host that
  * chunks its own seal rows has to know the bound the send path enforces. */
 

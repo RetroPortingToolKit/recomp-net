@@ -9,6 +9,8 @@
 #include "recomp_net/input_contract.h"
 #include "recomp_net/input_hist.h"
 #include "recomp_net/hash_confirm.h"
+#include "recomp_net/local_rollback.h"
+#include "recomp_net/telemetry.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/rb_post.h"
 #include "recomp_net/sched.h"

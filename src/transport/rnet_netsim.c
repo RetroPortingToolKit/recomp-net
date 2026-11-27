@@ -40,6 +40,8 @@ struct RNetNetSim
     rnet_u64 dropped_total;
     rnet_u32 live;
     rnet_u32 live_peak;
+    rnet_u32 duplicate_pct, burst_pct, burst_packets, burst_remaining, kbps;
+    rnet_u64 next_wire_us;
 };
 
 static rnet_u32 env_u32(const char *name, rnet_u32 fallback)
@@ -86,16 +88,30 @@ static void netsim_banner(RNetNetSim *sim, rnet_u64 now)
     sim->next_banner_ms = now + RNET_NETSIM_BANNER_MS;
 }
 
-RNetNetSim *rnet_netsim_create(void)
+static RNetNetSim *netsim_create(int send)
 {
     RNetNetSim *sim;
-    rnet_u32 latency = env_u32("RNET_SIM_LATENCY_MS", 0u);
-    rnet_u32 loss = env_u32("RNET_SIM_LOSS_PCT", 0u);
+    const char *profile = send ? NULL : getenv("RNET_SIM_PROFILE");
+    rnet_u32 profile_latency = 0, profile_jitter = 0, profile_loss = 0;
+    rnet_u32 latency, loss, dup, burst, kbps;
     rnet_u32 jitter;
+    if (profile && *profile) {
+        if (!strcmp(profile,"same-region")) { profile_latency=10; profile_jitter=2; }
+        else if (!strcmp(profile,"cross-country")) { profile_latency=40; profile_jitter=8; }
+        else if (!strcmp(profile,"transatlantic")) { profile_latency=80; profile_jitter=12; }
+        else if (!strcmp(profile,"transpacific")) { profile_latency=125; profile_jitter=20; }
+        else if (!strcmp(profile,"wifi")) { profile_latency=12; profile_jitter=12; profile_loss=2; }
+        else { fprintf(stderr,"rnet: unknown RNET_SIM_PROFILE '%s'\n",profile); return NULL; }
+    }
+    latency = env_u32(send ? "RNET_SIM_SEND_LATENCY_MS" : "RNET_SIM_LATENCY_MS", profile_latency);
+    loss = env_u32(send ? "RNET_SIM_SEND_LOSS_PCT" : "RNET_SIM_LOSS_PCT", profile_loss);
+    dup = env_u32(send ? "RNET_SIM_SEND_DUPLICATE_PCT" : "RNET_SIM_DUPLICATE_PCT", 0u);
+    burst = env_u32(send ? "RNET_SIM_SEND_BURST_PCT" : "RNET_SIM_BURST_PCT", 0u);
+    kbps = env_u32(send ? "RNET_SIM_SEND_KBPS" : "RNET_SIM_KBPS", 0u);
 
     /* Loss is independent of latency: dropping on a fast link is a legitimate
      * and quite different test, so either knob alone engages the simulator. */
-    if ((latency == 0u) && (loss == 0u))
+    if ((latency == 0u) && (loss == 0u) && !dup && !burst && !kbps)
     {
         return NULL;
     }
@@ -118,7 +134,7 @@ RNetNetSim *rnet_netsim_create(void)
         fflush(stderr);
         return NULL;
     }
-    jitter = env_u32("RNET_SIM_JITTER_MS", 0u);
+    jitter = env_u32(send ? "RNET_SIM_SEND_JITTER_MS" : "RNET_SIM_JITTER_MS", profile_jitter);
     /* Jitter wider than the latency would ask for a negative delay half the
      * time; clamping here keeps the distribution symmetric and honest rather
      * than silently squashing one tail against zero. */
@@ -140,14 +156,24 @@ RNetNetSim *rnet_netsim_create(void)
     sim->latency_ms = latency;
     sim->jitter_ms = jitter;
     sim->loss_pct = loss;
+    sim->duplicate_pct = dup > 100u ? 100u : dup;
+    sim->burst_pct = burst > 100u ? 100u : burst;
+    sim->burst_packets = env_u32(send ? "RNET_SIM_SEND_BURST_PACKETS" : "RNET_SIM_BURST_PACKETS", 3u);
+    if (sim->burst_packets > 1024u) sim->burst_packets = 1024u;
+    sim->kbps = kbps;
     sim->rng = env_u32("RNET_SIM_SEED", 0x5eed1234u);
+    if (send) sim->rng ^= 0xa511e9b3u;
     if (sim->rng == 0u)
     {
         sim->rng = 0x5eed1234u; /* xorshift is absorbing at zero */
     }
     netsim_banner(sim, rnet_os_monotonic_ms());
+    fprintf(stderr,"rnet: simulator direction=%s duplicate=%u%% burst=%u%%/%u packets bandwidth=%u kbit/s (0=unlimited)\n",
+        send ? "send" : "receive", sim->duplicate_pct, sim->burst_pct, sim->burst_packets, sim->kbps);
     return sim;
 }
+RNetNetSim *rnet_netsim_create(void) { return netsim_create(0); }
+RNetNetSim *rnet_netsim_create_send(void) { return netsim_create(1); }
 
 void rnet_netsim_destroy(RNetNetSim *sim)
 {
@@ -175,6 +201,11 @@ int rnet_netsim_hold(RNetNetSim *sim, const rnet_u8 *buf, size_t len,
     if ((sim == NULL) || (buf == NULL) || (len == 0u) || (len > RNET_MAX_PACKET))
     {
         return 0;
+    }
+    if (!sim->burst_remaining && sim->burst_pct &&
+        netsim_rand(sim) % 100u < sim->burst_pct) sim->burst_remaining = sim->burst_packets;
+    if (sim->burst_remaining) {
+        --sim->burst_remaining; ++sim->dropped_total; return 1;
     }
     if (sim->loss_pct > 0u)
     {
@@ -220,6 +251,12 @@ int rnet_netsim_hold(RNetNetSim *sim, const rnet_u8 *buf, size_t len,
     memcpy(sim->slot[i].data, buf, len);
     sim->slot[i].len = len;
     sim->slot[i].due_ms = rnet_os_monotonic_ms() + delay;
+    if (sim->kbps) {
+        rnet_u64 at = rnet_os_monotonic_ms() * 1000u;
+        if (sim->next_wire_us < at) sim->next_wire_us = at;
+        sim->next_wire_us += ((rnet_u64)len * 8000u + sim->kbps - 1u) / sim->kbps;
+        sim->slot[i].due_ms = (sim->next_wire_us + 999u) / 1000u + delay;
+    }
     if (src != NULL)
     {
         sim->slot[i].src = *src;
@@ -234,6 +271,19 @@ int rnet_netsim_hold(RNetNetSim *sim, const rnet_u8 *buf, size_t len,
     if (sim->live > sim->live_peak)
     {
         sim->live_peak = sim->live;
+    }
+    if (sim->duplicate_pct && netsim_rand(sim) % 100u < sim->duplicate_pct) {
+        rnet_u32 copy;
+        for (copy = 0; copy < RNET_NETSIM_SLOTS; ++copy) if (!sim->slot[copy].in_use) break;
+        if (copy < RNET_NETSIM_SLOTS) {
+            sim->slot[copy] = sim->slot[i]; ++sim->slot[copy].due_ms;
+            if (sim->kbps) {
+                sim->next_wire_us += ((rnet_u64)len * 8000u + sim->kbps - 1u) / sim->kbps;
+                sim->slot[copy].due_ms = (sim->next_wire_us + 999u) / 1000u + delay;
+            }
+            ++sim->live; ++sim->held_total;
+            if (sim->live > sim->live_peak) sim->live_peak = sim->live;
+        } else { ++sim->overflow_total; fprintf(stderr,"rnet: LINK SIMULATOR OVERFLOW duplicating packet\n"); }
     }
     return 1;
 }

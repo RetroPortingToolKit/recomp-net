@@ -67,6 +67,7 @@
 #include "recomp_net/input.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/session.h"
+#include "recomp_net/telemetry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -233,6 +234,8 @@ typedef struct RNetRbDriver RNetRbDriver;
 
 RNetRbDriver *rnet_rb_driver_create(void);
 void rnet_rb_driver_destroy(RNetRbDriver *d);
+/* Retained until destroy or next start, including after shutdown. */
+const RNetTelemetry *rnet_rb_driver_telemetry(const RNetRbDriver *d);
 
 /* Identity and mod set are properties of the PROCESS, not of a match: they
  * survive start()'s cold reset. Set them before start(). Fingerprints are
