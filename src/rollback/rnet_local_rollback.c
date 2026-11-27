@@ -1,5 +1,6 @@
 #include "recomp_net/local_rollback.h"
 #include "recomp_net/hash_confirm.h"
+#include "rnet_telemetry_internal.h"
 #include "platform/rnet_platform.h"
 #include <stdlib.h>
 #include <string.h>
@@ -184,6 +185,8 @@ static int hashes(RNetLocalDriver *d) {
 }
 int rnet_experiment_profiles_begin(RNetSession *s, rnet_u32 qualification,
                                    const RNetProfileCaps *caps, RNetSyncMode mode) {
+    if (!s || !qualification || !caps || !(caps->profiles & 1u) ||
+        caps->architecture > 255u || rnet_session_sim_tick(s)) return -1;
     if (mode != RNET_SYNC_EPISODE_V3 && mode != RNET_SYNC_LOCAL_V4) return -1;
     if (mode == RNET_SYNC_EPISODE_V3 && rnet_session_local_inputs_enabled(s)) return -1;
     if (mode == RNET_SYNC_LOCAL_V4 && rnet_session_enable_local_inputs(s)) return -1;
@@ -259,7 +262,10 @@ int rnet_local_poll(RNetLocalDriver *d) {
         if (!reconcile(d) || !hashes(d)) return 0;
         if (d->replaying) return 0;
     }
-    if (d->hold && d->tick >= d->hold_at) return 0;
+    if (d->hold && d->tick >= d->hold_at) {
+        d->poll_at = 0; /* an intentional pause is not network stall time */
+        return 0;
+    }
     if (!d->prepared_valid || d->prepared != d->tick) {
         int ok = d->cfg.session ? rnet_session_prepare_local_tip(d->cfg.session, d->tick)
             : d->host.sample(d->host.ctx, d->tick, d->cfg.delay);
@@ -322,6 +328,9 @@ int rnet_local_set_hold(RNetLocalDriver *d, rnet_u32 tick) {
 void rnet_local_clear_hold(RNetLocalDriver *d) { if (d) d->hold = 0; }
 const char *rnet_local_refusal(const RNetLocalDriver *d) { return d ? d->refusal : "no local driver"; }
 const RNetTelemetry *rnet_local_telemetry(const RNetLocalDriver *d) { return d ? d->telemetry : NULL; }
+size_t rnet_local_report(const RNetLocalDriver *d, char *out, size_t capacity) {
+    return d ? rnet_telemetry_report_extra(d->telemetry, &d->work, out, capacity) : 0;
+}
 rnet_u32 rnet_local_budget_delay(rnet_u32 transit, rnet_u32 jitter, rnet_u32 replay,
     rnet_u32 live, rnet_u32 budget, rnet_u32 max_depth, rnet_u32 *depth) {
     rnet_u32 affordable = replay && budget > live ? (budget - live) / replay : 0u;

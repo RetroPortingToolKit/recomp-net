@@ -59,6 +59,8 @@ int rnet_local_set_hold(RNetLocalDriver *, rnet_u32 tick);
 void rnet_local_clear_hold(RNetLocalDriver *);
 const char *rnet_local_refusal(const RNetLocalDriver *);
 const RNetTelemetry *rnet_local_telemetry(const RNetLocalDriver *);
+/* End-of-match report includes corrections after the last completed live tick. */
+size_t rnet_local_report(const RNetLocalDriver *, char *out, size_t capacity);
 /* Static budget decision, using measured costs in microseconds. No TURN floor.
  * one_way is an ESTIMATE when obtained from half an RTT. */
 rnet_u32 rnet_local_budget_delay(rnet_u32 one_way, rnet_u32 jitter,

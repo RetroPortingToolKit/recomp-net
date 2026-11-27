@@ -91,6 +91,7 @@ static void scenario(int incremental, int unread, int right_stick_only) {
     if (!incremental) host.run_tick = run;
     f->driver = rnet_local_create(&cfg, &host); CHECK(f->driver != NULL);
     if (!f->driver) { free(f); return; }
+    CHECK(rnet_local_set_hold(f->driver, TICKS));
     /* Finite input defines this workload; no wall-clock kill. */
     for (f->wall = 0; f->wall < TICKS + 40u; ++f->wall) {
         int a;
@@ -105,7 +106,19 @@ static void scenario(int incremental, int unread, int right_stick_only) {
     CHECK(rnet_local_confirmed(f->driver) == TICKS); CHECK(f->state == f->oracle[TICKS - 1u]);
     CHECK(f->loads > 10 && f->begins == f->ends && f->replayed > 100);
     CHECK(rnet_telemetry_read(rnet_local_telemetry(f->driver), 0, records, 8) == 8);
-    CHECK(rnet_telemetry_report(rnet_local_telemetry(f->driver), report, sizeof(report)) > 0);
+    CHECK(rnet_local_report(f->driver, report, sizeof(report)) > 0);
+    {
+        unsigned long long replay_total = 0;
+        const char *field = strstr(report, "\"replay_ticks\":");
+        CHECK(field && sscanf(field, "\"replay_ticks\":%llu", &replay_total) == 1);
+        CHECK(replay_total == f->replayed);
+        {
+            char again[4096];
+            CHECK(rnet_local_report(f->driver, again, sizeof(again)) == strlen(report) + 1u);
+            CHECK(!strcmp(again, report));
+            CHECK(!rnet_telemetry_read(rnet_local_telemetry(f->driver), TICKS, records, 8));
+        }
+    }
     CHECK(strstr(report, "local-v4") && strstr(report, "\"episodes\":0"));
     printf("%s %s %s: ticks=%u replay=%u corrections=%u digest=%08x\n",
         incremental ? "incremental" : "inline", unread ? "30Hz polls" : "60Hz polls",

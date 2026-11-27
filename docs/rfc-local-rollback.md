@@ -62,6 +62,11 @@ input latency measures **sample to simulation-input publication**, excluding
 USB, scanout and display latency. No samples means no measured latency; the
 report includes the sample count. Episode-mode timing currently uses its
 millisecond host clock and assumes 16,667 microseconds per tick in rate reports.
+Use `rnet_local_report` / `rnet_rb_driver_report` for the final match report:
+these include pending corrections after the last live tick without adding a
+synthetic tick. The generic ring report covers completed records only.
+Episode IDs in this history are match-local serials; skipped serials preserve
+episodes that began and aborted between two completed live ticks.
 
 Sequence-stamped echo requests/replies travel on the actual session transport.
 RTT is measured with one peer's clock; jitter is an EMA of successive RTT
@@ -77,6 +82,9 @@ burst loss and a serialized bandwidth cap (decimal kilobits/second).
 Independent `RNET_SIM_SEND_*` values impair the outbound direction. Set only
 the intended sides: send and receive impairments add together. Queue overflow
 invalidates timing evidence and is reported loudly.
+The existing ICE hub bypasses receive simulation, and hub-forwarded datagrams
+do not pass through the new outbound queue. These controls are qualified here
+for direct peer sessions, not as a complete per-pair hub network model.
 
 ## Qualification and remaining work
 

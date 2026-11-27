@@ -12,5 +12,12 @@ int main(void){
     if(!need || need>sizeof(report))return 3;
     if(!strstr(report,"\"dropped_ticks\":5") || !strstr(report,"33.334"))return 4;
     if(rnet_telemetry_report(t,short_buffer,2)<3 || memcmp(short_buffer,"xy",2))return 5;
-    rnet_telemetry_destroy(t);puts("telemetry wrap, exact latency and atomic short-buffer report passed");return 0;
+    rnet_telemetry_destroy(t);
+    t=rnet_telemetry_create(RNET_SYNC_EPISODE_V3,16667);
+    if(!t)return 6;
+    row.episode_id=1;rnet_telemetry_record(t,&row);
+    row.episode_id=7;rnet_telemetry_record(t,&row);
+    rnet_telemetry_report(t,report,sizeof(report));
+    if(!strstr(report,"\"episodes\":7"))return 7;
+    rnet_telemetry_destroy(t);puts("telemetry wrap, exact latency, episode gaps and atomic report passed");return 0;
 }

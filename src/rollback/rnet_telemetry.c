@@ -1,5 +1,6 @@
 #include "recomp_net/telemetry.h"
 #include "recomp_net/config.h"
+#include "rnet_telemetry_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,7 +8,7 @@ struct RNetTelemetry {
     RNetTickTelemetry ring[RNET_TELEMETRY_TICKS];
     RNetPeerTelemetry peers[RNET_MAX_SLOTS];
     rnet_u64 count, stalls, replays, corrections, latency, latency_n;
-    rnet_u64 delay_total, episodes, last_episode;
+    rnet_u64 delay_total, episodes;
     rnet_u32 tick_us;
     RNetSyncMode mode;
 };
@@ -25,9 +26,9 @@ void rnet_telemetry_record(RNetTelemetry *t, const RNetTickTelemetry *row) {
     t->stalls += row->stall_us; t->replays += row->replay_ticks;
     t->corrections += row->mispredicts; t->delay_total += row->delay;
     if (row->input_latency_valid) { t->latency += row->input_latency_us; ++t->latency_n; }
-    if (row->episode_id && row->episode_id != t->last_episode) {
-        ++t->episodes; t->last_episode = row->episode_id;
-    }
+    /* The driver supplies its match-local episode serial. Several aborted
+     * episodes may happen without a live tick between them. */
+    if (row->episode_id > t->episodes) t->episodes = row->episode_id;
 }
 void rnet_telemetry_peer(RNetTelemetry *t, int seat, const RNetPeerTelemetry *p) {
     if (t && p && seat >= 0 && seat < RNET_MAX_SLOTS) t->peers[seat] = *p;
@@ -41,9 +42,16 @@ size_t rnet_telemetry_read(const RNetTelemetry *t, rnet_u64 first,
     while (first < t->count && n < cap) out[n++] = t->ring[first++ % RNET_TELEMETRY_TICKS];
     return n;
 }
-size_t rnet_telemetry_report(const RNetTelemetry *t, char *out, size_t cap) {
+size_t rnet_telemetry_report_extra(const RNetTelemetry *t, const RNetTickTelemetry *pending,
+                                  char *out, size_t cap) {
     char json[4096]; size_t used; int i, n;
+    rnet_u64 stalls, replays, corrections, episodes;
     if (!t) return 0;
+    stalls = t->stalls + (pending ? pending->stall_us : 0u);
+    replays = t->replays + (pending ? pending->replay_ticks : 0u);
+    corrections = t->corrections + (pending ? pending->mispredicts : 0u);
+    episodes = t->episodes;
+    if (pending && pending->episode_id > episodes) episodes = pending->episode_id;
     n = snprintf(json, sizeof(json),
         "{\"schema\":1,\"mode\":\"%s\",\"ticks\":%llu,\"retained_ticks\":%llu,"
         "\"dropped_ticks\":%llu,\"tick_us\":%u,\"latency_boundary\":\"sample-to-publish\","
@@ -56,10 +64,10 @@ size_t rnet_telemetry_report(const RNetTelemetry *t, char *out, size_t cap) {
         (unsigned long long)(t->count > RNET_TELEMETRY_TICKS ? t->count - RNET_TELEMETRY_TICKS : 0),
         t->tick_us, t->latency_n ? (double)t->latency / t->latency_n / 1000.0 : 0.0,
         (unsigned long long)t->latency_n, t->count ? (double)t->delay_total / t->count : 0.0,
-        (double)t->stalls / 1000.0,
-        t->count && t->tick_us ? (double)t->stalls * 60000.0 / ((double)t->count * t->tick_us) : 0.0,
-        (unsigned long long)t->corrections, (unsigned long long)t->episodes,
-        (unsigned long long)t->replays);
+        (double)stalls / 1000.0,
+        t->count && t->tick_us ? (double)stalls * 60000.0 / ((double)t->count * t->tick_us) : 0.0,
+        (unsigned long long)corrections, (unsigned long long)episodes,
+        (unsigned long long)replays);
     if (n < 0 || (size_t)n >= sizeof(json)) return 0;
     used = (size_t)n;
     for (i = 0; i < RNET_MAX_SLOTS; ++i) {
@@ -75,4 +83,7 @@ size_t rnet_telemetry_report(const RNetTelemetry *t, char *out, size_t cap) {
     memcpy(json + used, "]}", 3); used += 3;
     if (out && cap >= used) memcpy(out, json, used);
     return used;
+}
+size_t rnet_telemetry_report(const RNetTelemetry *t, char *out, size_t cap) {
+    return rnet_telemetry_report_extra(t, NULL, out, cap);
 }

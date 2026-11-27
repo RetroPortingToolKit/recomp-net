@@ -72,6 +72,13 @@ static void scenario(int mismatch,int fork) {
         vt.ctx=p;vt.sample_local=sample;vt.publish=noop_publish;vt.now_ms=now_ms;
         p->session=rnet_session_create(&cfg,&vt);CHECK(p->session);if(!p->session)goto cleanup;
         CHECK(!rnet_session_set_input_transform(p->session,canonicalize,NULL));
+        CHECK(rnet_experiment_profiles_begin(p->session,0,&caps,RNET_SYNC_LOCAL_V4)==-1);
+        CHECK(!rnet_session_local_inputs_enabled(p->session));
+        {
+            RNetProfileCaps invalid=caps;invalid.profiles=0;
+            CHECK(rnet_experiment_profiles_begin(p->session,0x123456u,&invalid,RNET_SYNC_LOCAL_V4)==-1);
+            CHECK(!rnet_session_local_inputs_enabled(p->session));
+        }
         CHECK(!rnet_experiment_profiles_begin(p->session,0x123456u,&caps,
             mismatch && s ? RNET_SYNC_EPISODE_V3 : RNET_SYNC_LOCAL_V4));
         snprintf(addresses[s],sizeof(addresses[s]),"127.0.0.1:%u",port+(unsigned)s);
@@ -116,7 +123,13 @@ static void scenario(int mismatch,int fork) {
             CHECK(rnet_session_committed_delay(peers[s].session)==(s?3u:1u));
             CHECK(peers[s].begins==peers[s].ends);
             CHECK(rnet_local_verified(peers[s].driver)==N);
-            CHECK(rnet_telemetry_report(rnet_local_telemetry(peers[s].driver),report,sizeof(report))>0);
+            CHECK(rnet_local_report(peers[s].driver,report,sizeof(report))>0);
+            {
+                unsigned long long replay_total=0;
+                const char *field=strstr(report,"\"replay_ticks\":");
+                CHECK(field && sscanf(field,"\"replay_ticks\":%llu",&replay_total)==1);
+                CHECK(replay_total==peers[s].replay);
+            }
             puts(report);
             CHECK(rnet_session_get_peer_telemetry(peers[s].session,1-s,&probe));
             CHECK(probe.received>0 && probe.sent>=probe.received);

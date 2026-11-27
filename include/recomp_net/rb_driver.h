@@ -236,6 +236,7 @@ RNetRbDriver *rnet_rb_driver_create(void);
 void rnet_rb_driver_destroy(RNetRbDriver *d);
 /* Retained until destroy or next start, including after shutdown. */
 const RNetTelemetry *rnet_rb_driver_telemetry(const RNetRbDriver *d);
+size_t rnet_rb_driver_report(const RNetRbDriver *, char *out, size_t capacity);
 
 /* Identity and mod set are properties of the PROCESS, not of a match: they
  * survive start()'s cold reset. Set them before start(). Fingerprints are

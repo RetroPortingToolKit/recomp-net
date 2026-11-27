@@ -21,6 +21,7 @@
  */
 
 #include "recomp_net/rb_driver.h"
+#include "rnet_telemetry_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -4453,6 +4454,7 @@ RNetRbAdmit rnet_rb_driver_poll_admit(RNetRbDriver *d)
     if (d->resim_ticks != replay_before)
         d->telemetry_work.replay_us += (uint32_t)(rb_now(d) - now) * 1000ull;
     d->telemetry_waiting = a == RNET_RB_ADMIT_STALL;
+    if (d->stall_tag && !strcmp(d->stall_tag, "session_hold")) d->telemetry_waiting = 0;
     d->telemetry_wait_ms = rb_now(d);
     d->telemetry_run_ms = rb_now(d);
     d->telemetry_work.episode_stage = (uint32_t)d->stage;
@@ -4562,6 +4564,9 @@ void rnet_rb_driver_finish_frame(RNetRbDriver *d)
 
 uint32_t rnet_rb_driver_sim_tick(const RNetRbDriver *d) { return d ? d->sim : 0u; }
 const RNetTelemetry *rnet_rb_driver_telemetry(const RNetRbDriver *d) { return d ? d->telemetry : NULL; }
+size_t rnet_rb_driver_report(const RNetRbDriver *d, char *out, size_t capacity) {
+    return d ? rnet_telemetry_report_extra(d->telemetry, &d->telemetry_work, out, capacity) : 0;
+}
 uint32_t rnet_rb_driver_episode_count(const RNetRbDriver *d) { return d ? d->episode_count : 0u; }
 uint32_t rnet_rb_driver_invent_count(const RNetRbDriver *d) { return d ? d->ih.invent_count : 0u; }
 uint32_t rnet_rb_driver_promote_count(const RNetRbDriver *d) { return d ? d->ih.promote_count : 0u; }
