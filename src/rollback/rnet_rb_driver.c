@@ -4430,11 +4430,17 @@ static void rb_check_chain_fork(RNetRbDriver *d)
             d->chain_pending_ms[i] = now; /* cooldown or drain: retry later */
         } else {
             d->chain_fork_tick[i] = tick;
+            d->fork_seen = 1;
+            d->fork_tick = tick; d->fork_partition = "confirmed";
+            d->fork_mine = local; d->fork_theirs = peer;
+            d->desync_count++;
             rb_log(d, "RB chain stall tick=%u local=%08x peer=%08x "
                       "— unresolved for %ums (settle %ums). The confirmed watermark "
-                      "cannot advance past this tick. ADVISORY: not acted on.\n",
+                      "cannot advance past this tick. Refusing the match.\n",
                    (unsigned)tick, (unsigned)local, (unsigned)peer,
                    (unsigned)(now - d->chain_pending_ms[i]), (unsigned)settle);
+            rb_refuse(d, "confirmed_state_desync");
+            return;
         }
     }
 }

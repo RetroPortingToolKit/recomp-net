@@ -20,6 +20,11 @@ struct RNetLocalDriver {
     rnet_u32 tick, confirmed, emitted, replay_next, replay_end, pending, prepared;
     rnet_u32 occupied, peers;
     rnet_u64 poll_at, run_at, last_hash_request;
+    rnet_u64 tick_snapshot_us, replay_setup_us;
+    RNetLocalControlConfig control_cfg;
+    RNetLocalControlState control;
+    rnet_u32 control_next, control_stable, control_candidate;
+    int control_enabled;
     int prepared_valid, replaying;
     int hold;
     rnet_u32 hold_at;
@@ -27,6 +32,97 @@ struct RNetLocalDriver {
 };
 static rnet_u64 clock_us(RNetLocalDriver *d) {
     return d->host.now_us ? d->host.now_us(d->host.ctx) : rnet_os_monotonic_ms() * 1000u;
+}
+static rnet_u32 measured_cost(rnet_u32 previous, rnet_u64 sample) {
+    if (!sample) return previous; /* coarse clocks do not prove zero cost */
+    if (sample > 0xffffffffu) sample = 0xffffffffu;
+    return previous ? (rnet_u32)(((rnet_u64)previous * 7u + sample + 7u) / 8u)
+                    : (rnet_u32)sample;
+}
+static rnet_u32 budget_delay(rnet_u32 transit, rnet_u32 jitter, rnet_u32 replay,
+    rnet_u32 live, rnet_u32 setup, rnet_u32 budget, rnet_u32 tick_us,
+    rnet_u32 max_depth, rnet_u32 *depth) {
+    rnet_u64 fixed = (rnet_u64)live + setup;
+    rnet_u32 affordable = replay && budget > fixed ? (rnet_u32)((budget - fixed) / replay) : 0u;
+    rnet_u64 needed;
+    if (affordable > max_depth) affordable = max_depth;
+    if (depth) *depth = affordable;
+    if (!tick_us) return 20u;
+    needed = ((rnet_u64)transit + jitter + tick_us - 1u) / tick_us;
+    needed = needed > affordable ? needed - affordable : 1u;
+    return needed > 20u ? 20u : (rnet_u32)needed;
+}
+int rnet_local_control_preview(const RNetLocalControlConfig *cfg, rnet_u32 tick_us,
+    rnet_u32 max_depth, RNetLocalControlState *out) {
+    if (!cfg || !out || !tick_us || !max_depth || max_depth > 64u ||
+        !cfg->frame_budget_us || !cfg->live_tick_us || !cfg->replay_tick_us ||
+        !cfg->replay_setup_us) return 0;
+    memset(out, 0, sizeof(*out));
+    out->live_tick_us = cfg->live_tick_us; out->replay_tick_us = cfg->replay_tick_us;
+    out->replay_setup_us = cfg->replay_setup_us;
+    out->one_way_us = cfg->one_way_us; out->jitter_us = cfg->jitter_us;
+    out->network_valid = cfg->network_valid;
+    out->target_delay = budget_delay(cfg->one_way_us, cfg->jitter_us,
+        cfg->replay_tick_us, cfg->live_tick_us, cfg->replay_setup_us, cfg->frame_budget_us, tick_us,
+        max_depth, &out->rollback_depth);
+    out->delay = out->target_delay;
+    return 1;
+}
+int rnet_local_control_begin(RNetLocalDriver *d, const RNetLocalControlConfig *cfg) {
+    RNetLocalControlState state;
+    if (!d || d->control_enabled || d->tick || d->pending || d->prepared_valid ||
+        !rnet_local_control_preview(cfg, d->cfg.tick_us, d->cfg.rollback_depth, &state)) return 0;
+    if (!state.network_valid) state.delay = state.target_delay = d->cfg.delay;
+    if (d->cfg.session && rnet_session_set_local_delay(d->cfg.session, (rnet_u8)state.delay)) return 0;
+    d->control_cfg = *cfg; d->control = state; d->control_enabled = 1;
+    d->cfg.delay = state.delay;
+    d->control_next = cfg->interval_ticks ? cfg->interval_ticks : 60u;
+    return 1;
+}
+int rnet_local_control_state(const RNetLocalDriver *d, RNetLocalControlState *out) {
+    if (!d || !out || !d->control_enabled) return 0;
+    *out = d->control; return 1;
+}
+static void control_update(RNetLocalDriver *d) {
+    RNetLocalControlState *c = &d->control;
+    RNetPeerTelemetry worst = {0};
+    int valid = 0, missing = 0, seat;
+    rnet_u32 requested;
+    if (!d->control_enabled || d->tick < d->control_next) return;
+    d->control_next = d->tick + (d->control_cfg.interval_ticks ? d->control_cfg.interval_ticks : 60u);
+    if (d->host.network) valid = d->host.network(d->host.ctx, &worst);
+    else if (d->cfg.session) {
+        valid = 1;
+        for (seat = 0; seat < (int)d->cfg.seats; ++seat) {
+            RNetPeerTelemetry peer;
+            if (!(d->peers & (1u << seat))) continue;
+            if (!rnet_session_get_peer_telemetry(d->cfg.session, seat, &peer) || !peer.received) {
+                valid = 0; break;
+            }
+            if (peer.rtt_us > worst.rtt_us) worst.rtt_us = peer.rtt_us;
+            if (peer.jitter_us > worst.jitter_us) worst.jitter_us = peer.jitter_us;
+        }
+    }
+    if (valid) {
+        c->one_way_us = worst.rtt_us / 2u + worst.rtt_us % 2u;
+        c->jitter_us = worst.jitter_us; c->network_valid = 1;
+    } else if (d->host.network || d->cfg.session) {
+        /* Never lower delay using an incomplete set of occupied peers. */
+        missing = 1;
+    }
+    if (!c->network_valid) return;
+    requested = budget_delay(c->one_way_us, c->jitter_us, c->replay_tick_us,
+        c->live_tick_us, c->replay_setup_us, d->control_cfg.frame_budget_us, d->cfg.tick_us,
+        d->cfg.rollback_depth, &c->rollback_depth);
+    c->target_delay = requested;
+    if (missing) { d->control_stable = 0; return; }
+    if (requested != d->control_candidate) {
+        d->control_candidate = requested; d->control_stable = 1;
+    } else if (d->control_stable < 2u) ++d->control_stable;
+    if (d->control_stable < 2u || requested == c->delay) return;
+    c->delay = requested > c->delay ? c->delay + 1u : c->delay - 1u;
+    d->cfg.delay = c->delay;
+    if (d->cfg.session) rnet_session_set_local_delay(d->cfg.session, (rnet_u8)c->delay);
 }
 static int refuse(RNetLocalDriver *d, const char *why) {
     d->refusal = why;
@@ -95,7 +191,11 @@ static int make_tick(RNetLocalDriver *d, rnet_u32 tick, int replay) {
         row.tick = tick; row.valid = 1;
         h->rows[seat] = row;
     }
-    if (!save(d, tick)) return 0;
+    {
+        rnet_u64 before = d->work.snapshot_us;
+        if (!save(d, tick)) return 0;
+        d->tick_snapshot_us = d->work.snapshot_us - before;
+    }
     d->host.publish(d->host.ctx, tick, h->rows, (int)d->cfg.seats, replay);
     if (!replay) d->work.guessed_seats = h->predicted;
     d->run_at = clock_us(d);
@@ -139,6 +239,7 @@ static int reconcile(RNetLocalDriver *d) {
         d->replay_next = old; d->replay_end = d->tick;
         d->work.episode_depth = d->tick - wrong;
         d->replaying = 1; d->host.resim_begin(d->host.ctx);
+        d->replay_setup_us = clock_us(d) - begin;
         return 1;
     }
     d->confirmed = next;
@@ -266,14 +367,27 @@ int rnet_local_poll(RNetLocalDriver *d) {
         d->poll_at = 0; /* an intentional pause is not network stall time */
         return 0;
     }
+    control_update(d);
     if (!d->prepared_valid || d->prepared != d->tick) {
         int ok = d->cfg.session ? rnet_session_prepare_local_tip(d->cfg.session, d->tick)
             : d->host.sample(d->host.ctx, d->tick, d->cfg.delay);
         if (!ok) { d->work.stall_reason = RNET_TICK_INPUT; return 0; }
         d->prepared = d->tick; d->prepared_valid = 1;
     }
-    if (d->tick - d->confirmed >= d->cfg.rollback_depth) {
-        d->work.stall_reason = RNET_TICK_PREDICTION_LIMIT; return 0;
+    {
+        rnet_u32 limit = d->control_enabled ? d->control.rollback_depth : d->cfg.rollback_depth;
+        int wait = limit ? d->tick - d->confirmed >= limit : d->tick != d->confirmed;
+        if (!limit && !wait) {
+            int seat;
+            for (seat = 0; seat < (int)d->cfg.seats; ++seat) {
+                RNetInputSample row; int got;
+                if (!(d->occupied & (1u << seat))) continue;
+                got = input(d, seat, d->tick, &row);
+                if (got < 0) return refuse(d, "input row size differs");
+                if (!got) { wait = 1; break; }
+            }
+        }
+        if (wait) { d->work.stall_reason = RNET_TICK_PREDICTION_LIMIT; return 0; }
     }
     return make_tick(d, d->tick, 0);
 }
@@ -287,12 +401,21 @@ int rnet_local_finish(RNetLocalDriver *d) {
     h->consumed = d->host.consumed_seats ? d->host.consumed_seats(d->host.ctx, h->tick) : d->occupied;
     h->digest = d->host.digest(d->host.ctx); h->complete = 1;
     d->work.digest_us += clock_us(d) - begin;
+    if (d->control_enabled) {
+        rnet_u64 cost = now - d->run_at + d->tick_snapshot_us + clock_us(d) - begin;
+        if (replay) d->control.replay_tick_us = measured_cost(d->control.replay_tick_us, cost);
+        else d->control.live_tick_us = measured_cost(d->control.live_tick_us, cost);
+    }
     d->pending = 0;
     if (replay) {
         ++d->work.replay_ticks; d->work.replay_us += now - d->run_at;
         ++d->replay_next;
         if (d->replay_next == d->replay_end) {
+            rnet_u64 end_begin = clock_us(d);
             d->host.resim_end(d->host.ctx); d->replaying = 0;
+            if (d->control_enabled)
+                d->control.replay_setup_us = measured_cost(d->control.replay_setup_us,
+                    d->replay_setup_us + clock_us(d) - end_begin);
         }
     } else {
         d->work.tick = d->tick; d->work.at_us = now; d->work.delay = d->cfg.delay;
@@ -333,12 +456,5 @@ size_t rnet_local_report(const RNetLocalDriver *d, char *out, size_t capacity) {
 }
 rnet_u32 rnet_local_budget_delay(rnet_u32 transit, rnet_u32 jitter, rnet_u32 replay,
     rnet_u32 live, rnet_u32 budget, rnet_u32 max_depth, rnet_u32 *depth) {
-    rnet_u32 affordable = replay && budget > live ? (budget - live) / replay : 0u;
-    rnet_u64 needed;
-    if (affordable > max_depth) affordable = max_depth;
-    if (depth) *depth = affordable;
-    if (!budget) return 20u;
-    needed = ((rnet_u64)transit + jitter + budget - 1u) / budget;
-    needed = needed > affordable ? needed - affordable : 1u;
-    return needed > 20u ? 20u : (rnet_u32)needed;
+    return budget_delay(transit, jitter, replay, live, 0u, budget, budget, max_depth, depth);
 }

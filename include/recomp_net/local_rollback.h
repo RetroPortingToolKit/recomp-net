@@ -37,7 +37,28 @@ typedef struct RNetLocalHost {
     /* Only for a host-owned transport. input must return immutable canonical rows. */
     int (*input)(void *, int seat, rnet_u32 tick, RNetInputSample *out);
     int (*sample)(void *, rnet_u32 tick, rnet_u32 delay);
+    /* Host-owned transports: worst occupied peer's measured path. Return 0
+     * until every peer has a measurement. Session-backed hosts may leave NULL. */
+    int (*network)(void *, RNetPeerTelemetry *worst);
 } RNetLocalHost;
+typedef struct RNetLocalControlConfig {
+    rnet_u32 frame_budget_us;
+    /* Seed with built-host measurements including snapshot/digest overhead.
+     * The driver updates both costs from executed live/replay ticks. */
+    rnet_u32 live_tick_us, replay_tick_us;
+    /* Fixed rewind/drop/resim-bracket cost, reserved once per correction.
+     * A nonzero measured seed is required for coarse-clock hosts too. */
+    rnet_u32 replay_setup_us;
+    rnet_u32 one_way_us, jitter_us, network_valid;
+    /* 0 uses 60 live ticks. Both directions require two stable intervals,
+     * then move at most one delay tick per interval. */
+    rnet_u32 interval_ticks;
+} RNetLocalControlConfig;
+typedef struct RNetLocalControlState {
+    rnet_u32 delay, target_delay, rollback_depth;
+    rnet_u32 live_tick_us, replay_tick_us, replay_setup_us;
+    rnet_u32 one_way_us, jitter_us, network_valid;
+} RNetLocalControlState;
 /* Startup is immutable and uses the existing capability agreement. Both modes
  * must call this BEFORE transport start; qualification retains build/content identity.
  * A mode disagreement refuses startup instead of falling back. */
@@ -61,6 +82,14 @@ const char *rnet_local_refusal(const RNetLocalDriver *);
 const RNetTelemetry *rnet_local_telemetry(const RNetLocalDriver *);
 /* End-of-match report includes corrections after the last completed live tick. */
 size_t rnet_local_report(const RNetLocalDriver *, char *out, size_t capacity);
+/* Pure pre-match preview. tick_us is simulation cadence, distinct from the
+ * host's available frame budget. No CPU feature implies a qualified cost. */
+int rnet_local_control_preview(const RNetLocalControlConfig *, rnet_u32 tick_us,
+    rnet_u32 max_depth, RNetLocalControlState *);
+/* Configure once before tick 0 / sampling; NULL is not an enable/disable switch.
+ * Still reserve cfg.rollback_depth snapshots even when affordable depth is lower. */
+int rnet_local_control_begin(RNetLocalDriver *, const RNetLocalControlConfig *);
+int rnet_local_control_state(const RNetLocalDriver *, RNetLocalControlState *);
 /* Static budget decision, using measured costs in microseconds. No TURN floor.
  * one_way is an ESTIMATE when obtained from half an RTT. */
 rnet_u32 rnet_local_budget_delay(rnet_u32 one_way, rnet_u32 jitter,

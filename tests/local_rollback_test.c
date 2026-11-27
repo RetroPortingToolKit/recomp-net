@@ -9,6 +9,9 @@ typedef struct Fixture {
     struct { rnet_u32 tick, state; int valid; } snapshots[RNET_LOCAL_HISTORY];
     RNetInputSample truth[2][TICKS], published[2];
     RNetLocalDriver *driver;
+    rnet_u64 clock_offset;
+    rnet_u32 simulate_cost, simulate_load_cost, transport_rtt;
+    int network_ready;
     int unread;
 } Fixture;
 static int failures;
@@ -21,7 +24,9 @@ static rnet_u32 step(rnet_u32 state, rnet_u32 tick, const RNetInputSample *rows,
     }
     return (state ^ tick) * 16777619u;
 }
-static rnet_u64 now(void *ctx) { return ((Fixture *)ctx)->wall * 16667ull + 1u; }
+static rnet_u64 now(void *ctx) {
+    Fixture *f = ctx; return f->wall * 16667ull + f->clock_offset + 1u;
+}
 static int save(void *ctx, rnet_u32 t) {
     Fixture *f = ctx; unsigned i = t % RNET_LOCAL_HISTORY;
     f->snapshots[i].tick = t; f->snapshots[i].state = f->state; f->snapshots[i].valid = 1;
@@ -32,7 +37,8 @@ static int load(void *ctx, rnet_u32 t) {
     CHECK(f->snapshots[i].valid && f->snapshots[i].tick == t);
     CHECK(t == rnet_local_confirmed(f->driver));
     for (before = 0; before < t; ++before) CHECK(f->release[before] <= f->wall);
-    f->state = f->snapshots[i].state; ++f->loads; return 1;
+    f->state = f->snapshots[i].state; ++f->loads;
+    f->clock_offset += f->simulate_load_cost; return 1;
 }
 static void drop(void *ctx, rnet_u32 t) {
     Fixture *f = ctx; unsigned i;
@@ -47,7 +53,8 @@ static void publish(void *ctx, rnet_u32 t, const RNetInputSample *rows, int seat
 }
 static int run(void *ctx, rnet_u32 t) {
     Fixture *f = ctx; CHECK(t == f->row_tick);
-    f->state = step(f->state, t, f->published, f->unread); return 1;
+    f->state = step(f->state, t, f->published, f->unread);
+    f->clock_offset += f->simulate_cost; return 1;
 }
 static void begin(void *ctx) { ++((Fixture *)ctx)->begins; }
 static void end(void *ctx) { ++((Fixture *)ctx)->ends; }
@@ -61,6 +68,79 @@ static int input(void *ctx, int seat, rnet_u32 t, RNetInputSample *row) {
 static int sample(void *ctx, rnet_u32 t, rnet_u32 delay) { (void)ctx; (void)delay; return t < TICKS; }
 static void neutral(void *ctx, int seat, RNetInputSample *row) {
     (void)ctx; (void)seat; memset(row, 0, sizeof(*row)); row->size = 32; row->valid = 1;
+}
+static int network(void *ctx, RNetPeerTelemetry *peer) {
+    Fixture *f = ctx; memset(peer, 0, sizeof(*peer));
+    peer->rtt_us = f->transport_rtt; peer->received = 1;
+    return f->network_ready;
+}
+static void controller_scenario(void) {
+    Fixture *f = calloc(1, sizeof(*f));
+    RNetLocalConfig cfg = {0}; RNetLocalHost host = {0};
+    RNetLocalControlConfig control = {0}; RNetLocalControlState state;
+    rnet_u32 t, previous = 1, largest = 1, zero_depth_ticks = 0;
+    CHECK(f != NULL); if (!f) return;
+    f->state = 2166136261u; f->simulate_cost = 8000; f->simulate_load_cost = 3000;
+    f->network_ready = 1;
+    for (t = 0; t < TICKS; ++t) {
+        int s; for (s = 0; s < 2; ++s) {
+            f->truth[s][t].size = 32; f->truth[s][t].valid = 1;
+            f->truth[s][t].bytes[31] = (rnet_u8)(t * 13u + (unsigned)s);
+        }
+        /* Remote rows are genuinely late; depth zero must wait, not deadlock. */
+        f->release[t] = t + 2u;
+    }
+    cfg.seats = 2; cfg.row_size = 32; cfg.delay = 1;
+    cfg.rollback_depth = 12; cfg.tick_us = 16667;
+    host.ctx = f; host.save = save; host.load = load; host.drop_after = drop;
+    host.publish = publish; host.run_tick = run; host.resim_begin = begin; host.resim_end = end;
+    host.digest = digest; host.now_us = now; host.neutral = neutral;
+    host.input = input; host.sample = sample; host.network = network;
+    f->driver = rnet_local_create(&cfg, &host); CHECK(f->driver != NULL);
+    if (!f->driver) { free(f); return; }
+    control.frame_budget_us = 11000; control.live_tick_us = 8000; control.replay_setup_us = 1000;
+    control.replay_tick_us = 1000; control.network_valid = 1; control.interval_ticks = 8;
+    control.one_way_us = 100000;
+    CHECK(rnet_local_control_preview(&control, cfg.tick_us, cfg.rollback_depth, &state));
+    CHECK(state.delay == 4 && state.rollback_depth == 2);
+    control.replay_setup_us = 3000;
+    CHECK(rnet_local_control_preview(&control, cfg.tick_us, cfg.rollback_depth, &state));
+    CHECK(state.delay == 6 && state.rollback_depth == 0);
+    control.replay_setup_us = 1000;
+    control.one_way_us = 0;
+    CHECK(rnet_local_control_begin(f->driver, &control));
+    CHECK(!rnet_local_control_begin(f->driver, &control));
+    CHECK(rnet_local_set_hold(f->driver, TICKS));
+    for (f->wall = 0; f->wall < TICKS + 40u; ++f->wall) {
+        int a;
+        f->transport_rtt = f->wall < 8u || f->wall >= 100u ? 0u : 200000u;
+        /* Missing peer observations cannot lower the settled delay. */
+        f->network_ready = !(f->wall >= 100u && f->wall < 124u);
+        if (f->wall >= 180u) f->simulate_cost = 10000;
+        a = rnet_local_poll(f->driver);
+        if (a) { run(f, f->row_tick); CHECK(rnet_local_finish(f->driver)); }
+        CHECK(rnet_local_control_state(f->driver, &state));
+        CHECK(state.delay <= previous + 1u && previous <= state.delay + 1u);
+        if (!f->network_ready) CHECK(state.delay == previous);
+        previous = state.delay; if (state.delay > largest) largest = state.delay;
+        if (a == 1 && !state.rollback_depth) ++zero_depth_ticks;
+        if (rnet_local_refusal(f->driver)) break;
+    }
+    CHECK(!rnet_local_refusal(f->driver)); CHECK(rnet_local_confirmed(f->driver) == TICKS);
+    CHECK(largest > 1 && state.delay == 1 && zero_depth_ticks > 10);
+    CHECK(state.replay_setup_us > 1000u && state.replay_setup_us <= 3000u);
+    {
+        rnet_u32 expected = 2166136261u;
+        for (t = 0; t < TICKS; ++t) {
+            RNetInputSample rows[2] = {f->truth[0][t], f->truth[1][t]};
+            expected = step(expected, t, rows, 0);
+        }
+        CHECK(f->state == expected);
+    }
+    CHECK(!rnet_local_control_begin(f->driver, &control));
+    printf("controller: peak_delay=%u final_delay=%u zero_depth_ticks=%u\n",
+        largest, state.delay, zero_depth_ticks);
+    rnet_local_destroy(f->driver); free(f);
 }
 static void scenario(int incremental, int unread, int right_stick_only) {
     Fixture *f = calloc(1, sizeof(*f));
@@ -128,6 +208,7 @@ static void scenario(int incremental, int unread, int right_stick_only) {
 int main(void) {
     rnet_u32 depth;
     scenario(0, 0, 0); scenario(1, 0, 0); scenario(1, 1, 0); scenario(1, 0, 1);
+    controller_scenario();
     CHECK(rnet_local_budget_delay(100000, 10000, 1000, 8000, 16667, 12, &depth) == 1 && depth == 8);
     CHECK(rnet_local_budget_delay(100000, 10000, 8000, 15000, 16667, 12, &depth) == 7 && depth == 0);
     return failures ? 1 : 0;

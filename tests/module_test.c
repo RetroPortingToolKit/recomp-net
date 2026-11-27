@@ -36,6 +36,9 @@ int main(int argc, char **argv) {
     CHECK(module_symbol(h, "rnet_experiment_profiles_begin"));
     CHECK(module_symbol(h, "rnet_telemetry_report"));
     CHECK(module_symbol(h, "rnet_local_report"));
+    CHECK(module_symbol(h, "rnet_local_control_preview"));
+    CHECK(module_symbol(h, "rnet_local_control_begin"));
+    CHECK(module_symbol(h, "rnet_local_control_state"));
     CHECK(module_symbol(h, "rnet_rb_driver_report"));
     CHECK(module_symbol(h, "rnet_session_get_peer_telemetry"));
     CHECK(module_symbol(h, "rnet_session_create"));

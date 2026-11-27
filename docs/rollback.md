@@ -187,7 +187,7 @@ baseline gate, replay, POST verify, commit, tip-hold, tip-extend, abort
 classes and mirrored cooldowns, a watchdog on every stage that waits on a
 peer), snapshot policy (interval, floor, the baseline fork cap), the
 FRAME_COMMIT hash chain, the boot-digest gate, the mod-set and identity
-handshakes, lockstep degrade, the advisory chain-stall report, and a cold
+handshakes, lockstep degrade, confirmed chain-fork handling, and a cold
 reset on every start.
 
 Rules it adds over what snesrecomp shipped. The first two were found by
@@ -267,9 +267,14 @@ state, so a correction that never lands is a measurable divergence):
   ended any other way after its replay left the live, mispredicted digests
   behind, and the chain stalled on a tick the replay had already fixed. A
   replay undone by a tip restore leaves no trace (nothing is written until it
-  completes). The advisory "RB chain stall" is also not reported at or after
+  completes). "RB chain stall" is also not acted on at or after
   a correction this peer still owes: that mismatch is explained until the
   retry replays it.
+- **Persistent two-seat forks refuse the match** on this experimental branch.
+  After the existing correction/settle checks, the driver retains both digests,
+  reports `confirmed_state_desync`, requests the lobby once and admits no more
+  live ticks. The older advisory behavior mentioned in historical evidence
+  below is no longer the two-seat outcome. Multi-seat episode repair remains.
 - **POST and BEGIN are re-sent until answered** (2026-09-25). Each used to go
   out once, and one lost datagram held the peer that needed it for the whole
   2 s episode budget ("timed out waiting for peer POST"). A commit needs N-1

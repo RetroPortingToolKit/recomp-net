@@ -15,9 +15,10 @@
  *   GUEST  one offerer agent whose peer is the host.
  *          Seat moves preserve both endpoints and update routing metadata.
  *
- * Roles are fixed: the host answers, guests offer. No TURN and no
- * force-relay -- a hub agent that cannot connect directly is a failure, and
- * the lobby server's relay carries the match instead.
+ * Roles are fixed: the host answers, guests offer. This helper configures no
+ * TURN or force-relay; a hub agent that cannot connect directly is a failure.
+ * The lobby server has no gameplay UDP relay fallback. Using the existing
+ * TURN service here requires client credential/fallback integration.
  *
  * Signalling rides the lobby `signal` op addressed with to_player_id, in its
  * own type range so it cannot collide with the legacy game ICE (1-6), the

@@ -40,7 +40,7 @@ extern "C" {
 #endif
 
 #define RNET_MODULE_ABI_VERSION 1u
-#define RNET_MODULE_ABI_MINOR 3u /* driver reports include pending end-of-match work */
+#define RNET_MODULE_ABI_MINOR 4u /* local budget controller and preview */
 
 #define RNET_MODULE_FEATURE_ICE (1u << 0)      /* built with libjuice */
 #define RNET_MODULE_FEATURE_RBENGINE (1u << 1) /* exports rbe_* */

@@ -8,6 +8,9 @@ ordinary input corrections. `local_rollback.h` owns a local input timeline and
 replays through host snapshot, simulation and presentation callbacks. The
 existing `rb_driver.h` episode implementation remains in the same library for
 comparison. Hosts choose the driver after immutable startup agreement.
+The episode path also fixes complete pad-row comparison and refuses a persistent
+two-seat confirmed chain fork after its existing settle/correction checks.
+The A/B baseline includes these correctness fixes.
 
 ## Correctness boundary
 
@@ -49,9 +52,24 @@ Local mode disables host-authoritative HELLO/DELAY_SYNC adoption. Each seat's
 session stamps its own samples at T+D. Published rows are immutable. Increasing
 D fills newly exposed slots; decreasing D drains previously published input
 before fresh samples resume. Hosts must display the resulting delay and reserve
-enough snapshots. `rnet_local_budget_delay` computes a conservative budget from
-measured live/replay cost, transit and jitter; it is currently a calculation
-helper, not an autonomous adaptive controller.
+enough snapshots. `rnet_local_control_preview` computes the pre-match delay and
+affordable depth from measured live/replay costs, transit and jitter. Simulation
+cadence and available host frame budget are separate inputs. Half RTT is an
+estimate, not a measured one-way path.
+
+`rnet_local_control_begin` enables a controller before sampling. It updates
+execution costs (including snapshot/digest) from live/replay work, reserves the
+fixed load/drop/resim-bracket cost once per correction, and uses the
+worst occupied peer's sequence-echo RTT and jitter. Hosts with their own input
+transport supply the equivalent observation callback. Costs must be seeded
+from the built host, including a nonzero rewind/setup seed; zero-duration clock
+samples never establish free replay or rewind.
+Every interval (60 live ticks by default), two stable target observations permit
+a one-tick delay change. Raising and lowering use the same rule. Missing peer
+measurements prevent changes. Zero affordable depth waits for real input instead
+of inventing a replay budget. Hosts still reserve the full configured snapshot
+depth. A slow live tick exceeding its frame budget is a host coverage/performance
+gap; increasing D cannot make that computation fit.
 
 ## Observations
 
@@ -96,8 +114,8 @@ zero new desyncs, and minimum-hardware frame budget.
 
 Still required before promotion:
 
-1. Complete the adaptive delay controller with symmetric raise/lower policy,
-   actual measured replay budgets, startup preview and host integration.
+1. Integrate the budget controller/preview with actual built-host measurements
+   and lobby controls; qualify its policy on real games and minimum hardware.
 2. Real racer/FPS A/B workloads and full match reports, packet-capture probe
    checks, host diagnostics-mod wiring and durable report export.
 3. Shared dirty-page snapshots and each heavy core's qualified replay path.

@@ -59,10 +59,10 @@ static void run(Peer *p) {
 static void begin(void *ctx) {++((Peer*)ctx)->begins;}
 static void end(void *ctx) {++((Peer*)ctx)->ends;}
 static rnet_u32 digest(void *ctx) {return ((Peer*)ctx)->state;}
-static void scenario(int mismatch,int fork) {
+static void scenario(int mismatch,int fork,int adaptive) {
     Peer peers[2]={{0}};RNetProfileCaps caps={1u,1u,1u,0u};
     char addresses[2][48],report[4096];rnet_u64 next[2]={0,0};int s,done=0;
-    unsigned port=22000u+((unsigned)getpid()%12000u)*2u+(unsigned)mismatch*4u+(unsigned)fork*8u;
+    unsigned port=22000u+((unsigned)getpid()%12000u)*2u+(unsigned)mismatch*4u+(unsigned)fork*8u+(unsigned)adaptive*12u;
     for(s=0;s<2;s++) {
         Peer *p=&peers[s];RNetConfig cfg;RNetHostVTable vt={0};
         RNetLocalConfig lc={0};RNetLocalHost host={0};
@@ -88,6 +88,14 @@ static void scenario(int mismatch,int fork) {
         host.ctx=p;host.save=save;host.load=load;host.drop_after=drop;host.publish=publish;
         host.resim_begin=begin;host.resim_end=end;host.digest=digest;host.now_us=now_us;host.neutral=neutral;
         p->driver=rnet_local_create(&lc,&host);CHECK(p->driver);if(!p->driver)goto cleanup;
+        if(adaptive) {
+            RNetLocalControlConfig control={0};RNetLocalControlState state;
+            control.frame_budget_us=16667;control.live_tick_us=12000;control.replay_tick_us=2000;
+            control.replay_setup_us=1000;
+            control.one_way_us=200000;control.network_valid=1;control.interval_ticks=8;
+            CHECK(rnet_local_control_begin(p->driver,&control));
+            CHECK(rnet_local_control_state(p->driver,&state));CHECK(state.delay==11);
+        }
         CHECK(rnet_local_set_hold(p->driver,N));
     }
     for(s=0;s<2;s++)CHECK(!rnet_session_start_lan(peers[s].session,addresses[s],s?addresses[0]:NULL));
@@ -120,7 +128,16 @@ static void scenario(int mismatch,int fork) {
         CHECK(peers[0].state==peers[1].state);
         CHECK(peers[0].replay+peers[1].replay>0 || !getenv("RNET_SIM_LATENCY_MS"));
         for(s=0;s<2;s++) {
-            CHECK(rnet_session_committed_delay(peers[s].session)==(s?3u:1u));
+            if(adaptive) {
+                RNetLocalControlState state;
+                CHECK(rnet_local_control_state(peers[s].driver,&state));
+                /* A coarse clock can retain the measured startup replay cost;
+                 * it must not turn an unmeasurable tiny fixture into free replay. */
+                CHECK(state.delay>=1u && state.delay<11u);
+                CHECK(rnet_session_committed_delay(peers[s].session)==state.delay);
+                printf("adaptive seat=%d delay=%u target=%u depth=%u live_us=%u replay_us=%u\n",
+                    s,state.delay,state.target_delay,state.rollback_depth,state.live_tick_us,state.replay_tick_us);
+            } else CHECK(rnet_session_committed_delay(peers[s].session)==(s?3u:1u));
             CHECK(peers[s].begins==peers[s].ends);
             CHECK(rnet_local_verified(peers[s].driver)==N);
             CHECK(rnet_local_report(peers[s].driver,report,sizeof(report))>0);
@@ -135,9 +152,13 @@ static void scenario(int mismatch,int fork) {
             CHECK(probe.received>0 && probe.sent>=probe.received);
         }
     }
-    printf("socket scenario mode_mismatch=%d deliberate_fork=%d ticks=%u/%u replay=%u/%u\n",
-        mismatch,fork,rnet_local_tick(peers[0].driver),rnet_local_tick(peers[1].driver),peers[0].replay,peers[1].replay);
+    printf("socket scenario mode_mismatch=%d deliberate_fork=%d adaptive=%d ticks=%u/%u replay=%u/%u\n",
+        mismatch,fork,adaptive,rnet_local_tick(peers[0].driver),rnet_local_tick(peers[1].driver),peers[0].replay,peers[1].replay);
 cleanup:
     for(s=0;s<2;s++){rnet_local_destroy(peers[s].driver);rnet_session_destroy(peers[s].session);}
 }
-int main(void) {scenario(1,0);scenario(0,0);scenario(0,1);return failures?1:0;}
+int main(int argc,char **argv) {
+    if(argc==2 && !strcmp(argv[1],"trace")) {scenario(0,0,0);scenario(0,0,1);}
+    else {scenario(1,0,0);scenario(0,0,0);scenario(0,1,0);scenario(0,0,1);}
+    return failures?1:0;
+}
