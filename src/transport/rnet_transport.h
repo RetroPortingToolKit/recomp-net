@@ -43,6 +43,8 @@ struct RNetTransport
     int netsim_probed;
     RNetNetSim *send_netsim;
     int send_netsim_probed;
+    RNetPacketTransport external;
+    int external_failed;
 };
 
 void rnet_transport_init(RNetTransport *t);
@@ -56,6 +58,7 @@ int rnet_transport_start_ice_hub(RNetTransport *t,
                                  void *const ctx[RNET_MAX_SLOTS]);
 /* Bind-only LAN hub for host-as-relay (multi-seat fan-out). */
 int rnet_transport_start_lan_hub(RNetTransport *t, const char *bind_hostport);
+int rnet_transport_start_external(RNetTransport *t, const RNetPacketTransport *external);
 int rnet_transport_send(RNetTransport *t, const rnet_u8 *buf, size_t len);
 /* Returns bytes read, 0 if would-block/empty, -1 on hard error. */
 int rnet_transport_recv(RNetTransport *t, rnet_u8 *buf, size_t cap);

@@ -32,6 +32,7 @@ typedef struct HiPeer {
     /* Round trip over this agent once it is linked (-1 until measured). */
     int rtt_ms;
     rnet_u64 ping_due_ms;
+    int force_relay;
 } HiPeer;
 
 static void hi_rtt_pump(HiPeer *p, rnet_u64 now);
@@ -47,6 +48,9 @@ struct RNetHostIce {
     int stun_set;      /* view said something about STUN (even "") */
     unsigned short stun_port;
     char bind_address[64];
+    char turn_host[128], turn_user[192], turn_pass[128];
+    unsigned short turn_port;
+    int force_relay;
     char host_pid[RNET_HOST_ICE_ID_LEN]; /* guest: the one sender we accept */
     unsigned rejected;
     unsigned reports_sent;
@@ -104,6 +108,29 @@ void rnet_host_ice_destroy_agent(RNetIceAgent *agent)
     rnet_ice_agent_destroy(agent);
 }
 
+int rnet_host_ice_agent_send(RNetIceAgent *agent, const rnet_u8 *bytes, size_t len)
+{
+    if (!agent || !bytes || !len || rnet_ice_agent_state(agent) != RNET_ICE_STATE_COMPLETED)
+        return -1;
+    return rnet_ice_agent_send(agent, bytes, len);
+}
+
+int rnet_host_ice_agent_recv(RNetIceAgent *agent, rnet_u8 *bytes, size_t capacity)
+{
+    size_t len = 0;
+    if (!agent || !bytes || !capacity || rnet_ice_agent_state(agent) == RNET_ICE_STATE_FAILED)
+        return -1;
+    if (rnet_ice_agent_recv(agent, bytes, capacity, &len) != 0) return 0;
+    return len <= capacity ? (int)len : -1;
+}
+
+int rnet_host_ice_agent_pump(RNetIceAgent *agent)
+{
+    if (!agent) return -1;
+    rnet_ice_agent_poll(agent);
+    return rnet_ice_agent_state(agent) == RNET_ICE_STATE_FAILED ? -1 : 0;
+}
+
 int rnet_host_ice_sig_is_ours(int wire_type)
 {
     return wire_type > RNET_LOBBY_SIG_HOSTICE_BASE && wire_type <= RNET_LOBBY_SIG_HOSTICE_BASE + 6;
@@ -125,8 +152,7 @@ static void emit_cb(const RNetSignal *msg, void *user)
                          h->ctx);
 }
 
-/* Build (or rebuild) the agent for a peer. Never TURN, never force_relay,
- * never a fixed port. */
+/* Build (or rebuild) only an uncompleted negotiation. Never a fixed port. */
 static int peer_build_agent(RNetHostIce *h, HiPeer *p, int controlling)
 {
     RNetIceConfig cfg;
@@ -142,7 +168,11 @@ static int peer_build_agent(RNetHostIce *h, HiPeer *p, int controlling)
     cfg.bind_address = h->bind_address[0] ? h->bind_address : NULL;
     cfg.bind_port = 0;
     cfg.controlling = (rnet_u8)(controlling ? 1 : 0);
-    cfg.force_relay = 0;
+    cfg.turn_host = h->turn_host[0] ? h->turn_host : NULL;
+    cfg.turn_port = h->turn_port;
+    cfg.turn_user = h->turn_user[0] ? h->turn_user : NULL;
+    cfg.turn_pass = h->turn_pass[0] ? h->turn_pass : NULL;
+    cfg.force_relay = (rnet_u8)(h->force_relay || p->force_relay);
     p->agent = rnet_ice_agent_create(&cfg, emit_cb, p);
     if (p->agent == NULL)
         return -1;
@@ -286,7 +316,8 @@ static void guest_report(RNetHostIce *h, HiPeer *p, rnet_u64 now)
             const char *ice = NULL;
             path[0] = '\0';
             rnet_ice_agent_selected_info(p->agent, path, sizeof(path), NULL, 0, NULL, 0);
-            if (!strcmp(path, "host") || !strcmp(path, "srflx") || !strcmp(path, "prflx"))
+            if (!strcmp(path, "host") || !strcmp(path, "srflx") || !strcmp(path, "prflx") ||
+                !strcmp(path, "relay"))
                 ice = path;
             if (send_report(h, "direct", ice) == 0) {
                 snprintf(p->last_report, sizeof(p->last_report), "direct");
@@ -296,7 +327,15 @@ static void guest_report(RNetHostIce *h, HiPeer *p, rnet_u64 now)
         return;
     }
     if (st == RNET_ICE_STATE_FAILED ||
+        (h->turn_host[0] && !p->force_relay && !h->force_relay &&
+         now >= p->created_ms && now - p->created_ms >= 5000u) ||
         (now >= p->created_ms && now - p->created_ms > HI_CONNECT_TIMEOUT_MS)) {
+        if (h->turn_host[0] && !p->force_relay && !h->force_relay) {
+            const int g = next_gen(p->gen);
+            p->force_relay = 1;
+            if (peer_build_agent(h, p, 1) == 0) p->gen = g;
+            return;
+        }
         if (p->retry_at_ms == 0) {
             if (strcmp(p->last_report, "fail") != 0 && send_report(h, "fail", NULL) == 0)
                 snprintf(p->last_report, sizeof(p->last_report), "fail");
@@ -338,6 +377,25 @@ void rnet_host_ice_update(RNetHostIce *h, const RNetHostIceView *v)
     snprintf(h->stun_host, sizeof(h->stun_host), "%s", v->stun_host ? v->stun_host : "");
     h->stun_port = v->stun_port;
     snprintf(h->bind_address, sizeof(h->bind_address), "%s", v->bind_address ? v->bind_address : "");
+    {
+        int changed = strcmp(h->turn_host, v->turn_host ? v->turn_host : "") ||
+            strcmp(h->turn_user, v->turn_user ? v->turn_user : "") ||
+            strcmp(h->turn_pass, v->turn_pass ? v->turn_pass : "") ||
+            h->turn_port != v->turn_port || h->force_relay != !!v->force_relay;
+        snprintf(h->turn_host, sizeof(h->turn_host), "%s", v->turn_host ? v->turn_host : "");
+        snprintf(h->turn_user, sizeof(h->turn_user), "%s", v->turn_user ? v->turn_user : "");
+        snprintf(h->turn_pass, sizeof(h->turn_pass), "%s", v->turn_pass ? v->turn_pass : "");
+        h->turn_port = v->turn_port;
+        h->force_relay = !!v->force_relay;
+        if (changed) for (i = 0; i < RNET_HOST_ICE_MAX_PEERS; ++i) {
+            HiPeer *p = &h->peer[i];
+            if (!p->used || !p->agent || rnet_ice_agent_is_frozen(p->agent)) continue;
+            if (h->role == 2) p->gen = next_gen(p->gen);
+            else p->gen = 0;
+            p->force_relay = 0;
+            (void)peer_build_agent(h, p, h->role == 2);
+        }
+    }
     {
         /* Test aids (documented in host_ice.h), so a loopback test can drive the
          * real lobby client without a network. */

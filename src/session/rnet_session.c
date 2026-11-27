@@ -2861,6 +2861,21 @@ int rnet_session_start_ice(RNetSession *s, const RNetIceConfig *ice)
 #endif
 }
 
+int rnet_session_start_external(RNetSession *s, const RNetPacketTransport *transport)
+{
+    if (!s || s->phase != RNET_PHASE_IDLE || s->transport.mode != RNET_TRANSPORT_NONE ||
+        rnet_transport_start_external(&s->transport, transport) != 0)
+        return -1;
+    s->phase = RNET_PHASE_LINKING;
+    s->last_hello_ms = 0;
+    return 0;
+}
+
+int rnet_session_transport_failed(const RNetSession *s)
+{
+    return s && s->transport.mode == RNET_TRANSPORT_EXTERNAL && s->transport.external_failed;
+}
+
 int rnet_session_start_ice_hub(RNetSession *s, const RNetIceConfig *ice, rnet_u32 guest_slot_mask)
 {
 #if !defined(RNET_ENABLE_ICE)
@@ -3173,6 +3188,16 @@ void rnet_session_pump(RNetSession *s)
     {
         return;
     }
+    if (s->transport.mode == RNET_TRANSPORT_EXTERNAL)
+    {
+        if (s->transport.external_failed ||
+            (s->transport.external.pump && s->transport.external.pump(s->transport.external.ctx) < 0))
+        {
+            s->transport.external_failed = 1;
+            s->phase = RNET_PHASE_IDLE;
+            return;
+        }
+    }
     if (s->ice_hub_mask != 0u)
     {
         int i;
@@ -3224,6 +3249,7 @@ void rnet_session_pump(RNetSession *s)
         }
     }
     pump_recv(s);
+    if (rnet_session_transport_failed(s)) { s->phase = RNET_PHASE_IDLE; return; }
     maybe_bootstrap(s);
     profiles_drive(s);
     experiment_echo_drive(s);
@@ -3305,7 +3331,7 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
     rnet_u32 hash;
     rnet_u8 slot;
 
-    if ((s == NULL) || (s->phase != RNET_PHASE_RUNNING))
+    if ((s == NULL) || (s->phase != RNET_PHASE_RUNNING) || rnet_session_transport_failed(s))
     {
         if (s)
             note_admit_stall(s, RNET_ADMIT_NOT_RUNNING);
@@ -3847,7 +3873,7 @@ rnet_u32 rnet_session_sim_tick(const RNetSession *s)
 
 int rnet_session_is_running(const RNetSession *s)
 {
-    return (s != NULL && s->phase == RNET_PHASE_RUNNING) ? 1 : 0;
+    return (s != NULL && s->phase == RNET_PHASE_RUNNING && !rnet_session_transport_failed(s)) ? 1 : 0;
 }
 
 RNetIceState rnet_session_ice_state(const RNetSession *s)
@@ -3899,7 +3925,7 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     out->delay = s->delay;
     out->local_slot = s->cfg.local_slot;
     out->slot_count = s->cfg.slot_count;
-    out->is_running = (s->phase == RNET_PHASE_RUNNING) ? 1 : 0;
+    out->is_running = rnet_session_is_running(s);
     out->peer_gone = s->peer_gone;
     out->input_desync = s->input_desync;
     out->desync_tick = s->desync_tick;
@@ -4008,7 +4034,13 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     } else
 #endif
     {
-        snprintf(out->ice_path, sizeof(out->ice_path), "lan");
+        if (s->transport.mode == RNET_TRANSPORT_EXTERNAL)
+        {
+            const char *paths[] = {"unknown", "direct", "hub", "relay"};
+            snprintf(out->ice_path, sizeof(out->ice_path), "%s",
+                     s->transport.external_failed ? "failed" : paths[s->transport.external.path]);
+        }
+        else snprintf(out->ice_path, sizeof(out->ice_path), "lan");
     }
 }
 

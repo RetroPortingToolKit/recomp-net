@@ -339,6 +339,8 @@ int rnet_local_poll(RNetLocalDriver *d) {
         int status;
         RNetSessionStats stats;
         rnet_session_pump(d->cfg.session);
+        if (rnet_session_transport_failed(d->cfg.session))
+            return refuse(d, "packet transport failed");
         rnet_session_get_stats(d->cfg.session, &stats);
         if (stats.peer_gone) return refuse(d, "peer left the match");
         status = rnet_session_profiles_status(d->cfg.session, NULL, NULL);

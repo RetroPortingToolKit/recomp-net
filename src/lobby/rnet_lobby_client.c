@@ -1499,12 +1499,17 @@ static void host_ice_step(void)
     }
     v.peers = peers;
     v.peer_count = n;
-    /* STUN only. The lobby's Coturn mint is deliberately not used: hub agents
-     * never use TURN. */
+    /* The existing Coturn mint configures both waiting-room and game paths. */
     tc = rnet_lobby_turn_credentials();
     if (tc && tc->valid && tc->stun_host[0]) {
         v.stun_host = tc->stun_host;
         v.stun_port = (unsigned short)(tc->stun_port > 0 ? tc->stun_port : 3478);
+    }
+    if (tc && tc->valid && tc->turn_host[0] && tc->username[0] && tc->password[0]) {
+        v.turn_host = tc->turn_host;
+        v.turn_port = (unsigned short)(tc->turn_port > 0 ? tc->turn_port : 3478);
+        v.turn_user = tc->username;
+        v.turn_pass = tc->password;
     }
     v.send_signal = host_ice_send_signal;
     v.send_json = host_relay_send;

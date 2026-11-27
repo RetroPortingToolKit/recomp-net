@@ -7,6 +7,7 @@
 #include "recomp_net/rollback.h"
 #include "recomp_net/types.h"
 #include "recomp_net/telemetry.h"
+#include "recomp_net/transport.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +43,14 @@ int rnet_session_start_lan(RNetSession *s, const char *bind_hostport, const char
  * server input relay is not enabled.
  */
 int rnet_session_start_lan_hub(RNetSession *s, const char *bind_hostport);
+
+/* Attach an already-proven external path before transport start. Copies the
+ * callbacks, not their context. Startup/build/profile checks remain mandatory.
+ * No network socket or ICE agent is created or taken by this call. */
+int rnet_session_start_external(RNetSession *s, const RNetPacketTransport *transport);
+/* Latched on an external path's disconnect, overflow or invalid callback result.
+ * A failed session cannot admit more frames; create a new one for a rematch. */
+int rnet_session_transport_failed(const RNetSession *s);
 
 /*
  * Start ICE-backed session (requires RNET_ENABLE_ICE). After create, host must

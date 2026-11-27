@@ -361,6 +361,11 @@ if(RNET_BUILD_TESTS)
   target_include_directories(ring_admit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME ring_admit_test COMMAND ring_admit_test)
 
+  add_executable(external_transport_test tests/external_transport_test.c)
+  target_link_libraries(external_transport_test PRIVATE recomp_net)
+  target_include_directories(external_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME external_transport_test COMMAND external_transport_test)
+
   add_executable(wire_map_test tests/wire_map_test.c)
   target_link_libraries(wire_map_test PRIVATE recomp_net)
   add_test(NAME wire_map_test COMMAND wire_map_test)
