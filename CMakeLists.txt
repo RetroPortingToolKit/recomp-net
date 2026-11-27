@@ -54,6 +54,7 @@ set(RNET_CORE_SOURCES
   src/lobby/rnet_ice_xfer.c
   src/transport/rnet_netsim.c
   src/transport/rnet_transport.c
+  src/transport/rnet_packet_pipe.c
   src/session/rnet_session.c
   src/chat/rnet_chat_filter.c
   src/chat/rnet_chat_report.c
@@ -365,6 +366,10 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(external_transport_test PRIVATE recomp_net)
   target_include_directories(external_transport_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   add_test(NAME external_transport_test COMMAND external_transport_test)
+  add_executable(packet_pipe_test tests/packet_pipe_test.c)
+  target_link_libraries(packet_pipe_test PRIVATE recomp_net)
+  target_include_directories(packet_pipe_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME packet_pipe_test COMMAND packet_pipe_test)
 
   add_executable(wire_map_test tests/wire_map_test.c)
   target_link_libraries(wire_map_test PRIVATE recomp_net)

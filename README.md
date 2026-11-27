@@ -14,6 +14,8 @@ confirmed-state checks and match telemetry. It is not merge-qualified. See
 [Echoes integration assessment](docs/echoes-integration.md).
 The [consumer feasibility review](docs/host-feasibility.md) covers the other
 engines, shared snapshots, UI and distributed GBA linking.
+The optional [private Windows packet pipe](docs/packet-pipe.md) supports a
+launcher retaining ICE while a child process owns its simulation session.
 
 ## Features (v0.1)
 
