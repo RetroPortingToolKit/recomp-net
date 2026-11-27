@@ -10,7 +10,8 @@ typedef struct RNetTelemetry RNetTelemetry;
 typedef enum RNetSyncMode { RNET_SYNC_EPISODE_V3 = 0, RNET_SYNC_LOCAL_V4 = 1 } RNetSyncMode;
 typedef enum RNetTickStall {
     RNET_TICK_READY, RNET_TICK_STARTUP, RNET_TICK_INPUT,
-    RNET_TICK_PREDICTION_LIMIT, RNET_TICK_EPISODE, RNET_TICK_REFUSED
+    RNET_TICK_PREDICTION_LIMIT, RNET_TICK_EPISODE, RNET_TICK_REFUSED,
+    RNET_TICK_VERIFICATION
 } RNetTickStall;
 typedef struct RNetTickTelemetry {
     rnet_u64 sequence, at_us, stall_us, snapshot_us, digest_us, replay_us;

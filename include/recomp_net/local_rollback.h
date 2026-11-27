@@ -86,7 +86,8 @@ int rnet_local_finish(RNetLocalDriver *);
 rnet_u32 rnet_local_tick(const RNetLocalDriver *);
 /* Number of leading ticks with all inputs real and corrected (exclusive). */
 rnet_u32 rnet_local_confirmed(const RNetLocalDriver *);
-/* Exclusive verified prefix; network verification never gates a live tick. */
+/* Exclusive verified prefix. Verification runs in the background; admission
+ * waits only when an occupied peer still needs bounded retained history. */
 rnet_u32 rnet_local_verified(const RNetLocalDriver *);
 /* Stop before T while continuing reconciliation and hash exchange. */
 int rnet_local_set_hold(RNetLocalDriver *, rnet_u32 tick);

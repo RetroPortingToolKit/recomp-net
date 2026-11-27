@@ -332,6 +332,10 @@ if(RNET_BUILD_TESTS)
   add_test(NAME local_session_test COMMAND local_session_test)
   set_tests_properties(local_session_test PROPERTIES ENVIRONMENT
     "RNET_SIM_LATENCY_MS=40;RNET_SIM_JITTER_MS=12;RNET_SIM_LOSS_PCT=2;RNET_SIM_DUPLICATE_PCT=3")
+  add_executable(local_history_repair_test tests/local_history_repair_test.c)
+  target_link_libraries(local_history_repair_test PRIVATE recomp_net)
+  target_include_directories(local_history_repair_test PRIVATE src)
+  add_test(NAME local_history_repair_test COMMAND local_history_repair_test)
 
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)

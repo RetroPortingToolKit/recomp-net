@@ -29,6 +29,7 @@ struct RNetLocalDriver {
     int hold;
     rnet_u32 hold_at;
     const char *refusal;
+    rnet_u32 peer_verified[RNET_MAX_SLOTS];
 };
 static rnet_u64 clock_us(RNetLocalDriver *d) {
     return d->host.now_us ? d->host.now_us(d->host.ctx) : rnet_os_monotonic_ms() * 1000u;
@@ -269,9 +270,19 @@ static int hashes(RNetLocalDriver *d) {
         rnet_hc_note_peer_from(&d->hashes, rnet_session_rb_last_take_from(s), t, digest);
     }
     while (rnet_session_take_rb_sync(s, &epoch, &mismatch, &load, &target, &initiator, &op, &flags)) {
-        if (op == RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST &&
-            rnet_hc_local_digest(&d->hashes, mismatch, &digest))
-            rnet_session_send_rb_frame_commit(s, mismatch, digest);
+        if (op == RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST) {
+            int from=rnet_session_rb_last_take_from(s);
+            /* In local mode the requested first missing digest also credits
+             * every earlier digest. Only an occupied, negotiated peer may
+             * release retained history, never a claimed future prefix. */
+            if(from<0 || from>=(int)d->cfg.seats || !(d->peers&(1u<<from)))
+                return refuse(d,"invalid verification credit peer");
+            if(epoch || load || target || initiator || flags || mismatch>d->confirmed)
+                return refuse(d,"invalid verification credit");
+            if(mismatch>d->peer_verified[from])d->peer_verified[from]=mismatch;
+            if(rnet_hc_local_digest(&d->hashes,mismatch,&digest))
+                rnet_session_send_rb_frame_commit(s,mismatch,digest);
+        }
     }
     if (rnet_hc_peek_mismatch(&d->hashes, &t, NULL, NULL))
         return refuse(d, "confirmed state desync");
@@ -281,9 +292,10 @@ static int hashes(RNetLocalDriver *d) {
     now = clock_us(d);
     if (now - d->last_hash_request >= 100000u) {
         t = d->hashes.resolved_valid ? rnet_hc_resolved_through(&d->hashes) + 1u : 0u;
-        if (t < d->confirmed)
-            rnet_session_send_rb_sync(s, 0u, t, 0u, 0u, 0u,
-                                      RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST, 0u);
+        /* Send even when caught up: a peer needs our credit before it may
+         * overwrite a digest whose previous transmission could be lost. */
+        rnet_session_send_rb_sync(s,0u,t,0u,0u,0u,
+                                  RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST,0u);
         d->last_hash_request = now;
     }
     return 1;
@@ -383,6 +395,22 @@ int rnet_local_poll(RNetLocalDriver *d) {
         return 0;
     }
     control_update(d);
+    if(d->cfg.session) {
+        rnet_u32 oldest=rnet_local_verified(d);int seat;
+        for(seat=0;seat<(int)d->cfg.seats;++seat)
+            if((d->peers&(1u<<seat)) && d->peer_verified[seat]<oldest)
+                oldest=d->peer_verified[seat];
+        /* Preserve one slot before the local hash ring's hard exhaustion
+         * guard, including a slow peer's still-unacknowledged digests. The
+         * normal poll continues repair/credits while admission is held. */
+        const rnet_u32 window=RNET_HC_RING<RNET_LOCAL_HISTORY?RNET_HC_RING:RNET_LOCAL_HISTORY;
+        rnet_u32 limit=window-1u;
+        rnet_u32 input_limit=RNET_HISTORY_LENGTH-rnet_session_committed_delay(d->cfg.session);
+        if(input_limit<limit)limit=input_limit;
+        if(d->tick-oldest>=limit) {
+            d->work.stall_reason=RNET_TICK_VERIFICATION;return 0;
+        }
+    }
     if (!d->prepared_valid || d->prepared != d->tick) {
         int ok = d->cfg.session ? rnet_session_prepare_local_tip(d->cfg.session, d->tick)
             : d->host.sample(d->host.ctx, d->tick, d->cfg.delay);

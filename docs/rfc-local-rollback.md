@@ -31,8 +31,13 @@ The A/B baseline includes these correctness fixes.
 - Only confirmed post-tick digests enter the background hash chain. Missing
   commits are requested again. Confirmed mismatches stop the local driver
   with a stable refusal; replay and snapshot failures also stop explicitly.
-  Verification does not stall live admission. Exhausting retained verification
-  history is an explicit failure, never a silently healed gap.
+  Verification normally runs behind live admission. Each occupied peer's
+  periodic first-missing-digest request also credits the preceding verified
+  prefix. Before bounded input or digest history could be overwritten, live
+  admission waits while receive, repair and credit exchange continue. A lost
+  digest can then recover without discarding hash verification. Impossible
+  future credits and confirmed mismatches refuse the match. This meaning is
+  local-mode-only; the retained episode driver is unchanged.
 - Inline and incremental replay use identical publish/finish semantics. Replay
   suppresses repeated audio and presentation through host callbacks.
 

@@ -748,7 +748,7 @@ static void store_remote_frame(RNetSession *s, rnet_u8 slot, const RNetWireFrame
     }
     sample.valid = 1;
     rnet_ring_store(&s->remote_rings[slot], &sample);
-    if (s->cfg.slot_count > 2)
+    if (s->cfg.slot_count > 2 || s->local_inputs)
     {
         rnet_u32 next = s->remote_contiguous_ack[slot] + 1u;
         while (rnet_ring_get(&s->remote_rings[slot], next, &existing))
@@ -920,11 +920,14 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         {
             store_remote_frame(s, pkt->local_slot, &pkt->frames[i]);
         }
-        if (s->cfg.slot_count > 2 && pkt->local_slot < s->cfg.slot_count &&
-            pkt->ack_count == s->cfg.slot_count &&
+        if (pkt->local_slot < s->cfg.slot_count &&
+            ((s->cfg.slot_count > 2 && pkt->ack_count == s->cfg.slot_count) ||
+             (s->local_inputs && s->cfg.slot_count == 2)) &&
             rnet_config_slot_occupied(&s->cfg, pkt->local_slot))
         {
-            rnet_u32 ack = pkt->acks[s->cfg.local_slot];
+            /* Local two-peer play uses the existing scalar wire ACK, but
+             * credits a contiguous prefix, including after hard_resync. */
+            rnet_u32 ack = s->cfg.slot_count > 2 ? pkt->acks[s->cfg.local_slot] : pkt->ack_tick;
             if (!s->peer_ack_seen[pkt->local_slot] ||
                 (ack != 0xffffffffu &&
                  (s->peer_ack_tick[pkt->local_slot] == 0xffffffffu ||
@@ -2504,12 +2507,12 @@ static void send_input_bundle(RNetSession *s)
     /* Peer ACK of our tips: resend from ack+1 when they fell behind the
      * tip-redundancy window (WAN/TURN loss). Cap so one pump cannot emit
      * the whole 128-slot history. */
-    if (s->cfg.slot_count > 2)
+    if (s->cfg.slot_count > 2 || s->local_inputs)
     {
         rnet_u32 ack_lo = tip + 1u;
-        rnet_u32 max_back = (rnet_u32)RNET_HISTORY_LENGTH / 2u;
+        rnet_u32 max_back = s->local_inputs ? RNET_HISTORY_LENGTH : (rnet_u32)RNET_HISTORY_LENGTH / 2u;
         if (max_back < 32u) max_back = 32u;
-        if (max_back > 64u) max_back = 64u;
+        if (!s->local_inputs && max_back > 64u) max_back = 64u;
         for (slot = 0; slot < s->cfg.slot_count; ++slot)
         {
             rnet_u32 peer_lo;
@@ -2545,6 +2548,8 @@ static void send_input_bundle(RNetSession *s)
         &s->remote_rings[s->is_observer
                              ? 0
                              : ((s->cfg.local_slot + 1) % s->cfg.slot_count)]);
+    if (s->local_inputs)
+        ack = s->remote_contiguous_ack[(s->cfg.local_slot + 1) % s->cfg.slot_count];
     for (slot = 0; slot < s->cfg.slot_count; ++slot)
         ack_vector[slot] = s->remote_contiguous_ack[slot];
     t = lo;
