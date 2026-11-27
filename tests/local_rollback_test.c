@@ -10,7 +10,9 @@ typedef struct Fixture {
     RNetInputSample truth[2][TICKS], published[2];
     RNetLocalDriver *driver;
     rnet_u64 clock_offset;
+    rnet_u64 idle_offset;
     rnet_u32 simulate_cost, simulate_load_cost, transport_rtt;
+    rnet_u32 snapshot_cost, digest_cost, pacing_cost;
     int network_ready;
     int unread;
 } Fixture;
@@ -25,11 +27,13 @@ static rnet_u32 step(rnet_u32 state, rnet_u32 tick, const RNetInputSample *rows,
     return (state ^ tick) * 16777619u;
 }
 static rnet_u64 now(void *ctx) {
-    Fixture *f = ctx; return f->wall * 16667ull + f->clock_offset + 1u;
+    Fixture *f = ctx; return f->wall * 16667ull + f->clock_offset + f->idle_offset + 1u;
 }
+static rnet_u64 work_now(void *ctx) {return ((Fixture*)ctx)->clock_offset+1u;}
 static int save(void *ctx, rnet_u32 t) {
     Fixture *f = ctx; unsigned i = t % RNET_LOCAL_HISTORY;
     f->snapshots[i].tick = t; f->snapshots[i].state = f->state; f->snapshots[i].valid = 1;
+    f->clock_offset += f->snapshot_cost;
     return 1;
 }
 static int load(void *ctx, rnet_u32 t) {
@@ -54,11 +58,11 @@ static void publish(void *ctx, rnet_u32 t, const RNetInputSample *rows, int seat
 static int run(void *ctx, rnet_u32 t) {
     Fixture *f = ctx; CHECK(t == f->row_tick);
     f->state = step(f->state, t, f->published, f->unread);
-    f->clock_offset += f->simulate_cost; return 1;
+    f->clock_offset += f->simulate_cost; f->idle_offset += f->pacing_cost; return 1;
 }
 static void begin(void *ctx) { ++((Fixture *)ctx)->begins; }
 static void end(void *ctx) { ++((Fixture *)ctx)->ends; }
-static rnet_u32 digest(void *ctx) { return ((Fixture *)ctx)->state; }
+static rnet_u32 digest(void *ctx) { Fixture* f=ctx;f->clock_offset+=f->digest_cost;return f->state; }
 static rnet_u32 consumed(void *ctx, rnet_u32 t) { (void)t; return ((Fixture *)ctx)->consumed; }
 static int input(void *ctx, int seat, rnet_u32 t, RNetInputSample *row) {
     Fixture *f = ctx;
@@ -73,6 +77,38 @@ static int network(void *ctx, RNetPeerTelemetry *peer) {
     Fixture *f = ctx; memset(peer, 0, sizeof(*peer));
     peer->rtt_us = f->transport_rtt; peer->received = 1;
     return f->network_ready;
+}
+static void work_clock_scenario(void) {
+    Fixture *f=calloc(1,sizeof(*f));RNetLocalConfig cfg={0};RNetLocalHost host={0};
+    RNetLocalControlConfig control={0};RNetLocalControlState state;RNetTickTelemetry records[16];
+    unsigned t,seat,count; rnet_u64 stalled=0;
+    CHECK(f);if(!f)return;
+    f->state=2166136261u;f->simulate_cost=8000;f->snapshot_cost=200;f->digest_cost=300;f->pacing_cost=50000;
+    for(t=0;t<16;++t)for(seat=0;seat<2;++seat){f->truth[seat][t].size=32;f->truth[seat][t].valid=1;}
+    f->release[2]=10; // A genuine input wait remains visible on the wall clock.
+    cfg.seats=2;cfg.row_size=32;cfg.delay=1;cfg.rollback_depth=8;cfg.tick_us=16667;
+    host.ctx=f;host.save=save;host.load=load;host.drop_after=drop;host.publish=publish;
+    host.resim_begin=begin;host.resim_end=end;host.digest=digest;host.now_us=now;host.work_us=work_now;
+    host.neutral=neutral;host.input=input;host.sample=sample;
+    f->driver=rnet_local_create(&cfg,&host);CHECK(f->driver);
+    if(!f->driver){free(f);return;}
+    control.frame_budget_us=16667;control.live_tick_us=8500;control.replay_tick_us=8500;
+    control.replay_setup_us=3000;control.network_valid=1;
+    CHECK(rnet_local_control_begin(f->driver,&control));CHECK(rnet_local_set_hold(f->driver,16));
+    for(f->wall=0;f->wall<32;++f->wall) {
+        int admission=rnet_local_poll(f->driver);
+        if(admission){run(f,f->row_tick);CHECK(rnet_local_finish(f->driver));}
+        if(rnet_local_refusal(f->driver))break;
+    }
+    CHECK(!rnet_local_refusal(f->driver));CHECK(rnet_local_tick(f->driver)==16);
+    CHECK(rnet_local_control_state(f->driver,&state));
+    CHECK(state.live_tick_us==8500); // Includes 200 save + 300 digest, excludes 50ms pacing.
+    CHECK(f->idle_offset==800000u && state.rollback_depth==0);
+    count=(unsigned)rnet_telemetry_read(rnet_local_telemetry(f->driver),0,records,16);
+    CHECK(count==16);
+    for(t=0;t<count;++t){stalled+=records[t].stall_us;CHECK(records[t].snapshot_us==200 && records[t].digest_us==300);}
+    CHECK(stalled>0);CHECK(records[15].at_us>f->idle_offset);
+    rnet_local_destroy(f->driver);free(f);
 }
 static void controller_scenario(void) {
     Fixture *f = calloc(1, sizeof(*f));
@@ -209,6 +245,7 @@ int main(void) {
     rnet_u32 depth;
     scenario(0, 0, 0); scenario(1, 0, 0); scenario(1, 1, 0); scenario(1, 0, 1);
     controller_scenario();
+    work_clock_scenario();
     CHECK(rnet_local_budget_delay(100000, 10000, 1000, 8000, 16667, 12, &depth) == 1 && depth == 8);
     CHECK(rnet_local_budget_delay(100000, 10000, 8000, 15000, 16667, 12, &depth) == 7 && depth == 0);
     return failures ? 1 : 0;

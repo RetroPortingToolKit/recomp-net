@@ -19,7 +19,7 @@ struct RNetLocalDriver {
     RNetTickTelemetry work;
     rnet_u32 tick, confirmed, emitted, replay_next, replay_end, pending, prepared;
     rnet_u32 occupied, peers;
-    rnet_u64 poll_at, run_at, last_hash_request;
+    rnet_u64 poll_at, run_at, run_work_at, last_hash_request;
     rnet_u64 tick_snapshot_us, replay_setup_us;
     RNetLocalControlConfig control_cfg;
     RNetLocalControlState control;
@@ -32,6 +32,9 @@ struct RNetLocalDriver {
 };
 static rnet_u64 clock_us(RNetLocalDriver *d) {
     return d->host.now_us ? d->host.now_us(d->host.ctx) : rnet_os_monotonic_ms() * 1000u;
+}
+static rnet_u64 work_clock_us(RNetLocalDriver *d) {
+    return d->host.work_us ? d->host.work_us(d->host.ctx) : clock_us(d);
 }
 static rnet_u32 measured_cost(rnet_u32 previous, rnet_u64 sample) {
     if (!sample) return previous; /* coarse clocks do not prove zero cost */
@@ -153,9 +156,9 @@ static int input(RNetLocalDriver *d, int seat, rnet_u32 tick, RNetInputSample *o
     return 1;
 }
 static int save(RNetLocalDriver *d, rnet_u32 tick) {
-    rnet_u64 begin = clock_us(d);
+    rnet_u64 begin = work_clock_us(d);
     int ok = d->host.save(d->host.ctx, tick);
-    d->work.snapshot_us += clock_us(d) - begin;
+    d->work.snapshot_us += work_clock_us(d) - begin;
     return ok ? 1 : refuse(d, "snapshot save failed");
 }
 static int make_tick(RNetLocalDriver *d, rnet_u32 tick, int replay) {
@@ -199,6 +202,7 @@ static int make_tick(RNetLocalDriver *d, rnet_u32 tick, int replay) {
     d->host.publish(d->host.ctx, tick, h->rows, (int)d->cfg.seats, replay);
     if (!replay) d->work.guessed_seats = h->predicted;
     d->run_at = clock_us(d);
+    d->run_work_at = work_clock_us(d);
     d->pending = replay ? 2u : 1u;
     d->poll_at = 0;
     return (int)d->pending;
@@ -231,15 +235,15 @@ static int reconcile(RNetLocalDriver *d) {
         if (prefix) next = t + 1u;
     }
     if (have_wrong) {
-        rnet_u64 begin = clock_us(d);
+        rnet_u64 begin = work_clock_us(d);
         /* Retain the unresolved anchor even when a later mismatch arrives first. */
         if (!d->host.load(d->host.ctx, old)) return refuse(d, "confirmed snapshot unavailable");
-        d->work.snapshot_us += clock_us(d) - begin;
+        d->work.snapshot_us += work_clock_us(d) - begin;
         d->host.drop_after(d->host.ctx, old);
         d->replay_next = old; d->replay_end = d->tick;
         d->work.episode_depth = d->tick - wrong;
         d->replaying = 1; d->host.resim_begin(d->host.ctx);
-        d->replay_setup_us = clock_us(d) - begin;
+        d->replay_setup_us = work_clock_us(d) - begin;
         return 1;
     }
     d->confirmed = next;
@@ -403,30 +407,30 @@ int rnet_local_poll(RNetLocalDriver *d) {
     return make_tick(d, d->tick, 0);
 }
 int rnet_local_finish(RNetLocalDriver *d) {
-    LocalTick *h; rnet_u64 now, begin; int replay;
+    LocalTick *h; rnet_u64 now, work_now, begin; int replay;
     if (!d || !d->pending || d->refusal) return 0;
     replay = d->pending == 2u;
     h = history(d, replay ? d->replay_next : d->tick);
     if (!h) return refuse(d, "completed tick history unavailable");
-    now = clock_us(d); begin = now;
+    now = clock_us(d); work_now = work_clock_us(d); begin = work_now;
     h->consumed = d->host.consumed_seats ? d->host.consumed_seats(d->host.ctx, h->tick) : d->occupied;
     h->digest = d->host.digest(d->host.ctx); h->complete = 1;
-    d->work.digest_us += clock_us(d) - begin;
+    d->work.digest_us += work_clock_us(d) - begin;
     if (d->control_enabled) {
-        rnet_u64 cost = now - d->run_at + d->tick_snapshot_us + clock_us(d) - begin;
+        rnet_u64 cost = work_now - d->run_work_at + d->tick_snapshot_us + work_clock_us(d) - begin;
         if (replay) d->control.replay_tick_us = measured_cost(d->control.replay_tick_us, cost);
         else d->control.live_tick_us = measured_cost(d->control.live_tick_us, cost);
     }
     d->pending = 0;
     if (replay) {
-        ++d->work.replay_ticks; d->work.replay_us += now - d->run_at;
+        ++d->work.replay_ticks; d->work.replay_us += work_now - d->run_work_at;
         ++d->replay_next;
         if (d->replay_next == d->replay_end) {
-            rnet_u64 end_begin = clock_us(d);
+            rnet_u64 end_begin = work_clock_us(d);
             d->host.resim_end(d->host.ctx); d->replaying = 0;
             if (d->control_enabled)
                 d->control.replay_setup_us = measured_cost(d->control.replay_setup_us,
-                    d->replay_setup_us + clock_us(d) - end_begin);
+                    d->replay_setup_us + work_clock_us(d) - end_begin);
         }
     } else {
         d->work.tick = d->tick; d->work.at_us = now; d->work.delay = d->cfg.delay;

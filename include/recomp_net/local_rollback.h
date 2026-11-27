@@ -40,6 +40,11 @@ typedef struct RNetLocalHost {
     /* Host-owned transports: worst occupied peer's measured path. Return 0
      * until every peer has a measurement. Session-backed hosts may leave NULL. */
     int (*network)(void *, RNetPeerTelemetry *worst);
+    /* Optional monotonic work clock, in microseconds. Exclude only deliberate
+     * host pacing; retain snapshot/digest/restore, GPU/I/O waits and execution.
+     * now_us remains the wall clock for stalls, latency and transport timers.
+     * NULL uses now_us. Never rewind this clock with simulation state. */
+    rnet_u64 (*work_us)(void *);
 } RNetLocalHost;
 typedef struct RNetLocalControlConfig {
     rnet_u32 frame_budget_us;
