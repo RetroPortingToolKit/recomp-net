@@ -366,6 +366,24 @@ int main(void)
     expect_true(rnet_rb_get_phase(s) == nRNetRbPhaseLive, "starts live");
     expect_true(!rnet_rb_is_active(s), "live not active");
 
+    {
+        RNetRbFrame guessed = {0}, real;
+        guessed.tick = 12; guessed.is_valid = 1; guessed.is_predicted = 1;
+        guessed.rx = guessed.ry = 128;
+        real = guessed; real.is_predicted = 0;
+        expect_true(!rnet_input_contract_decision_is_rewind(
+            rnet_rb_decide_row_replace(s, &guessed, &real, 1)), "whole pad equal promotes");
+        real.rx++;
+        expect_true(rnet_input_contract_decision_is_rewind(
+            rnet_rb_decide_row_replace(s, &guessed, &real, 1)), "right X alone rewinds");
+        real = guessed; real.ry++;
+        expect_true(rnet_input_contract_decision_is_rewind(
+            rnet_rb_decide_row_replace(s, &guessed, &real, 1)), "right Y alone rewinds");
+        real = guessed; real.analog++;
+        expect_true(rnet_input_contract_decision_is_rewind(
+            rnet_rb_decide_row_replace(s, &guessed, &real, 1)), "controller mode alone rewinds");
+    }
+
     /* Begin episode */
     memset(&corr, 0, sizeof(corr));
     corr.epoch_id = 7u;

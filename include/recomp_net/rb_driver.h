@@ -67,6 +67,7 @@
 #include "recomp_net/input.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/session.h"
+#include "recomp_net/telemetry.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -233,6 +234,9 @@ typedef struct RNetRbDriver RNetRbDriver;
 
 RNetRbDriver *rnet_rb_driver_create(void);
 void rnet_rb_driver_destroy(RNetRbDriver *d);
+/* Retained until destroy or next start, including after shutdown. */
+const RNetTelemetry *rnet_rb_driver_telemetry(const RNetRbDriver *d);
+size_t rnet_rb_driver_report(const RNetRbDriver *, char *out, size_t capacity);
 
 /* Identity and mod set are properties of the PROCESS, not of a match: they
  * survive start()'s cold reset. Set them before start(). Fingerprints are
@@ -370,7 +374,8 @@ const char *rnet_rb_driver_stall_tag(const RNetRbDriver *d);
  * peers did not start from the same state), "boot_digest_timeout" (a peer's
  * starting-state digest was not received in time), "mod_set_mismatch" (the peers'
  * content fingerprints differ), "mod_set_not_agreed" (the host's set could not
- * be confirmed or honoured). Stable codes, suitable for a launcher's
+ * be confirmed or honoured), "confirmed_state_desync" (a two-seat confirmed
+ * chain fork persisted after outstanding corrections and settle). Stable codes, suitable for a launcher's
  * last_error. Latched until the next start. */
 const char *rnet_rb_driver_refusal(const RNetRbDriver *d);
 /* Last digest fork: tick + partition name, and both peers' master digests. */

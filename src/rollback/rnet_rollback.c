@@ -10,9 +10,21 @@
  */
 
 #include "recomp_net/rollback.h"
+#include "recomp_net/input_hist.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+RNetInputContractDecision rnet_rb_decide_row_replace(RNetRbSession *s,
+    const RNetRbFrame *published, const RNetRbFrame *wire, uint8_t completed)
+{
+    RNetInputContractFrame a, b;
+    if (!published || !wire || published->rx != wire->rx || published->ry != wire->ry ||
+        published->analog != wire->analog) return nRNetInputContractRewind;
+    rnet_ih_frame_to_contract(published, &a);
+    rnet_ih_frame_to_contract(wire, &b);
+    return rnet_rb_decide_stick_replace(s, &a, &b, completed);
+}
 
 #define RNET_RB_EVENT_QUEUE_MAX 8u
 

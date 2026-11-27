@@ -2,7 +2,17 @@
  * the info, the acceptance test, and that a driver can be created. */
 #include "recomp_net/module.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#define module_open(path) ((void *)LoadLibraryA(path))
+#define module_symbol(handle, name) GetProcAddress((HMODULE)(handle), (name))
+#define module_error() "LoadLibrary failed"
+#else
 #include <dlfcn.h>
+#define module_open(path) dlopen((path), RTLD_NOW | RTLD_LOCAL)
+#define module_symbol(handle, name) dlsym((handle), (name))
+#define module_error() dlerror()
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -10,23 +20,32 @@
 
 int main(int argc, char **argv) {
     CHECK(argc >= 2);
-    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    if (!h) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
-    size_t (*info)(RNetModuleInfo *, size_t) = (size_t (*)(RNetModuleInfo *, size_t))dlsym(h, "rnet_module_info");
+    void *h = module_open(argv[1]);
+    if (!h) { fprintf(stderr, "module load: %s\n", module_error()); return 1; }
+    size_t (*info)(RNetModuleInfo *, size_t) = (size_t (*)(RNetModuleInfo *, size_t))module_symbol(h, "rnet_module_info");
     CHECK(info);
     RNetModuleInfo m;
     size_t n = info(&m, sizeof m);
     CHECK(n == sizeof m && m.struct_size == sizeof m);
     CHECK(rnet_module_check(&m, n, RNET_MODULE_FEATURE_RBENGINE) == 0);
-    CHECK(m.wire_version >= 2); /* RNET_WIRE_VERSION, rnet_protocol.h */
+    CHECK(m.wire_version == 4 && m.abi_minor >= 2);
     RNetModuleInfo bad = m; bad.abi_version += 1;
     CHECK(rnet_module_check(&bad, n, 0) != 0);
-    CHECK(dlsym(h, "rnet_rb_driver_create"));
-    CHECK(dlsym(h, "rnet_session_create"));
-    CHECK(dlsym(h, "rbe_snap_ring_create"));
-    CHECK(!dlsym(h, "rnet_proto_internal_not_exported_xyz"));
-    void *(*mk)(void) = (void *(*)(void))dlsym(h, "rnet_rb_driver_create");
-    void (*rm)(void *) = (void (*)(void *))dlsym(h, "rnet_rb_driver_destroy");
+    CHECK(module_symbol(h, "rnet_rb_driver_create"));
+    CHECK(module_symbol(h, "rnet_local_create"));
+    CHECK(module_symbol(h, "rnet_experiment_profiles_begin"));
+    CHECK(module_symbol(h, "rnet_telemetry_report"));
+    CHECK(module_symbol(h, "rnet_local_report"));
+    CHECK(module_symbol(h, "rnet_local_control_preview"));
+    CHECK(module_symbol(h, "rnet_local_control_begin"));
+    CHECK(module_symbol(h, "rnet_local_control_state"));
+    CHECK(module_symbol(h, "rnet_rb_driver_report"));
+    CHECK(module_symbol(h, "rnet_session_get_peer_telemetry"));
+    CHECK(module_symbol(h, "rnet_session_create"));
+    CHECK(module_symbol(h, "rbe_snap_ring_create"));
+    CHECK(!module_symbol(h, "rnet_proto_internal_not_exported_xyz"));
+    void *(*mk)(void) = (void *(*)(void))module_symbol(h, "rnet_rb_driver_create");
+    void (*rm)(void *) = (void (*)(void *))module_symbol(h, "rnet_rb_driver_destroy");
     void *d = mk();
     CHECK(d);
     rm(d);

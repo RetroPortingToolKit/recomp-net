@@ -6,6 +6,8 @@
 #include "recomp_net/input.h"
 #include "recomp_net/rollback.h"
 #include "recomp_net/types.h"
+#include "recomp_net/telemetry.h"
+#include "recomp_net/transport.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +43,14 @@ int rnet_session_start_lan(RNetSession *s, const char *bind_hostport, const char
  * server input relay is not enabled.
  */
 int rnet_session_start_lan_hub(RNetSession *s, const char *bind_hostport);
+
+/* Attach an already-proven external path before transport start. Copies the
+ * callbacks, not their context. Startup/build/profile checks remain mandatory.
+ * No network socket or ICE agent is created or taken by this call. */
+int rnet_session_start_external(RNetSession *s, const RNetPacketTransport *transport);
+/* Latched on an external path's disconnect, overflow or invalid callback result.
+ * A failed session cannot admit more frames; create a new one for a rematch. */
+int rnet_session_transport_failed(const RNetSession *s);
 
 /*
  * Start ICE-backed session (requires RNET_ENABLE_ICE). After create, host must
@@ -239,6 +249,18 @@ typedef struct RNetSessionStats
 } RNetSessionStats;
 
 void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
+
+/* Experimental local input policy. Enable BEFORE transport/profile setup.
+ * HELLO/DELAY_SYNC cannot change this peer's D. Published rows stay immutable;
+ * decreases drain the existing pipeline. */
+int rnet_session_enable_local_inputs(RNetSession *s);
+int rnet_session_local_inputs_enabled(const RNetSession *s);
+int rnet_session_set_local_delay(RNetSession *s, rnet_u8 delay);
+typedef void (*RNetCanonicalizeFn)(void *ctx, RNetInputSample *sample);
+/* Runs once before publication, never on receipt. */
+int rnet_session_set_input_transform(RNetSession *, RNetCanonicalizeFn, void *ctx);
+int rnet_session_input_age_us(const RNetSession *, rnet_u32 tick, rnet_u64 *age);
+int rnet_session_get_peer_telemetry(const RNetSession *, int seat, RNetPeerTelemetry *out);
 
 /* Savestate / SRAM transfer ops for rnet_session_state_begin / probe. */
 #define RNET_STATE_OP_SAVE 0 /* peer stores file; admit stalls until probe/xfer done */
@@ -472,6 +494,9 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * session; never forwarded to the episode driver's RB_SYNC receive queue. */
 #define RNET_RB_SYNC_OP_PROFILE_OFFER 7u
 #define RNET_RB_SYNC_OP_PROFILE_ACK 8u
+/* 9/10 carry the experiment's path echo. Identity is three immutable startup
+ * fragments, never an episode or a room-wide correction handshake. */
+#define RNET_RB_SYNC_OP_PROFILE_IDENTITY 11u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */

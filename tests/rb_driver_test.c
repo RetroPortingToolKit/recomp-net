@@ -106,6 +106,7 @@ typedef struct Child {
     uint32_t n_refusal_lines;   /* "RB match refused" */
     uint32_t n_deferred, n_at_tip, n_chain_stall;
     uint32_t n_missing_snap_refused;
+    int force_chain_fork;
     /* Epochs, for the per-pair ledger: opened here, followed, refused. */
 #define MAX_EPOCHS 512
     uint32_t ep_init[MAX_EPOCHS], ep_follow[MAX_EPOCHS], ep_refused[MAX_EPOCHS];
@@ -144,6 +145,7 @@ static void toy_step(void)
     uint32_t acc = fold(g_c.state.acc, tick);
     for (i = 0; i < g_c.pub_slots; ++i)
         acc = fold(acc, (uint32_t)g_c.pub[i].buttons | ((uint32_t)i << 16));
+    if (g_c.force_chain_fork && tick == 60u) acc ^= 0xa5a5a5a5u;
     g_c.state.acc = acc;
     g_c.state.tick = tick + 1u;
     if (tick < TOY_TICKS)
@@ -513,9 +515,9 @@ typedef struct Scenario {
     /* A small real-host ring and a longer run expose a late row before an
      * already-open correction's load. Zero keeps the short fixture defaults. */
     unsigned snap_capacity;
-    uint32_t run_timeout_ms;
     /* Grade the settled frontier at the final hold in the prefix-loss case. */
     int settle_final;
+    int force_chain_fork;
 } Scenario;
 
 static int write_all(int fd, const void *buf, size_t n)
@@ -586,6 +588,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
     g_c.slot = slot;
     g_c.snap_capacity = sc->snap_capacity;
     g_c.mode = slot == 0 ? sc->mode_a : sc->mode_b;
+    g_c.force_chain_fork = slot == 0 && sc->force_chain_fork;
     if (slot >= slots)
         snprintf(logname, sizeof(logname), "rb_driver_test_%s_observer.log", sc->name);
     else if (slots == 2)
@@ -645,7 +648,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
         goto report;
 
     start_ms = mono_ms();
-    while (!rnet_session_is_running(s) && (uint32_t)(mono_ms() - start_ms) < 5000u) {
+    while (!rnet_session_is_running(s)) {
         rnet_session_pump(s);
         sleep_ms(1);
     }
@@ -700,7 +703,7 @@ static void run_child(const Scenario *sc, int slot, unsigned port_base,
         uint32_t lagged = 0;
         uint32_t refused_ms = 0;
         fcntl(stop_fd, F_SETFL, O_NONBLOCK);
-        while ((uint32_t)(mono_ms() - start_ms) < (sc->run_timeout_ms ? sc->run_timeout_ms : 40000u)) {
+        for (;;) {
             RNetRbAdmit a;
             RNetRbQuiesce q;
             rnet_session_pump(s);
@@ -1158,7 +1161,7 @@ int main(int argc, char **argv)
         { .name = "baseline-prefix", .mode_a = 1, .mode_b = 1,
           .latency_ms = "25", .jitter_ms = "10", .force_mispredict = 45,
           .ticks = 3300u, .initial_delay = 2, .inject_both = 1, .slow_ms = 2,
-          .snap_capacity = 40u, .run_timeout_ms = 120000u },
+          .snap_capacity = 40u },
         { "incremental-rtt200",  1, 1,       "100", "25",  45,    420u,  0 },
         /* The stop propagates: only the initiator is asked. */
         { "drain-one-side-rtt200", 0, 0,     "100", "25",  45,    420u,  1 },
@@ -1168,6 +1171,9 @@ int main(int argc, char **argv)
           1, 0, "boot_digest_mismatch" },
         { "refuse-mod-mismatch", 0, 1,       "30",  "8",   0,     420u,  0,
           0, 1, "mod_set_mismatch" },
+        { .name = "refuse-chain-fork", .mode_a = 0, .mode_b = 1,
+          .latency_ms = "30", .jitter_ms = "8", .ticks = 420u,
+          .refusal = "confirmed_state_desync", .force_chain_fork = 1 },
         /* The follower runs 3-4 ticks behind on a 0 ms link, so the
          * initiator's load tick is often one it has not simulated yet: it must
          * follow (deferred, or at its tip), never refuse -- and the chain must

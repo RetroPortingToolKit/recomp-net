@@ -15,9 +15,10 @@
  *   GUEST  one offerer agent whose peer is the host.
  *          Seat moves preserve both endpoints and update routing metadata.
  *
- * Roles are fixed: the host answers, guests offer. No TURN and no
- * force-relay -- a hub agent that cannot connect directly is a failure, and
- * the lobby server's relay carries the match instead.
+ * Roles are fixed: the host answers, guests offer. TURN is configured from
+ * the lobby's existing short-lived credentials. A
+ * guest that cannot connect directly retries through TURN; completed agents
+ * remain frozen. The lobby server has no gameplay UDP relay fallback.
  *
  * Signalling rides the lobby `signal` op addressed with to_player_id, in its
  * own type range so it cannot collide with the legacy game ICE (1-6), the
@@ -86,6 +87,13 @@ typedef struct RNetHostIceView {
     const char *stun_host;
     unsigned short stun_port;   /* 0 = 3478 */
     const char *bind_address;   /* NULL = any (test aid) */
+    /* Borrowed for this update; copied before agents use them. NULL/empty =
+     * no TURN service. Late credentials may rebuild only uncompleted agents. */
+    const char *turn_host;
+    unsigned short turn_port;
+    const char *turn_user;
+    const char *turn_pass;
+    int force_relay;
     /* Send one lobby `signal` addressed to to_player_id. 0 = sent / queued. */
     int (*send_signal)(const char *to_player_id, int type, int flag, const char *text, void *ctx);
     /* Send a complete lobby op as JSON (path_report). 0 = sent / queued. */
@@ -148,6 +156,20 @@ int rnet_host_ice_held_count(const RNetHostIce *h, const char *player_id);
  * destroy it with rnet_host_ice_destroy_agent. NULL when there is no such
  * peer or it is not COMPLETED -- never a half-connected agent. */
 RNetIceAgent *rnet_host_ice_take_completed(RNetHostIce *h, const char *player_id);
+/* Packet access for an owner retaining a completed agent across a child-game
+ * handoff. recv returns bytes, 0 when empty, -1 on failure. These never take
+ * ownership and must not run concurrently with another consumer of the agent. */
+int rnet_host_ice_agent_send(RNetIceAgent *, const rnet_u8 *, size_t);
+int rnet_host_ice_agent_recv(RNetIceAgent *, rnet_u8 *, size_t);
+int rnet_host_ice_agent_pump(RNetIceAgent *);
+/* Read the actual selected path and receive-queue loss counter after handoff.
+ * No credentials or endpoint addresses are exposed. Returns 0 for NULL. */
+typedef struct RNetHostIceAgentInfo {
+    int state;
+    char path[8]; /* host|srflx|prflx|relay|unknown */
+    rnet_u32 received_drops;
+} RNetHostIceAgentInfo;
+int rnet_host_ice_agent_info(const RNetIceAgent *,RNetHostIceAgentInfo *);
 /* 1 when the agent for player_id exists and is COMPLETED. */
 int rnet_host_ice_peer_completed(const RNetHostIce *h, const char *player_id);
 /* Release an agent the caller took and will not hand to a session. */

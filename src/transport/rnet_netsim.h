@@ -71,6 +71,8 @@ typedef struct RNetNetSim RNetNetSim;
 /* Returns NULL when RNET_SIM_LATENCY_MS is unset/0 — the caller then uses the
  * plain receive path and pays nothing. */
 RNetNetSim *rnet_netsim_create(void);
+/* Outbound queue uses RNET_SIM_SEND_* overrides; off unless configured. */
+RNetNetSim *rnet_netsim_create_send(void);
 void rnet_netsim_destroy(RNetNetSim *sim);
 
 /* Hold an arrived datagram until its delay elapses. `src` is remembered so
