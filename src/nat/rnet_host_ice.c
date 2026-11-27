@@ -130,6 +130,16 @@ int rnet_host_ice_agent_pump(RNetIceAgent *agent)
     rnet_ice_agent_poll(agent);
     return rnet_ice_agent_state(agent) == RNET_ICE_STATE_FAILED ? -1 : 0;
 }
+int rnet_host_ice_agent_info(const RNetIceAgent *agent,RNetHostIceAgentInfo *out)
+{
+    if(!out)return 0;
+    memset(out,0,sizeof(*out));
+    if(!agent)return 0;
+    out->state=(int)rnet_ice_agent_state(agent);
+    out->received_drops=rnet_ice_agent_recv_drops(agent);
+    rnet_ice_agent_selected_info(agent,out->path,sizeof(out->path),NULL,0,NULL,0);
+    return 1;
+}
 
 int rnet_host_ice_sig_is_ours(int wire_type)
 {

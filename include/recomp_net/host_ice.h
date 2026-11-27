@@ -162,6 +162,14 @@ RNetIceAgent *rnet_host_ice_take_completed(RNetHostIce *h, const char *player_id
 int rnet_host_ice_agent_send(RNetIceAgent *, const rnet_u8 *, size_t);
 int rnet_host_ice_agent_recv(RNetIceAgent *, rnet_u8 *, size_t);
 int rnet_host_ice_agent_pump(RNetIceAgent *);
+/* Read the actual selected path and receive-queue loss counter after handoff.
+ * No credentials or endpoint addresses are exposed. Returns 0 for NULL. */
+typedef struct RNetHostIceAgentInfo {
+    int state;
+    char path[8]; /* host|srflx|prflx|relay|unknown */
+    rnet_u32 received_drops;
+} RNetHostIceAgentInfo;
+int rnet_host_ice_agent_info(const RNetIceAgent *,RNetHostIceAgentInfo *);
 /* 1 when the agent for player_id exists and is COMPLETED. */
 int rnet_host_ice_peer_completed(const RNetHostIce *h, const char *player_id);
 /* Release an agent the caller took and will not hand to a session. */

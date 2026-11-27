@@ -435,6 +435,13 @@ static void scenario_4(void)
     g1 = rnet_host_ice_take_completed(g_n[1].h, g_n[0].pid);
     g2 = rnet_host_ice_take_completed(g_n[2].h, g_n[0].pid);
     check(a1 && a2 && g1 && g2, "4: four COMPLETED agents taken");
+    {
+        RNetHostIceAgentInfo info;
+        check(rnet_host_ice_agent_info(a1,&info) && info.state==RNET_ICE_STATE_COMPLETED &&
+              !strcmp(info.path,"host") && !info.received_drops,
+              "4: handoff exposes actual direct path and queue-loss counter");
+        check(!rnet_host_ice_agent_info(NULL,&info),"4: metadata refuses absent agent");
+    }
     check(rnet_host_ice_take_completed(g_n[0].h, g_n[1].pid) == NULL, "4: an agent is taken once");
 
     ss[0] = mk_session(0); ss[1] = mk_session(1); ss[2] = mk_session(2);

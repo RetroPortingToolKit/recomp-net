@@ -32,7 +32,9 @@ input and simulation checks. Never derive the agent's identity from the
 packet's claimed sender.
 
 Use the actual selected direct/hub/TURN path in `open`, retaining per-agent
-metadata in the launcher. Packet access to an agent has one owner: no other
+metadata in the launcher. `rnet_host_ice_agent_info` exposes the selected
+candidate type and receive-queue drop count without credentials or addresses;
+refuse a match if that counter increases after handoff. Packet access to an agent has one owner: no other
 session or lobby helper may concurrently consume that same agent.
 
 The adapter currently supports Windows. Other platforms report unavailable
