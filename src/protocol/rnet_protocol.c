@@ -65,6 +65,12 @@ int rnet_proto_is_rb_control(rnet_u16 type)
            type == RNET_PKT_RB_FRAME_COMMIT || type == RNET_PKT_RB_RESOLVED;
 }
 
+int rnet_proto_is_state_probe_control(rnet_u16 type)
+{
+    return type == RNET_PKT_STATE_PROBE || type == RNET_PKT_STATE_PROBE_REPLY ||
+           type == RNET_PKT_STATE_PROBE_DONE;
+}
+
 int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch)
 {
     rnet_u8 *c;
@@ -987,7 +993,7 @@ int rnet_proto_decode(const rnet_u8 *data, size_t len, rnet_u32 expect_magic, RN
     default:
         return -1;
     }
-    if (rnet_proto_is_rb_control(out->type)) {
+    if (rnet_proto_is_rb_control(out->type) || rnet_proto_is_state_probe_control(out->type)) {
         /* Legacy packets are generation zero. A post-load session rejects them. */
         if (end - c == 2) out->input_epoch = read_u16(&c);
         else if (end != c) return -1;

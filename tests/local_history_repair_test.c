@@ -20,6 +20,7 @@ static Peer peers[MAX_PEERS];
 static int seats, failures, dropped, held, drop_inputs, dropped_inputs;
 static unsigned round_index;
 static rnet_u64 clock_ms=1000;
+static int ready_reply_drops[MAX_PEERS],done_drops[MAX_PEERS];
 #define CHECK(x) do { if (!(x)) { fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x); ++failures; } } while(0)
 static rnet_u64 now_ms(void *ctx) { (void)ctx;return clock_ms; }
 static rnet_u64 now_us(void *ctx) { return now_ms(ctx)*1000u; }
@@ -30,6 +31,13 @@ static int enqueue(int seat,int from,const rnet_u8 *bytes,size_t size) {
      * Forwarding preserves that binding, rather than trusting a claimed seat. */
     if(packet.type!=RNET_PKT_START && packet.type!=RNET_PKT_DELAY_SYNC &&
        packet.local_slot!=(rnet_u8)from)return -1;
+    if(seat==0 && packet.type==RNET_PKT_STATE_PROBE_REPLY && packet.state_op==RNET_STATE_OP_LOAD &&
+       packet.state_total_size==0 && ready_reply_drops[from]>0) {
+        --ready_reply_drops[from];return (int)size;
+    }
+    if(packet.type==RNET_PKT_STATE_PROBE_DONE && done_drops[seat]>0) {
+        --done_drops[seat];return (int)size;
+    }
     if(seat==(seats==2?0:1) && from==seats-1 && round_index<1500u &&
        packet.type==RNET_PKT_RB_FRAME_COMMIT && packet.rb_through_tick==4u) {
         ++dropped;return (int)size;
@@ -132,6 +140,77 @@ static void check_state(void) {
     }
     for(i=0;i<seats;i++) {CHECK(peers[i].state==expected);CHECK(peers[i].begins==peers[i].ends);}
 }
+static void restart(Peer *p) {
+    RNetInputSample row;
+    rnet_local_destroy(p->driver);p->state=2166136261u;
+    memset(p->snaps,0,sizeof(p->snaps));rnet_session_hard_resync(p->session);
+    neutral(NULL,p->seat,&row);rnet_session_prime_delay_inputs(p->session,row.bytes,row.size);create_driver(p);
+}
+static void pump_sessions(void) {
+    ++clock_ms;for(int i=0;i<seats;i++)rnet_session_pump(peers[i].session);
+}
+static int all_idle(void) {
+    for(int i=1;i<seats;i++)if(rnet_session_state_busy(peers[i].session))return 0;
+    return 1;
+}
+static void probe_epoch_roundtrip(void) {
+    int changed[MAX_PEERS]={0},complete=0,i,k,match=0;rnet_u8 bytes[64];int size;
+    for(i=1;i<seats;i++)ready_reply_drops[i]=3;
+    CHECK(!rnet_session_state_probe(peers[0].session,RNET_STATE_OP_LOAD,4,0,0x4c4f4144u));
+    for(k=0;k<5000 && !complete;k++) {
+        pump_sessions();
+        for(i=1;i<seats;i++)if(rnet_session_state_probe_pending(peers[i].session,NULL,NULL,NULL,NULL)) {
+            CHECK(!changed[i]);CHECK(!rnet_session_state_probe_reply(peers[i].session,1));
+            restart(&peers[i]);changed[i]=1;
+        }
+        if(rnet_session_state_probe_take_reply(peers[0].session,&match)) {
+            CHECK(match);rnet_session_state_probe_finish(peers[0].session);restart(&peers[0]);complete=1;
+        }
+    }
+    CHECK(complete);for(i=1;i<seats;i++)CHECK(changed[i] && !ready_reply_drops[i]);
+    /* A delayed pre-load request cannot reapply/stall the new epoch. */
+    size=rnet_proto_encode_state_probe(bytes,sizeof(bytes),0x524e4554u,1,0,RNET_STATE_OP_LOAD,4,123,0x7654u);
+    size=rnet_proto_tag_rb_epoch(bytes,(size_t)size,sizeof(bytes),0);
+    for(i=1;i<seats;i++)CHECK(enqueue(i,0,bytes,(size_t)size)>0);
+    for(k=0;k<8;k++)pump_sessions();
+    CHECK(all_idle());
+    printf("%dp ready ACKs recovered after guest epoch advance; stale LOAD ignored\n",seats);
+}
+static void done_epoch_roundtrip(void) {
+    int i,k,complete=0,match=0;rnet_u8 bytes[64];int size;
+    done_drops[seats-1]=3;
+    CHECK(!rnet_session_state_probe(peers[0].session,RNET_STATE_OP_SAVE,4,123,0x7654u));
+    for(k=0;k<5000 && !complete;k++) {
+        pump_sessions();for(i=1;i<seats;i++)
+            if(rnet_session_state_probe_pending(peers[i].session,NULL,NULL,NULL,NULL))CHECK(!rnet_session_state_probe_reply(peers[i].session,1));
+        if(rnet_session_state_probe_take_reply(peers[0].session,&match)) {
+            CHECK(match);rnet_session_state_probe_finish(peers[0].session);restart(&peers[0]);complete=1;
+        }
+    }
+    CHECK(complete);
+    for(k=0;k<5000 && !all_idle();k++)pump_sessions();
+    CHECK(all_idle() && !done_drops[seats-1]);
+    for(i=1;i<seats;i++)restart(&peers[i]);
+    /* Reuse the tuple in the next epoch: an old DONE cannot release it. */
+    CHECK(!rnet_session_state_probe(peers[0].session,RNET_STATE_OP_SAVE,4,123,0x7654u));
+    for(k=0;k<5000;k++) {
+        int parked=0;pump_sessions();
+        for(i=1;i<seats;i++) {
+            if(rnet_session_state_probe_pending(peers[i].session,NULL,NULL,NULL,NULL))CHECK(!rnet_session_state_probe_reply(peers[i].session,1));
+            if(rnet_session_state_busy(peers[i].session))++parked;
+        }
+        if(parked==seats-1)break;
+    }
+    size=rnet_proto_encode_state_probe_done(bytes,sizeof(bytes),0x524e4554u,1,0,RNET_STATE_OP_SAVE,4,123,0x7654u);
+    size=rnet_proto_tag_rb_epoch(bytes,(size_t)size,sizeof(bytes),1);
+    for(i=1;i<seats;i++)CHECK(enqueue(i,0,bytes,(size_t)size)>0);
+    for(k=0;k<8;k++)pump_sessions();
+    for(i=1;i<seats;i++)CHECK(rnet_session_state_busy(peers[i].session));
+    for(k=0;k<5000 && !rnet_session_state_probe_take_reply(peers[0].session,&match);k++)pump_sessions();
+    CHECK(match);rnet_session_state_probe_finish(peers[0].session);
+    for(k=0;k<5000 && !all_idle();k++)pump_sessions();CHECK(all_idle());
+    printf("%dp lost DONE recovered across host epoch advance; stale DONE ignored\n",seats);
+}
 static void scenario(int count) {
     RNetProfileCaps caps={1u,1u,1u,0u};int i;
     memset(peers,0,sizeof(peers));seats=count;dropped=held=drop_inputs=dropped_inputs=0;round_index=0;
@@ -146,19 +225,16 @@ static void scenario(int count) {
     }
     CHECK(drive());CHECK(dropped>0);CHECK(held>0);check_state();
     printf("%dp withheld hash: dropped=%d held=%d verified=%u\n",seats,dropped,held,rnet_local_verified(peers[0].driver));
+    round_index=0;drop_inputs=seats==2;
+    probe_epoch_roundtrip();
     if(seats==2) {
         /* Recreate exactly the post-shared-load epoch. Losing the first new
          * neutral row must recover even after higher rows arrive. */
         drop_inputs=1;round_index=0;
-        for(i=0;i<seats;i++) {
-            RNetInputSample row;Peer *p=&peers[i];
-            rnet_local_destroy(p->driver);p->head=p->count=0;p->state=2166136261u;
-            memset(p->snaps,0,sizeof(p->snaps));rnet_session_hard_resync(p->session);
-            neutral(NULL,i,&row);rnet_session_prime_delay_inputs(p->session,row.bytes,row.size);create_driver(p);
-        }
         CHECK(drive());CHECK(dropped_inputs>0);check_state();
         printf("2p post-load missing row zero: dropped=%d verified=%u\n",dropped_inputs,rnet_local_verified(peers[0].driver));
     }
+    done_epoch_roundtrip();
     /* A genuine occupied peer still cannot release future, unverified data. */
     CHECK(!rnet_session_send_rb_sync(peers[seats-1].session,0,END_TICK+1u,0,0,0,
         RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST,0));

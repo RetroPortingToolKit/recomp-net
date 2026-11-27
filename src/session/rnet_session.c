@@ -221,6 +221,15 @@ struct RNetSession
     rnet_u8 state_probe_released_slot;
     rnet_u32 state_probe_released_size;
     rnet_u32 state_probe_released_crc;
+    rnet_u16 state_probe_released_epoch;
+    /* A ready/control ACK may be lost after the app advances its input
+     * epoch. Replay this exact answer without reapplying the old request. */
+    struct {
+        int valid;
+        rnet_u16 epoch;
+        rnet_u8 op, slot, match;
+        rnet_u32 size, crc;
+    } state_probe_answer;
     /* When set, pump must not emit INPUT bundles. Used across LOAD apply/ready
      * so pre-resync tip rows cannot clobber the post-hard_resync epoch
      * (tick % RNET_HISTORY_LENGTH collisions). Cleared by prime_delay_inputs. */
@@ -400,6 +409,7 @@ static void note_admit_ok(RNetSession *s)
 }
 
 static void send_raw(RNetSession *s, const rnet_u8 *buf, int len);
+static void send_raw_epoch(RNetSession *s, const rnet_u8 *buf, int len, rnet_u16 epoch);
 
 /* Additive RB_SYNC startup ops, deliberately separate from episode state.
  * Offers are copied once. Retries do not observe or change host capabilities. */
@@ -823,6 +833,25 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         return;
     if (pkt->session_id != s->cfg.session_id)
     {
+        return;
+    }
+    if (s->local_inputs && rnet_proto_is_state_probe_control(pkt->type) &&
+        pkt->input_epoch != s->input_epoch)
+    {
+        if (pkt->type == RNET_PKT_STATE_PROBE && pkt->local_slot == 0 &&
+            s->state_probe_answer.valid && pkt->input_epoch == s->state_probe_answer.epoch &&
+            (rnet_u16)(s->input_epoch - pkt->input_epoch) == 1u &&
+            pkt->state_op == s->state_probe_answer.op && pkt->state_slot == s->state_probe_answer.slot &&
+            pkt->state_total_size == s->state_probe_answer.size && pkt->state_payload_crc == s->state_probe_answer.crc)
+        {
+            rnet_u8 reply[64];
+            int n = rnet_proto_encode_state_probe_reply(reply,sizeof(reply),s->cfg.protocol_magic,
+                s->cfg.session_id,s->wire_slot,pkt->state_op,pkt->state_slot,
+                s->state_probe_answer.match,pkt->state_total_size,pkt->state_payload_crc);
+            if(n>0)send_raw_epoch(s,reply,n,pkt->input_epoch);
+        }
+        else if (pkt->type == RNET_PKT_STATE_PROBE_REPLY)
+            state_on_probe_reply(s,pkt); /* retained DONE receipt only */
         return;
     }
     switch (pkt->type)
@@ -1356,13 +1385,17 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     }
 }
 
-static void send_raw(RNetSession *s, const rnet_u8 *buf, int len)
+static void send_raw_epoch(RNetSession *s, const rnet_u8 *buf, int len, rnet_u16 epoch)
 {
     rnet_u8 tagged[RNET_MAX_PACKET];
-    if (len >= 14 && rnet_proto_is_rb_control((rnet_u16)(buf[4] | (buf[5] << 8)))) {
+    rnet_u16 type;
+    if (!s || !buf || len <= 0) return;
+    type=len>=6?(rnet_u16)(buf[4] | (buf[5] << 8)):0;
+    if (len >= 14 && (rnet_proto_is_rb_control(type) ||
+        (s->local_inputs && rnet_proto_is_state_probe_control(type)))) {
         if ((size_t)len + 2 > sizeof(tagged)) return;
         memcpy(tagged, buf, (size_t)len);
-        len = rnet_proto_tag_rb_epoch(tagged, (size_t)len, sizeof(tagged), s->input_epoch);
+        len = rnet_proto_tag_rb_epoch(tagged, (size_t)len, sizeof(tagged), epoch);
         if (len <= 0) return;
         buf = tagged;
     }
@@ -1372,6 +1405,10 @@ static void send_raw(RNetSession *s, const rnet_u8 *buf, int len)
         return;
     }
     (void)rnet_transport_send(&s->transport, buf, (size_t)len);
+}
+static void send_raw(RNetSession *s, const rnet_u8 *buf, int len)
+{
+    if(s)send_raw_epoch(s,buf,len,s->input_epoch);
 }
 
 /* Sender seat of a decoded packet, or -1 when the packet carries none.
@@ -2298,9 +2335,12 @@ static void state_on_probe(RNetSession *s, const RNetDecodedPacket *pkt)
 static void state_on_probe_reply(RNetSession *s, const RNetDecodedPacket *pkt)
 {
     rnet_u8 from = pkt->local_slot;
-    if (!s->state_probe_active || !s->state_probe_sender)
+    if (!s->state_probe_active || !s->state_probe_sender ||
+        (s->local_inputs && pkt->input_epoch != s->input_epoch))
     {
         if (s->state_probe_released_valid && pkt->state_probe_match && from != s->wire_slot &&
+            from < s->cfg.slot_count && rnet_config_slot_occupied(&s->cfg,from) &&
+            (!s->local_inputs || pkt->input_epoch == s->state_probe_released_epoch) &&
             pkt->state_op == s->state_probe_released_op && pkt->state_slot == s->state_probe_released_slot &&
             pkt->state_total_size == s->state_probe_released_size &&
             pkt->state_payload_crc == s->state_probe_released_crc)
@@ -2312,7 +2352,7 @@ static void state_on_probe_reply(RNetSession *s, const RNetDecodedPacket *pkt)
                                                        s->state_probe_released_crc);
             if (n > 0)
             {
-                send_raw(s, buf, n);
+                send_raw_epoch(s, buf, n, s->state_probe_released_epoch);
             }
         }
         return;
@@ -2384,6 +2424,7 @@ static void state_send_probe_done(RNetSession *s)
     s->state_probe_released_slot = s->state_probe_slot;
     s->state_probe_released_size = s->state_probe_size;
     s->state_probe_released_crc = s->state_probe_crc;
+    s->state_probe_released_epoch = s->input_epoch;
 }
 
 static void maybe_bootstrap(RNetSession *s)
@@ -4133,7 +4174,7 @@ int rnet_session_state_probe(RNetSession *s, rnet_u8 op, rnet_u8 slot, rnet_u32 
     }
 
     state_probe_clear(s);
-    s->state_probe_released_valid = 0;
+    if(!s->local_inputs)s->state_probe_released_valid = 0;
     s->state_probe_active = 1;
     s->state_probe_sender = 1;
     s->state_probe_expect_mask = expect;
@@ -4248,6 +4289,12 @@ int rnet_session_state_probe_reply(RNetSession *s, int match)
         return -1;
     }
     send_raw(s, buf, n);
+    if(s->local_inputs && s->state_probe_size == 0) {
+        s->state_probe_answer.valid=1;s->state_probe_answer.epoch=s->input_epoch;
+        s->state_probe_answer.op=s->state_probe_op;s->state_probe_answer.slot=s->state_probe_slot;
+        s->state_probe_answer.match=match?1u:0u;s->state_probe_answer.size=s->state_probe_size;
+        s->state_probe_answer.crc=s->state_probe_crc;
+    }
     s->state_probe_pending = 0;
     s->state_probe_match = match ? 1 : 0;
     if (s->state_probe_size == 0)

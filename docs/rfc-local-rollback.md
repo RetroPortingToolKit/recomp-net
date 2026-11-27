@@ -38,6 +38,11 @@ The A/B baseline includes these correctness fixes.
   digest can then recover without discarding hash verification. Impossible
   future credits and confirmed mismatches refuse the match. This meaning is
   local-mode-only; the retained episode driver is unchanged.
+- Local-mode state probe requests, replies and completion tokens carry the
+  input epoch. Delayed pre-load requests cannot reapply or park a restored
+  match. Exact ready/control answers and completion receipts can be resent
+  in their original epoch, so losing those replies still recovers. Retained
+  episode-mode state messages keep their previous encoding.
 - Inline and incremental replay use identical publish/finish semantics. Replay
   suppresses repeated audio and presentation through host callbacks.
 

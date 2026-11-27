@@ -217,7 +217,7 @@ typedef struct RNetDecodedPacket
     rnet_u32 effective_tick;
     rnet_u32 confirm_sim_tick;
     rnet_u32 confirm_hash;
-    rnet_u16 input_epoch; /* Input and rollback generation (hard_resync). */
+    rnet_u16 input_epoch; /* Input, rollback and local state-probe generation. */
     int frame_count;
     RNetWireFrame frames[RNET_MAX_BUNDLE];
     /* STATE_* */
@@ -270,6 +270,7 @@ typedef struct RNetDecodedPacket
 
 /* Add a generation trailer to rollback control packets. */
 int rnet_proto_is_rb_control(rnet_u16 type);
+int rnet_proto_is_state_probe_control(rnet_u16 type);
 int rnet_proto_tag_rb_epoch(rnet_u8 *buf, size_t size, size_t cap, rnet_u16 epoch);
 
 /* Returns 0 on success. */
